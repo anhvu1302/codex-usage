@@ -10,7 +10,7 @@ export default defineConfig({
   },
   webServer: {
     command:
-      "PORT=8788 CODEX_SESSIONS_DIR=e2e/fixtures/sessions CODEX_USAGE_DB=.local/e2e-usage.db pnpm prod",
+      "cross-env PORT=8788 CODEX_SESSIONS_DIR=e2e/fixtures/sessions CODEX_USAGE_DB=.local/e2e-usage.db pnpm prod",
     port: 8788,
     reuseExistingServer: false,
   },

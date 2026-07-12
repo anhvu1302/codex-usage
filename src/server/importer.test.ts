@@ -72,6 +72,9 @@ describe("token usage parsing", () => {
 
   it("uses safe local defaults and honours custom config", () => {
     expect(getConfig({ PORT: "not-a-port" }).port).toBe(8787);
+    expect(getConfig({ CODEX_HOME: "/custom/codex-home" }).sessionsDirectory).toBe(
+      "/custom/codex-home/sessions",
+    );
     expect(
       getConfig({
         CODEX_SESSIONS_DIR: "/tmp/sessions",

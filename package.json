@@ -9,11 +9,11 @@
     "pnpm": ">=11.5.0"
   },
   "scripts": {
-    "dev": "NODE_ENV=development tsx watch src/server/index.ts",
+    "dev": "cross-env NODE_ENV=development tsx watch src/server/index.ts",
     "build": "pnpm build:web && pnpm build:server",
     "build:web": "vite build",
     "build:server": "tsup",
-    "start": "NODE_ENV=production node build-server/index.js",
+    "start": "cross-env NODE_ENV=production node build-server/index.js",
     "prod": "pnpm build && pnpm start",
     "pm2:start": "pnpm build && pm2 startOrRestart ecosystem.config.cjs --env production --update-env && pm2 save",
     "pm2:restart": "pnpm build && pm2 restart ecosystem.config.cjs --env production --update-env && pm2 save",
@@ -74,6 +74,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "@vitest/coverage-v8": "^4.1.10",
+    "cross-env": "^10.1.0",
     "drizzle-kit": "^0.31.10",
     "eslint": "^9.39.5",
     "eslint-import-resolver-typescript": "^4.4.5",

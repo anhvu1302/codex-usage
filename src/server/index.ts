@@ -38,7 +38,14 @@ console.log(
   `Codex Usage listening at http://127.0.0.1:${config.port} (${isProduction ? "production" : "development"})`,
 );
 
-async function shutdown() {
+let shutdownPromise: Promise<void> | undefined;
+
+function shutdown(): Promise<void> {
+  shutdownPromise ??= shutdownServices();
+  return shutdownPromise;
+}
+
+async function shutdownServices() {
   retention.stop();
   await importer.stop();
   await closeVite?.();
@@ -46,10 +53,26 @@ async function shutdown() {
     server.closeAllConnections();
   }
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  database.$client.close();
 }
 
-process.once("SIGINT", () => void shutdown());
-process.once("SIGTERM", () => void shutdown());
+function exitAfterShutdown() {
+  console.log("Codex Usage is shutting down");
+  void shutdown().then(
+    () => process.exit(0),
+    (error: unknown) => {
+      console.error("Graceful shutdown failed", error);
+      process.exit(1);
+    },
+  );
+}
+
+process.once("SIGINT", exitAfterShutdown);
+process.once("SIGTERM", exitAfterShutdown);
+process.on("message", (message) => {
+  if (message !== "shutdown") return;
+  exitAfterShutdown();
+});
 
 async function startDevelopmentServer(fetch: typeof app.fetch, port: number): Promise<Server> {
   const server = createServer();

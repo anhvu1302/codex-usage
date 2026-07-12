@@ -13,11 +13,12 @@ export type AppConfig = {
 
 export function getConfig(environment = process.env): AppConfig {
   const port = Number.parseInt(environment["PORT"] ?? "8787", 10);
+  const codexHome = environment["CODEX_HOME"] ?? join(homedir(), ".codex");
 
   return {
     databasePath:
       environment["CODEX_USAGE_DB"] ?? join(homedir(), ".codex-usage", "codex-usage.db"),
     port: Number.isSafeInteger(port) && port > 0 ? port : 8787,
-    sessionsDirectory: environment["CODEX_SESSIONS_DIR"] ?? join(homedir(), ".codex", "sessions"),
+    sessionsDirectory: environment["CODEX_SESSIONS_DIR"] ?? join(codexHome, "sessions"),
   };
 }
