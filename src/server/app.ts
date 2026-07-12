@@ -11,6 +11,7 @@ import {
 } from "@/server/analytics";
 import type { AppDatabase } from "@/server/db/client";
 import type { SessionImporter } from "@/server/importer";
+import { currentLocalDate, dateDaysBefore, type RetentionService } from "@/server/retention";
 import type { DashboardFilters } from "@/shared/types";
 
 const datePattern = /^\d{4}-\d{2}-\d{2}$/;
@@ -20,12 +21,18 @@ const rateSchema = z.object({
   outputRate: z.coerce.number().finite().nonnegative(),
 });
 
-export function createApp(database: AppDatabase, importer: SessionImporter) {
+export function createApp(
+  database: AppDatabase,
+  importer: SessionImporter,
+  retention: RetentionService,
+) {
   const app = new Hono();
 
   app.get("/api/health", (context) => context.json({ ok: true }));
   app.get("/api/status", (context) => context.json(importer.getStatus()));
   app.post("/api/sync", async (context) => context.json(await importer.syncAll()));
+  app.get("/api/storage/status", async (context) => context.json(await retention.getStatus()));
+  app.post("/api/storage/compact", async (context) => context.json(await retention.compact()));
 
   app.get("/api/dashboard", (context) => {
     const filters = parseFilters(context.req.query());
@@ -70,31 +77,11 @@ export function createApp(database: AppDatabase, importer: SessionImporter) {
 function parseFilters(
   query: Record<string, string | undefined>,
 ): { data: DashboardFilters; success: true } | { error: string; success: false } {
-  const to = query["to"] ?? currentDate();
+  const to = query["to"] ?? currentLocalDate();
   const from = query["from"] ?? dateDaysBefore(to, 29);
   if (!datePattern.test(from) || !datePattern.test(to) || from > to) {
     return { error: "from and to must be ISO dates with from <= to", success: false };
   }
   const model = query["model"]?.trim();
   return { data: { from, ...(model ? { model } : {}), to }, success: true };
-}
-
-function currentDate(): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    day: "2-digit",
-    month: "2-digit",
-    timeZone: "Asia/Ho_Chi_Minh",
-    year: "numeric",
-  }).formatToParts(new Date());
-  const year = parts.find((part) => part.type === "year")?.value;
-  const month = parts.find((part) => part.type === "month")?.value;
-  const day = parts.find((part) => part.type === "day")?.value;
-  if (!year || !month || !day) throw new Error("Could not format the current date");
-  return `${year}-${month}-${day}`;
-}
-
-function dateDaysBefore(date: string, days: number): string {
-  const value = new Date(`${date}T00:00:00.000Z`);
-  value.setUTCDate(value.getUTCDate() - days);
-  return value.toISOString().slice(0, 10);
 }

@@ -14,10 +14,24 @@ export function createDatabase(filePath: string) {
   const client = new BetterSqlite3(filePath);
   client.pragma("journal_mode = WAL");
   client.pragma("foreign_keys = ON");
+  client.pragma("busy_timeout = 5000");
+  client.pragma("synchronous = NORMAL");
 
   return drizzle({ client, schema });
 }
 
 export function migrateDatabase(database: AppDatabase) {
   migrate(database, { migrationsFolder: "drizzle" });
+  const client = database.$client;
+  if (client.pragma("auto_vacuum", { simple: true }) !== 2) {
+    client.pragma("auto_vacuum = INCREMENTAL");
+    client.exec("VACUUM");
+  }
+}
+
+export function reclaimDatabaseSpace(database: AppDatabase) {
+  const client = database.$client;
+  client.pragma("incremental_vacuum");
+  client.pragma("wal_checkpoint(TRUNCATE)");
+  client.pragma("optimize");
 }

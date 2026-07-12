@@ -1,8 +1,8 @@
-import { appendFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -16,13 +16,22 @@ import {
 import { createApp } from "@/server/app";
 import { getConfig } from "@/server/config";
 import { createDatabase, migrateDatabase, type AppDatabase } from "@/server/db/client";
-import { sessions, usageEvents } from "@/server/db/schema";
+import {
+  archivedUsageEventIds,
+  importStates,
+  sessions,
+  usageDailyRollups,
+  usageEvents,
+  usageHourlyRollups,
+  usageRollupSessionMemberships,
+} from "@/server/db/schema";
 import {
   calculateCost,
   normalizeTokenUsage,
   SessionImporter,
   toLocalDate,
 } from "@/server/importer";
+import { compactUsage, RetentionService } from "@/server/retention";
 
 const temporaryDirectories: string[] = [];
 
@@ -203,7 +212,7 @@ describe("session importer", () => {
     const session = getSessions(harness.database, {
       from: "2026-07-12",
       to: "2026-07-12",
-    })[0];
+    }).sessions[0];
     expect(session).toMatchObject({
       sessionId: "session-parent",
       title: "Tạo dashboard usage theo ngày",
@@ -285,9 +294,9 @@ describe("session importer", () => {
     );
 
     await harness.importer.syncAll();
-    expect(getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" })[0]?.title).toBe(
-      "Tên task chuẩn trong Codex",
-    );
+    expect(
+      getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0]?.title,
+    ).toBe("Tên task chuẩn trong Codex");
   });
 
   it("watches Codex session-index changes and refreshes titles", async () => {
@@ -313,8 +322,10 @@ describe("session importer", () => {
     await vi.waitFor(
       () => {
         expect(
-          getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" })[0]?.title,
+          getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0]
+            ?.title,
         ).toBe("Tên đổi trong Codex");
+        expect(harness.importer.getStatus().filesProcessed).toBe(0);
       },
       { interval: 50, timeout: 3_000 },
     );
@@ -364,7 +375,7 @@ describe("session importer", () => {
         .kpis.totalTokens,
     ).toBe(0);
     expect(
-      getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" })[0],
+      getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0],
     ).toMatchObject({
       models: ["gpt-api"],
       sessionId: "session-api",
@@ -383,9 +394,11 @@ describe("session importer", () => {
     ]);
     expect(backfillUnpricedUsage(harness.database, "missing-rate")).toBe(0);
 
-    const app = createApp(harness.database, harness.importer);
+    const app = createApp(harness.database, harness.importer, harness.retention);
     expect((await app.request("/api/health")).status).toBe(200);
     expect((await app.request("/api/status")).status).toBe(200);
+    expect((await app.request("/api/storage/status")).status).toBe(200);
+    expect((await app.request("/api/storage/compact", { method: "POST" })).status).toBe(200);
     expect((await app.request("/api/dashboard")).status).toBe(200);
     expect((await app.request("/api/models")).status).toBe(200);
     expect((await app.request("/api/rates")).status).toBe(200);
@@ -424,6 +437,159 @@ describe("session importer", () => {
     ).toBe(500);
     expect((await app.request("/api/rates/%20/backfill", { method: "POST" })).status).toBe(400);
     expect((await app.request("/api/rates/gpt-api/backfill", { method: "POST" })).status).toBe(200);
+  });
+
+  it("compacts raw usage into exact hourly and daily retention tiers", async () => {
+    const harness = await createHarness();
+    const now = new Date("2026-07-13T00:00:00.000Z");
+    const hourlySource = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-hourly", {
+        agentId: "agent-hourly",
+        parentThreadId: "session-hourly",
+        threadSource: "subagent",
+      }),
+      turnContext("gpt-retained"),
+      tokenCount("2026-06-13T02:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-raw"),
+      turnContext("gpt-retained"),
+      tokenCount("2026-06-14T02:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-hourly-edge"),
+      turnContext("gpt-retained"),
+      tokenCount("2026-04-15T02:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-daily"),
+      turnContext("gpt-retained"),
+      tokenCount("2026-04-14T02:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await harness.importer.syncAll();
+
+    expect(compactUsage(harness.database, now)).toMatchObject({
+      hourlyRowsDeleted: 2,
+      rawEventsDeleted: 3,
+      rollupRowsWritten: 6,
+    });
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
+    expect(harness.database.select().from(usageHourlyRollups).all()).toHaveLength(2);
+    expect(harness.database.select().from(usageDailyRollups).all()).toHaveLength(3);
+    expect(harness.database.select().from(archivedUsageEventIds).all()).toHaveLength(3);
+    expect(
+      harness.database
+        .select()
+        .from(usageDailyRollups)
+        .where(eq(usageDailyRollups.localDate, "2026-06-13"))
+        .get(),
+    ).toMatchObject({ agentKind: "subagent", totalTokens: 110 });
+
+    const dashboard = getDashboard(harness.database, { from: "2026-04-14", to: "2026-06-14" }, now);
+    expect(dashboard.kpis).toMatchObject({
+      requestCount: 4,
+      sessionCount: 4,
+      totalTokens: 440,
+      unpricedUsageCount: 4,
+    });
+    expect(
+      getDashboard(harness.database, { from: "2026-04-15", to: "2026-04-15" }, now).hourly.find(
+        (hour) => hour.hour === "09:00",
+      ),
+    ).toMatchObject({ sessionCount: 1, totalTokens: 110 });
+    expect(
+      getDashboard(harness.database, { from: "2026-04-14", to: "2026-04-14" }, now),
+    ).toMatchObject({ hourly: [], retention: { hourlyAvailable: false } });
+    expect(
+      getSessions(harness.database, { from: "2026-04-14", to: "2026-06-14" }, now),
+    ).toMatchObject({ coverage: { from: "2026-06-14", status: "partial" } });
+
+    expect(compactUsage(harness.database, now)).toEqual({
+      hourlyRowsDeleted: 0,
+      rawEventsDeleted: 0,
+      rollupRowsWritten: 0,
+    });
+    harness.database.update(importStates).set({ lastOffset: 0 }).run();
+    expect((await harness.importer.syncAll()).recordsInserted).toBe(0);
+
+    await appendFile(hourlySource, `${tokenCount("2026-06-13T03:00:00.000Z", 50, 10, 5, 2)}\n`);
+    expect((await harness.importer.syncAll()).recordsInserted).toBe(1);
+    expect(compactUsage(harness.database, now).rawEventsDeleted).toBe(1);
+    expect(
+      getDashboard(harness.database, { from: "2026-06-13", to: "2026-06-13" }, now).kpis,
+    ).toMatchObject({ sessionCount: 1, totalTokens: 165, unpricedUsageCount: 2 });
+
+    upsertModelRate(harness.database, {
+      cachedInputRate: 0.5,
+      inputRate: 2,
+      model: "gpt-retained",
+      outputRate: 4,
+    });
+    expect(backfillUnpricedUsage(harness.database, "gpt-retained")).toBeGreaterThan(0);
+    expect(
+      getDashboard(harness.database, { from: "2026-04-14", to: "2026-06-14" }, now).kpis,
+    ).toMatchObject({ totalTokens: 495, unpricedUsageCount: 0 });
+    expect(
+      harness.database
+        .select()
+        .from(usageRollupSessionMemberships)
+        .where(eq(usageRollupSessionMemberships.bucketType, "day"))
+        .all(),
+    ).toHaveLength(3);
+  });
+
+  it("rolls back retention atomically and reports a compaction error", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-retention-failure"),
+      turnContext("gpt-failure"),
+      tokenCount("2026-05-01T02:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await harness.importer.syncAll();
+    harness.database.run(sql`
+      create trigger reject_daily_rollup
+      before insert on usage_daily_rollups
+      begin
+        select raise(abort, 'forced retention failure');
+      end
+    `);
+
+    const status = await harness.retention.compact();
+    expect(status.error).toContain("forced retention failure");
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
+    expect(harness.database.select().from(usageHourlyRollups).all()).toHaveLength(0);
+    expect(harness.database.select().from(usageDailyRollups).all()).toHaveLength(0);
+  });
+
+  it("reports storage paths and keeps scheduled compaction single-instance", async () => {
+    const harness = await createHarness();
+    const missing = new RetentionService(
+      harness.database,
+      join(harness.sessionsDirectory, "missing.db"),
+      join(harness.sessionsDirectory, "missing-source"),
+    );
+    const missingStatus = await missing.getStatus();
+    expect(missingStatus).toMatchObject({
+      databaseBytes: 0,
+      oldestRawDate: null,
+      sourceBytes: 0,
+      walBytes: 0,
+    });
+
+    await symlink(harness.sessionsDirectory, join(harness.sessionsDirectory, "ignored-link"));
+    const [first, second] = await Promise.all([
+      harness.retention.compact(),
+      harness.retention.compact(),
+    ]);
+    expect(first.error).toBeNull();
+    expect(second.policy).toEqual({ dailyRetention: "forever", hourlyDays: 90, rawDays: 30 });
+
+    vi.useFakeTimers();
+    harness.retention.start();
+    harness.retention.start();
+    harness.retention.stop();
+    harness.retention.stop();
+    vi.useRealTimers();
   });
 
   it("skips malformed or incomplete records and reports individual file errors", async () => {
@@ -509,13 +675,26 @@ async function createHarness() {
   temporaryDirectories.push(directory);
   const sessionsDirectory = join(directory, "sessions");
   await mkdir(sessionsDirectory, { recursive: true });
-  const database = createDatabase(join(directory, "usage.db"));
+  const databasePath = join(directory, "usage.db");
+  const database = createDatabase(databasePath);
   migrateDatabase(database);
+  const retention = new RetentionService(
+    database,
+    databasePath,
+    sessionsDirectory,
+    () => new Date("2026-07-13T00:00:00.000Z"),
+  );
   return {
     database,
     importer: new SessionImporter(database, sessionsDirectory),
+    retention,
     sessionsDirectory,
-  } satisfies { database: AppDatabase; importer: SessionImporter; sessionsDirectory: string };
+  } satisfies {
+    database: AppDatabase;
+    importer: SessionImporter;
+    retention: RetentionService;
+    sessionsDirectory: string;
+  };
 }
 
 async function createSessionFile(directory: string, lines: string[]): Promise<string> {

@@ -89,6 +89,48 @@ export type ImportStatus = {
   recordsReclassified: number;
 };
 
+export type RetentionCoverage = {
+  hourlyAvailable: boolean;
+  hourlyFrom: string;
+  rawFrom: string;
+  sessionDetails: "full" | "none" | "partial";
+};
+
+export type SessionCoverage = {
+  from: string | null;
+  status: "full" | "none" | "partial";
+  to: string | null;
+};
+
+export type SessionsResponse = {
+  coverage: SessionCoverage;
+  sessions: SessionUsage[];
+};
+
+export type StorageStatus = {
+  dailyRows: number;
+  databaseBytes: number;
+  error: string | null;
+  hourlyRows: number;
+  isCompacting: boolean;
+  lastCompactionAt: string | null;
+  lastHourlyRowsDeleted: number;
+  lastRawEventsDeleted: number;
+  lastRollupRowsWritten: number;
+  oldestDailyDate: string | null;
+  oldestHourlyDate: string | null;
+  oldestRawDate: string | null;
+  policy: {
+    dailyRetention: "forever";
+    hourlyDays: 90;
+    rawDays: 30;
+  };
+  rawEvents: number;
+  sourceBytes: number;
+  sourceManaged: false;
+  walBytes: number;
+};
+
 export type DashboardResponse = {
   daily: DailyUsage[];
   dailyModels: DailyModelUsage[];
@@ -96,4 +138,5 @@ export type DashboardResponse = {
   hourlyModels: HourlyModelUsage[];
   kpis: DashboardKpis;
   models: ModelUsage[];
+  retention: RetentionCoverage;
 };

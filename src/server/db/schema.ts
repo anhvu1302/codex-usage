@@ -1,4 +1,12 @@
-import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import {
+  index,
+  integer,
+  primaryKey,
+  real,
+  sqliteTable,
+  text,
+  uniqueIndex,
+} from "drizzle-orm/sqlite-core";
 
 export const sessions = sqliteTable(
   "sessions",
@@ -84,5 +92,85 @@ export const usageEvents = sqliteTable(
     index("usage_events_model_index").on(table.model),
     index("usage_events_session_index").on(table.sessionId),
     index("usage_events_agent_index").on(table.agentId),
+    index("usage_events_date_model_index").on(table.localDate, table.model),
+    index("usage_events_date_session_index").on(table.localDate, table.sessionId),
   ],
 );
+
+const rollupFields = () => ({
+  inputTokens: integer("input_tokens").notNull(),
+  cachedInputTokens: integer("cached_input_tokens").notNull(),
+  outputTokens: integer("output_tokens").notNull(),
+  reasoningOutputTokens: integer("reasoning_output_tokens").notNull(),
+  totalTokens: integer("total_tokens").notNull(),
+  requestCount: integer("request_count").notNull(),
+  costUsd: real("cost_usd").notNull(),
+  unpricedUsageCount: integer("unpriced_usage_count").notNull(),
+  unpricedInputTokens: integer("unpriced_input_tokens").notNull(),
+  unpricedCachedInputTokens: integer("unpriced_cached_input_tokens").notNull(),
+  unpricedOutputTokens: integer("unpriced_output_tokens").notNull(),
+});
+
+export const usageHourlyRollups = sqliteTable(
+  "usage_hourly_rollups",
+  {
+    localDate: text("local_date").notNull(),
+    localHour: text("local_hour").notNull(),
+    model: text("model").notNull(),
+    agentKind: text("agent_kind").notNull(),
+    ...rollupFields(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.localDate, table.localHour, table.model, table.agentKind] }),
+    index("usage_hourly_rollups_model_date_index").on(table.model, table.localDate),
+  ],
+);
+
+export const usageDailyRollups = sqliteTable(
+  "usage_daily_rollups",
+  {
+    localDate: text("local_date").notNull(),
+    model: text("model").notNull(),
+    agentKind: text("agent_kind").notNull(),
+    ...rollupFields(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.localDate, table.model, table.agentKind] }),
+    index("usage_daily_rollups_model_date_index").on(table.model, table.localDate),
+  ],
+);
+
+export const usageRollupSessionMemberships = sqliteTable(
+  "usage_rollup_session_memberships",
+  {
+    bucketType: text("bucket_type").notNull(),
+    bucketStart: text("bucket_start").notNull(),
+    model: text("model").notNull(),
+    agentKind: text("agent_kind").notNull(),
+    sessionId: text("session_id").notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.bucketType, table.bucketStart, table.model, table.agentKind, table.sessionId],
+    }),
+    index("usage_rollup_memberships_model_bucket_index").on(
+      table.model,
+      table.bucketType,
+      table.bucketStart,
+    ),
+  ],
+);
+
+export const archivedUsageEventIds = sqliteTable("archived_usage_event_ids", {
+  id: text("id").primaryKey(),
+  archivedAt: integer("archived_at").notNull(),
+});
+
+export const retentionState = sqliteTable("retention_state", {
+  id: text("id").primaryKey(),
+  error: text("error"),
+  hourlyRowsDeleted: integer("hourly_rows_deleted").notNull().default(0),
+  lastCompactionAt: integer("last_compaction_at"),
+  rawEventsDeleted: integer("raw_events_deleted").notNull().default(0),
+  rollupRowsWritten: integer("rollup_rows_written").notNull().default(0),
+});

@@ -14,6 +14,16 @@ In development, open `http://127.0.0.1:8787` (or the `PORT` in `.env`). One Node
 
 Session titles use the newest matching `thread_name` in `~/.codex/session_index.jsonl`, which is the name shown in Codex. A first-user-request summary is only a fallback when no index title exists. The session drawer separately attributes usage to the main agent and each Codex subagent using JSONL metadata such as nickname, role, parent thread, and depth.
 
+## Storage retention
+
+SQLite uses tiered retention while preserving totals, model breakdown and estimated cost:
+
+- Last 30 calendar days: raw usage events and full session/subagent drill-down.
+- Days 31–90: hourly rollups by model and main/subagent.
+- Older than 90 days: daily rollups by model and main/subagent, retained forever.
+
+Compaction runs once after startup and daily at 03:15 Asia/Ho_Chi_Minh. It is transactional, retains a permanent dedupe ledger, and can also be triggered from the Storage card with **Compact now**. The app only reads `~/.codex/sessions`; it never deletes, moves or compresses Codex JSONL files.
+
 ## Environment
 
 | Variable             | Default                         | Purpose                                                       |

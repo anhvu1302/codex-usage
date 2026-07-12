@@ -7,6 +7,7 @@ import { createApp } from "@/server/app";
 import { getConfig } from "@/server/config";
 import { createDatabase, migrateDatabase } from "@/server/db/client";
 import { SessionImporter } from "@/server/importer";
+import { RetentionService } from "@/server/retention";
 
 const config = getConfig();
 const database = createDatabase(config.databasePath);
@@ -14,8 +15,10 @@ migrateDatabase(database);
 
 const importer = new SessionImporter(database, config.sessionsDirectory);
 await importer.start();
+const retention = new RetentionService(database, config.databasePath, config.sessionsDirectory);
+retention.start();
 
-const app = createApp(database, importer);
+const app = createApp(database, importer, retention);
 const isProduction = process.env["NODE_ENV"] === "production";
 let closeVite: (() => Promise<void>) | undefined;
 if (isProduction) {
@@ -36,6 +39,7 @@ console.log(
 );
 
 async function shutdown() {
+  retention.stop();
   await importer.stop();
   await closeVite?.();
   if ("closeAllConnections" in server && typeof server.closeAllConnections === "function") {

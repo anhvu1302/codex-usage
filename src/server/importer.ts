@@ -9,7 +9,14 @@ import { and, eq, isNull } from "drizzle-orm";
 import { backfillAllUnpricedUsage, reconcileUnknownModels } from "@/server/analytics";
 import { TIME_ZONE } from "@/server/config";
 import type { AppDatabase } from "@/server/db/client";
-import { importStates, modelRates, sessionAgents, sessions, usageEvents } from "@/server/db/schema";
+import {
+  archivedUsageEventIds,
+  importStates,
+  modelRates,
+  sessionAgents,
+  sessions,
+  usageEvents,
+} from "@/server/db/schema";
 import type { ImportStatus, TokenUsage } from "@/shared/types";
 
 type JsonRecord = Record<string, unknown>;
@@ -222,7 +229,17 @@ export class SessionImporter {
     this.sessionIndexRefreshScheduled = true;
     setTimeout(() => {
       this.sessionIndexRefreshScheduled = false;
-      void this.syncAll();
+      void this.enqueue(async () => {
+        this.beginSync();
+        try {
+          await this.refreshSessionTitles();
+          this.status.lastSyncAt = new Date().toISOString();
+        } catch (error) {
+          this.status.error = errorMessage(error);
+        } finally {
+          this.status.isSyncing = false;
+        }
+      });
     }, 350);
   }
 
@@ -426,8 +443,18 @@ export class SessionImporter {
     const cumulativeUsage = normalizeTokenUsage(info?.["total_token_usage"]);
     const model = state.activeModel ?? "unknown";
     const agentId = state.agentId ?? state.sessionId;
-    const rate = this.getRate(model);
     const sourceHash = createUsageFingerprint(rawLine, usage, cumulativeUsage);
+    const eventId = createHash("sha256")
+      .update(`${state.sessionId}\u0000${sourceHash}`)
+      .digest("hex");
+    const archived = this.database
+      .select({ id: archivedUsageEventIds.id })
+      .from(archivedUsageEventIds)
+      .where(eq(archivedUsageEventIds.id, eventId))
+      .get();
+    if (archived) return 0;
+
+    const rate = this.getRate(model);
     const usageEventValues = {
       agentId,
       cachedInputRate: rate?.cachedInputRate ?? null,
@@ -447,7 +474,7 @@ export class SessionImporter {
       .insert(usageEvents)
       .values({
         createdAt: Date.now(),
-        id: createHash("sha256").update(`${state.sessionId}\u0000${sourceHash}`).digest("hex"),
+        id: eventId,
         sessionId: state.sessionId,
         sourceHash,
         ...usageEventValues,

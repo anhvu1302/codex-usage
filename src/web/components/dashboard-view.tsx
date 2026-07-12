@@ -10,7 +10,17 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useDeferredValue, useState, useTransition } from "react";
-import { Bar, CartesianGrid, ComposedChart, Legend, Line, Tooltip, XAxis, YAxis } from "recharts";
+import {
+  Bar,
+  CartesianGrid,
+  ComposedChart,
+  Legend,
+  Line,
+  Tooltip,
+  XAxis,
+  YAxis,
+  type TooltipContentProps,
+} from "recharts";
 import { toast } from "sonner";
 
 import {
@@ -269,11 +279,18 @@ export function DashboardView() {
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <HourlyUsageChart
-                data={dashboard.data?.hourly ?? []}
-                modelData={dashboard.data?.hourlyModels ?? []}
-                models={dashboard.data?.models.map((model) => model.model) ?? []}
-              />
+              {dashboard.data && !dashboard.data.retention.hourlyAvailable ? (
+                <div className="text-muted-foreground flex h-40 items-center justify-center rounded-lg border border-dashed px-6 text-center text-sm">
+                  Dữ liệu này đã quá 90 ngày nên chỉ còn tổng theo ngày; breakdown theo giờ đã được
+                  compact.
+                </div>
+              ) : (
+                <HourlyUsageChart
+                  data={dashboard.data?.hourly ?? []}
+                  modelData={dashboard.data?.hourlyModels ?? []}
+                  models={dashboard.data?.models.map((model) => model.model) ?? []}
+                />
+              )}
             </CardContent>
           </Card>
         ) : null}
@@ -330,6 +347,13 @@ export function DashboardView() {
           </CardDescription>
         </CardHeader>
         <CardContent className="p-0">
+          {sessions.data && sessions.data.coverage.status !== "full" ? (
+            <div className="bg-muted/50 text-muted-foreground border-b px-6 py-3 text-sm">
+              {sessions.data?.coverage.status === "partial"
+                ? `Chi tiết session chỉ còn từ ${sessions.data.coverage.from}; KPI và biểu đồ vẫn bao gồm rollup cũ.`
+                : "Khoảng này đã được compact nên không còn drill-down session; KPI và biểu đồ theo model/ngày vẫn được giữ."}
+            </div>
+          ) : null}
           <Table>
             <TableHeader>
               <TableRow>
@@ -342,7 +366,7 @@ export function DashboardView() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {sessions.data?.map((session) => (
+              {sessions.data?.sessions.map((session) => (
                 <TableRow
                   key={session.sessionId}
                   className="cursor-pointer"
@@ -373,7 +397,7 @@ export function DashboardView() {
                   <TableCell>{formatUsd(session.estimatedCostUsd)}</TableCell>
                 </TableRow>
               ))}
-              {!sessions.isLoading && sessions.data?.length === 0 ? (
+              {!sessions.isLoading && sessions.data?.sessions.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={6} className="text-muted-foreground h-24 text-center">
                     Chưa có session.
@@ -503,7 +527,7 @@ function UsageChart({
           axisLine={false}
           width={48}
         />
-        <Tooltip formatter={modelTooltipFormatter} />
+        <Tooltip content={ModelChartTooltip} />
         <Legend verticalAlign="top" />
         {chart.series.map((series) => (
           <Bar
@@ -568,7 +592,7 @@ function HourlyUsageChart({
           axisLine={false}
           width={48}
         />
-        <Tooltip formatter={modelTooltipFormatter} />
+        <Tooltip content={ModelChartTooltip} />
         <Legend verticalAlign="top" />
         {chart.series.map((series) => (
           <Bar
@@ -626,12 +650,26 @@ function buildModelChart(
   return { points, series };
 }
 
-function modelTooltipFormatter(value: unknown, name: unknown) {
-  const label = String(name);
-  return [
-    label === "Cost" ? formatUsd(Number(value)) : formatTokens(Number(value)),
-    label,
-  ] as const;
+function ModelChartTooltip({ active, label, payload }: TooltipContentProps) {
+  if (!active || !payload?.length) return null;
+  const cost = payload.find((entry) => entry.name === "Cost");
+  const models = payload.filter((entry) => entry.name !== "Cost" && Number(entry.value) > 0);
+  const totalTokens = models.reduce((total, entry) => total + Number(entry.value), 0);
+
+  return (
+    <div className="bg-background min-w-56 space-y-2 rounded-md border p-3 text-sm shadow-md">
+      <p className="font-medium">{String(label)}</p>
+      {cost ? <p>Cost: {formatUsd(Number(cost.value))}</p> : null}
+      <p className="font-semibold">Total tokens: {formatTokens(totalTokens)}</p>
+      <div className="space-y-1">
+        {models.map((entry) => (
+          <p key={String(entry.dataKey)} style={{ color: entry.color }}>
+            {entry.name}: {formatTokens(Number(entry.value))}
+          </p>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function ShareBar({ value }: { value: number }) {

@@ -3,7 +3,8 @@ import type {
   DashboardResponse,
   ImportStatus,
   ModelRate,
-  SessionUsage,
+  SessionsResponse,
+  StorageStatus,
 } from "@/shared/types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -30,7 +31,15 @@ export function fetchDashboard(filters: DashboardFilters) {
 }
 
 export function fetchSessions(filters: DashboardFilters) {
-  return request<SessionUsage[]>(`/api/sessions?${query(filters)}`);
+  return request<SessionsResponse>(`/api/sessions?${query(filters)}`);
+}
+
+export function fetchStorageStatus() {
+  return request<StorageStatus>("/api/storage/status");
+}
+
+export function compactStorage() {
+  return request<StorageStatus>("/api/storage/compact", { method: "POST" });
 }
 
 export function fetchModels() {

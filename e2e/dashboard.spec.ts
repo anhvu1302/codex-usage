@@ -5,6 +5,8 @@ test("renders the dashboard, sync action, and rate card settings", async ({ page
 
   await expect(page.getByRole("heading", { name: "Token usage" })).toBeVisible();
   await expect(page.getByText("Total tokens")).toBeVisible();
+  await page.locator(".recharts-bar-rectangle path").first().hover();
+  await expect(page.getByText(/Total tokens:/)).toBeVisible();
   await page.getByRole("button", { name: "Sync now" }).click();
   await expect(page.getByText(/Đã sync/)).toBeVisible();
   await page.getByRole("button", { name: "Hôm nay" }).click();
@@ -12,6 +14,9 @@ test("renders the dashboard, sync action, and rate card settings", async ({ page
 
   await page.getByRole("tab", { name: "Rate cards" }).click();
   await expect(page.getByRole("heading", { name: "Rate cards" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Storage retention" })).toBeVisible();
+  await page.getByRole("button", { name: "Compact now" }).click();
+  await expect(page.getByText(/Đã compact/)).toBeVisible();
 
   await page.getByRole("tab", { name: "Dashboard" }).click();
   await page.getByRole("combobox").click();
