@@ -1,0 +1,23 @@
+import type { ReactNode } from "react";
+
+import { Card, CardContent, CardHeader, CardTitle } from "@/web/components/ui/card";
+
+type MetricCardProps = {
+  icon: ReactNode;
+  label: string;
+  value: string;
+};
+
+export function MetricCard({ icon, label, value }: MetricCardProps) {
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle className="text-muted-foreground text-sm font-medium">{label}</CardTitle>
+        <span className="text-muted-foreground">{icon}</span>
+      </CardHeader>
+      <CardContent>
+        <p className="text-2xl font-bold tracking-tight">{value}</p>
+      </CardContent>
+    </Card>
+  );
+}

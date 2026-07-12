@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build-server/
+coverage/
+playwright-report/
+test-results/
+.env
+.local/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

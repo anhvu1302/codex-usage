@@ -1,0 +1,1 @@
+ALTER TABLE `import_states` ADD `dedupe_version` integer DEFAULT 0 NOT NULL;

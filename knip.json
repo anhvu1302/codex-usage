@@ -1,0 +1,8 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "project": ["src/**/*.{ts,tsx}"],
+  "ignoreDependencies": ["tw-animate-css"],
+  "ignoreIssues": {
+    "src/web/components/ui/**": ["exports"]
+  }
+}

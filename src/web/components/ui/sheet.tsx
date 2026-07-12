@@ -1,0 +1,72 @@
+import * as DialogPrimitive from "@radix-ui/react-dialog";
+import { X } from "lucide-react";
+import type { ComponentPropsWithoutRef, ElementRef } from "react";
+import { forwardRef } from "react";
+
+import { cn } from "@/web/lib/utils";
+
+const Sheet = DialogPrimitive.Root;
+const SheetTrigger = DialogPrimitive.Trigger;
+const SheetClose = DialogPrimitive.Close;
+
+const SheetContent = forwardRef<
+  ElementRef<typeof DialogPrimitive.Content>,
+  ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
+    side?: "bottom" | "left" | "right" | "top";
+  }
+>(({ className, children, side = "right", ...props }, reference) => (
+  <DialogPrimitive.Portal>
+    <DialogPrimitive.Overlay className="data-[state=open]:animate-in data-[state=closed]:animate-out fixed inset-0 z-50 bg-black/45" />
+    <DialogPrimitive.Content
+      ref={reference}
+      className={cn(
+        "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out fixed z-50 flex flex-col gap-4 p-6 shadow-lg",
+        side === "right" && "inset-y-0 right-0 h-full w-3/4 border-l sm:max-w-lg",
+        side === "left" && "inset-y-0 left-0 h-full w-3/4 border-r sm:max-w-lg",
+        side === "top" && "inset-x-0 top-0 border-b",
+        side === "bottom" && "inset-x-0 bottom-0 border-t",
+        className,
+      )}
+      {...props}
+    >
+      {children}
+      <DialogPrimitive.Close className="focus:ring-ring absolute top-4 right-4 rounded-sm opacity-70 hover:opacity-100 focus:ring-2 focus:outline-none">
+        <X className="size-4" />
+        <span className="sr-only">Close</span>
+      </DialogPrimitive.Close>
+    </DialogPrimitive.Content>
+  </DialogPrimitive.Portal>
+));
+SheetContent.displayName = "SheetContent";
+
+function SheetHeader({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div className={cn("flex flex-col space-y-2 text-center sm:text-left", className)} {...props} />
+  );
+}
+
+const SheetTitle = forwardRef<
+  ElementRef<typeof DialogPrimitive.Title>,
+  ComponentPropsWithoutRef<typeof DialogPrimitive.Title>
+>(({ className, ...props }, reference) => (
+  <DialogPrimitive.Title
+    ref={reference}
+    className={cn("text-lg font-semibold", className)}
+    {...props}
+  />
+));
+SheetTitle.displayName = DialogPrimitive.Title.displayName;
+
+const SheetDescription = forwardRef<
+  ElementRef<typeof DialogPrimitive.Description>,
+  ComponentPropsWithoutRef<typeof DialogPrimitive.Description>
+>(({ className, ...props }, reference) => (
+  <DialogPrimitive.Description
+    ref={reference}
+    className={cn("text-muted-foreground text-sm", className)}
+    {...props}
+  />
+));
+SheetDescription.displayName = DialogPrimitive.Description.displayName;
+
+export { Sheet, SheetClose, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTrigger };

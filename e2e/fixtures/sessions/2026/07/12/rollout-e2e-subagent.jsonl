@@ -1,0 +1,4 @@
+{"type":"session_meta","timestamp":"2026-07-12T04:01:00.000Z","payload":{"session_id":"e2e-session","id":"e2e-mapper","parent_thread_id":"e2e-session","thread_source":"subagent","agent_nickname":"Mapper","agent_role":"explorer","source":{"subagent":{"thread_spawn":{"depth":1}}},"cwd":"/workspace/e2e","timestamp":"2026-07-12T04:01:00.000Z"}}
+{"type":"event_msg","timestamp":"2026-07-12T04:01:00.500Z","payload":{"type":"user_message","message":"Map the dashboard source"}}
+{"type":"turn_context","timestamp":"2026-07-12T04:01:01.000Z","payload":{"model":"gpt-e2e"}}
+{"type":"event_msg","timestamp":"2026-07-12T04:01:02.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"cached_input_tokens":5,"output_tokens":4,"reasoning_output_tokens":1,"total_tokens":24}}}}
