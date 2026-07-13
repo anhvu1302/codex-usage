@@ -4,6 +4,7 @@ import {
   Activity,
   ArrowDownToLine,
   ArrowUpToLine,
+  CalendarRange,
   CircleDollarSign,
   Database,
   RefreshCw,
@@ -158,6 +159,7 @@ export function DashboardView() {
   const models = useQuery({ queryKey: ["models"], queryFn: fetchModels });
   const status = useQuery({ queryKey: ["status"], queryFn: fetchStatus, refetchInterval: 10_000 });
   const showHourly = deferredFilters.from === deferredFilters.to;
+  const isSingleDay = filters.from === filters.to;
   const sync = useMutation({
     mutationFn: syncSessions,
     onError: (error) => toast.error(error.message),
@@ -184,7 +186,7 @@ export function DashboardView() {
 
   return (
     <div className="space-y-6">
-      <section className="flex flex-col justify-between gap-4 lg:flex-row lg:items-end">
+      <section className="motion-reveal motion-delay-1 flex flex-col justify-between gap-4 lg:flex-row lg:items-end">
         <div>
           <h1 className="text-3xl font-semibold tracking-tight">Token usage</h1>
           <p className="text-muted-foreground mt-1 text-sm">
@@ -203,13 +205,20 @@ export function DashboardView() {
           <Button
             variant="outline"
             onClick={() => {
-              const today = localDate(new Date());
               startFiltering(() => {
-                setFilters((current) => ({ ...current, from: today, to: today }));
+                setFilters((current) => {
+                  if (current.from === current.to) {
+                    return { ...current, ...defaultDateRange() };
+                  }
+
+                  const today = localDate(new Date());
+                  return { ...current, from: today, to: today };
+                });
               });
             }}
           >
-            Hôm nay
+            {isSingleDay ? <CalendarRange className="size-4" /> : null}
+            {isSingleDay ? "30 ngày gần nhất" : "Hôm nay"}
           </Button>
           <Select
             value={filters.model ?? "all"}
@@ -252,11 +261,11 @@ export function DashboardView() {
         </Card>
       ) : null}
 
-      <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <section className="motion-stagger grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {dashboard.isLoading ? <MetricSkeletons /> : <Metrics data={dashboard.data} />}
       </section>
 
-      <section className="grid gap-4 xl:grid-cols-5">
+      <section className="motion-stagger grid gap-4 xl:grid-cols-5">
         <Card className="xl:col-span-5">
           <CardHeader>
             <CardTitle>Usage theo ngày</CardTitle>
@@ -302,7 +311,7 @@ export function DashboardView() {
             </CardDescription>
           </CardHeader>
           <CardContent className="p-0">
-            <Table className="min-w-[1100px]">
+            <Table className="motion-table min-w-[1100px]">
               <TableHeader>
                 {table.getHeaderGroups().map((group) => (
                   <TableRow key={group.id}>
@@ -339,7 +348,7 @@ export function DashboardView() {
         </Card>
       </section>
 
-      <Card>
+      <Card className="motion-reveal motion-delay-3">
         <CardHeader>
           <CardTitle>Sessions</CardTitle>
           <CardDescription>
@@ -354,7 +363,7 @@ export function DashboardView() {
                 : "Khoảng này đã được compact nên không còn drill-down session; KPI và biểu đồ theo model/ngày vẫn được giữ."}
             </div>
           ) : null}
-          <Table>
+          <Table className="motion-table">
             <TableHeader>
               <TableRow>
                 <TableHead>Task / session</TableHead>
@@ -702,7 +711,7 @@ function SessionSheet({
           </SheetDescription>
         </SheetHeader>
         {session ? (
-          <div className="grid gap-4 text-sm">
+          <div className="motion-stagger grid gap-4 text-sm">
             <Detail label="Workspace" value={session.cwd ?? "Không có CWD"} />
             <Detail label="Models" value={session.models.join(", ")} />
             <Detail
@@ -764,7 +773,7 @@ function AgentBreakdown({ agents }: { agents: SessionAgentUsage[] }) {
       </div>
       {mainAgent ? <AgentCard agent={mainAgent} /> : null}
       {subagents.length > 0 ? (
-        <div className="grid gap-2">
+        <div className="motion-agent-list grid gap-2">
           <p className="text-muted-foreground text-xs font-medium uppercase">
             Subagents ({subagents.length})
           </p>
@@ -784,7 +793,7 @@ function AgentBreakdown({ agents }: { agents: SessionAgentUsage[] }) {
 function AgentCard({ agent }: { agent: SessionAgentUsage }) {
   const name = agent.isSubagent ? (agent.name ?? "Unnamed subagent") : "Main agent";
   return (
-    <article className="grid gap-3 rounded-lg border p-3">
+    <article className="hover:border-primary/25 grid gap-3 rounded-lg border p-3 transition-[border-color,box-shadow,transform] duration-300 hover:-translate-y-0.5 hover:shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <p className="font-medium">{name}</p>
@@ -831,6 +840,10 @@ function Detail({ label, value }: { label: string; value: string }) {
 }
 
 function defaultFilters(): DashboardFilters {
+  return defaultDateRange();
+}
+
+function defaultDateRange(): DashboardFilters {
   const to = localDate(new Date());
   const fromDate = new Date(`${to}T12:00:00`);
   fromDate.setDate(fromDate.getDate() - 29);

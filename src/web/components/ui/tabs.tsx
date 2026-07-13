@@ -42,7 +42,10 @@ const TabsContent = forwardRef<
 >(({ className, ...props }, reference) => (
   <TabsPrimitive.Content
     ref={reference}
-    className={cn("mt-4 focus-visible:outline-none", className)}
+    className={cn(
+      "data-[state=active]:animate-in data-[state=active]:fade-in data-[state=active]:slide-in-from-bottom-1 mt-4 duration-300 focus-visible:outline-none",
+      className,
+    )}
     {...props}
   />
 ));

@@ -83,7 +83,7 @@ export function RateSettings() {
   );
 
   return (
-    <div className="space-y-6">
+    <div className="motion-stagger space-y-6">
       <Card>
         <CardHeader>
           <CardTitle>Rate cards</CardTitle>
@@ -93,7 +93,7 @@ export function RateSettings() {
           </CardDescription>
         </CardHeader>
         <CardContent className="p-0">
-          <Table>
+          <Table className="motion-table">
             <TableHeader>
               <TableRow>
                 <TableHead>Model</TableHead>

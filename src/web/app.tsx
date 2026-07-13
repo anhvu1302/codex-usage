@@ -29,12 +29,12 @@ function AppContent() {
   const [tab, setTab] = useState("dashboard");
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_top_right,_oklch(0.93_0.04_258),_transparent_34rem)]">
-      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+    <main className="app-shell min-h-screen bg-[radial-gradient(circle_at_top_right,_oklch(0.93_0.04_258),_transparent_34rem)]">
+      <div className="relative z-10 mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <Tabs value={tab} onValueChange={setTab}>
-          <div className="mb-7 flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+          <div className="motion-reveal mb-7 flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
             <div className="flex items-center gap-3">
-              <div className="bg-primary text-primary-foreground rounded-xl p-2">
+              <div className="brand-mark bg-primary text-primary-foreground rounded-xl p-2">
                 <BarChart3 className="size-5" />
               </div>
               <div>

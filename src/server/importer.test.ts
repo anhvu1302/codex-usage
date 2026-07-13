@@ -186,13 +186,13 @@ describe("session importer", () => {
       model: "gpt-child",
       outputRate: 2,
     });
-    await createSessionFile(harness.sessionsDirectory, [
+    const parentSource = await createSessionFile(harness.sessionsDirectory, [
       sessionMeta("session-parent"),
       userMessage("Tạo dashboard usage theo ngày"),
       turnContext("gpt-parent"),
       tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
     ]);
-    await createSessionFile(harness.sessionsDirectory, [
+    const childSource = await createSessionFile(harness.sessionsDirectory, [
       sessionMeta("session-parent", {
         agentId: "agent-mapper",
         depth: 1,
@@ -201,6 +201,7 @@ describe("session importer", () => {
         role: "explorer",
         threadSource: "subagent",
       }),
+      sessionMeta("session-parent"),
       userMessage("Khảo sát source code dashboard"),
       turnContext("gpt-child"),
       tokenCount("2026-07-12T01:01:00.000Z", 200, 50, 30, 10),
@@ -211,6 +212,17 @@ describe("session importer", () => {
 
     const usage = harness.database.select().from(usageEvents).orderBy(usageEvents.timestamp).all();
     expect(usage.map((event) => event.agentId)).toEqual(["session-parent", "agent-mapper"]);
+    expect(
+      harness.database
+        .select({ agentId: importStates.agentId })
+        .from(importStates)
+        .where(eq(importStates.sourcePath, childSource))
+        .get()?.agentId,
+    ).toBe("agent-mapper");
+    expect(
+      harness.database.select().from(sessions).where(eq(sessions.id, "session-parent")).get()
+        ?.sourcePath,
+    ).toBe(parentSource);
 
     const session = getSessions(harness.database, {
       from: "2026-07-12",
@@ -239,6 +251,63 @@ describe("session importer", () => {
         }),
       ]),
     );
+  });
+
+  it("repairs legacy subagent attribution without changing price snapshots", async () => {
+    const harness = await createHarness();
+    upsertModelRate(harness.database, {
+      cachedInputRate: 0.25,
+      inputRate: 1,
+      model: "gpt-child",
+      outputRate: 2,
+    });
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-repair"),
+      turnContext("gpt-parent"),
+      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-repair", {
+        agentId: "agent-legacy",
+        depth: 1,
+        name: "Legacy",
+        parentThreadId: "session-repair",
+        threadSource: "subagent",
+      }),
+      sessionMeta("session-repair"),
+      turnContext("gpt-child"),
+      tokenCount("2026-07-12T01:01:00.000Z", 200, 50, 30, 10),
+    ]);
+    await harness.importer.syncAll();
+
+    harness.database
+      .update(usageEvents)
+      .set({
+        agentId: "session-repair",
+        cachedInputRate: 8,
+        costUsd: 42,
+        inputRate: 9,
+        outputRate: 10,
+      })
+      .where(eq(usageEvents.timestamp, "2026-07-12T01:01:00.000Z"))
+      .run();
+    harness.database.update(importStates).set({ dedupeVersion: 2 }).run();
+
+    const status = await harness.importer.syncAll();
+    const repaired = harness.database
+      .select()
+      .from(usageEvents)
+      .where(eq(usageEvents.timestamp, "2026-07-12T01:01:00.000Z"))
+      .get();
+    expect(status.recordsReclassified).toBeGreaterThanOrEqual(1);
+    expect(repaired).toMatchObject({
+      agentId: "agent-legacy",
+      cachedInputRate: 8,
+      costUsd: 42,
+      inputRate: 9,
+      outputRate: 10,
+      totalTokens: 230,
+    });
   });
 
   it("deduplicates mirrored subagent token snapshots using cumulative usage", async () => {

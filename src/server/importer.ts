@@ -4,7 +4,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { watch, type FSWatcher } from "chokidar";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, ne } from "drizzle-orm";
 
 import { backfillAllUnpricedUsage, reconcileUnknownModels } from "@/server/analytics";
 import { TIME_ZONE } from "@/server/config";
@@ -33,13 +33,18 @@ type RateSnapshot = {
   outputRate: number;
 };
 
+type AttributionCandidate = {
+  agentId: string;
+  timestamp: string;
+};
+
 const DATE_PARTS = new Intl.DateTimeFormat("en-CA", {
   day: "2-digit",
   month: "2-digit",
   timeZone: TIME_ZONE,
   year: "numeric",
 });
-const USAGE_DEDUPE_VERSION = 2;
+const USAGE_DEDUPE_VERSION = 3;
 
 export function normalizeTokenUsage(value: unknown): TokenUsage | null {
   if (!isRecord(value)) return null;
@@ -86,6 +91,7 @@ export function calculateCost(usage: TokenUsage, rate: RateSnapshot): number {
 }
 
 export class SessionImporter {
+  private attributionCandidates: Map<string, AttributionCandidate> | null = null;
   private readonly rateCache = new Map<string, RateSnapshot | null>();
   private readonly scheduledFiles = new Set<string>();
   private readonly sessionIndexPath: string;
@@ -154,12 +160,13 @@ export class SessionImporter {
 
       try {
         const files = await findSessionFiles(this.sessionsDirectory);
-        this.prepareUsageHistoryForDeduplication();
+        this.prepareUsageHistoryForDeduplication(files);
         for (const filePath of files) {
           const inserted = await this.importFile(filePath);
           this.status.filesProcessed += 1;
           this.status.recordsInserted += inserted;
         }
+        this.attributionCandidates = null;
         await this.refreshSessionTitles();
         this.reconcileUsage();
         this.refreshDeletedSources();
@@ -243,7 +250,7 @@ export class SessionImporter {
     }, 350);
   }
 
-  private prepareUsageHistoryForDeduplication() {
+  private prepareUsageHistoryForDeduplication(files: string[]) {
     const states = this.database.select().from(importStates).all();
     if (
       states.length === 0 ||
@@ -252,23 +259,38 @@ export class SessionImporter {
       return;
     }
 
-    const hasDeletedSource = this.database
-      .select()
-      .from(sessions)
-      .all()
-      .some((session) => session.sourceDeleted);
-    if (hasDeletedSource) {
+    const availablePaths = new Set(files);
+    const availableStates = states.filter((state) => availablePaths.has(state.sourcePath));
+    const unavailableStates = states.filter((state) => !availablePaths.has(state.sourcePath));
+    const now = Date.now();
+
+    for (const state of availableStates) {
       this.database
         .update(importStates)
-        .set({ dedupeVersion: USAGE_DEDUPE_VERSION, updatedAt: Date.now() })
+        .set({
+          activeModel: null,
+          agentId: null,
+          dedupeVersion: USAGE_DEDUPE_VERSION - 1,
+          lastOffset: 0,
+          sessionId: null,
+          updatedAt: now,
+        })
+        .where(eq(importStates.sourcePath, state.sourcePath))
         .run();
-      this.status.error =
-        "Không thể rebuild usage legacy vì một số JSONL source đã bị xóa; history hiện có vẫn được giữ.";
-      return;
     }
 
-    this.database.delete(usageEvents).run();
-    this.database.delete(importStates).run();
+    for (const state of unavailableStates) {
+      this.database
+        .update(importStates)
+        .set({ dedupeVersion: USAGE_DEDUPE_VERSION, updatedAt: now })
+        .where(eq(importStates.sourcePath, state.sourcePath))
+        .run();
+    }
+
+    this.attributionCandidates = files.length > 0 ? new Map() : null;
+    if (unavailableStates.length > 0) {
+      this.status.error = `Không thể sửa attribution cho ${unavailableStates.length} JSONL source đã bị xóa; history hiện có vẫn được giữ.`;
+    }
   }
 
   private reconcileUsage() {
@@ -351,6 +373,11 @@ export class SessionImporter {
     if (!payload) return 0;
 
     if (record["type"] === "session_meta") {
+      // A legacy subagent JSONL can embed the parent session metadata immediately after its
+      // own metadata. The first session_meta identifies the physical file owner; inherited
+      // metadata is context and must never move subsequent usage back to the main agent.
+      if (state.sessionId !== null) return 0;
+
       const sessionId = asString(payload["session_id"]) ?? asString(payload["id"]);
       if (!sessionId) return 0;
 
@@ -454,6 +481,8 @@ export class SessionImporter {
       .get();
     if (archived) return 0;
 
+    this.reattributeExistingEvent(eventId, agentId, timestamp);
+
     const rate = this.getRate(model);
     const usageEventValues = {
       agentId,
@@ -499,6 +528,21 @@ export class SessionImporter {
     }
 
     return result.changes;
+  }
+
+  private reattributeExistingEvent(eventId: string, agentId: string, timestamp: string) {
+    if (!this.attributionCandidates) return;
+
+    const current = this.attributionCandidates.get(eventId);
+    if (current && timestamp >= current.timestamp) return;
+    this.attributionCandidates.set(eventId, { agentId, timestamp });
+
+    const result = this.database
+      .update(usageEvents)
+      .set({ agentId })
+      .where(and(eq(usageEvents.id, eventId), ne(usageEvents.agentId, agentId)))
+      .run();
+    this.status.recordsReclassified += result.changes;
   }
 
   private getRate(model: string): RateSnapshot | null {

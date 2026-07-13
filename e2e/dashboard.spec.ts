@@ -11,6 +11,10 @@ test("renders the dashboard, sync action, and rate card settings", async ({ page
   await expect(page.getByText(/Đã sync/)).toBeVisible();
   await page.getByRole("button", { name: "Hôm nay" }).click();
   await expect(page.getByRole("heading", { name: "Usage theo giờ" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "30 ngày gần nhất" })).toBeVisible();
+  await page.getByRole("button", { name: "30 ngày gần nhất" }).click();
+  await expect(page.getByRole("heading", { name: "Usage theo giờ" })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Hôm nay" })).toBeVisible();
 
   await page.getByRole("tab", { name: "Rate cards" }).click();
   await expect(page.getByRole("heading", { name: "Rate cards" })).toBeVisible();
