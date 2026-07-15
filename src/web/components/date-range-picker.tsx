@@ -28,15 +28,16 @@ export function DateRangePicker({ onChange, value }: DateRangePickerProps) {
     <Popover>
       <PopoverTrigger asChild>
         <Button
+          aria-label={`Tuỳ chọn ngày, từ ${value.from} đến ${value.to}`}
           variant="outline"
-          className={cn("w-full justify-start text-left font-normal sm:w-[270px]")}
+          className={cn("w-[260px] justify-start text-left font-normal")}
         >
           <CalendarDays className="size-4" />
           {value.from} — {value.to}
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-auto p-0">
-        <Calendar mode="range" numberOfMonths={2} onSelect={handleSelect} selected={selected} />
+        <Calendar mode="range" numberOfMonths={1} onSelect={handleSelect} selected={selected} />
       </PopoverContent>
     </Popover>
   );

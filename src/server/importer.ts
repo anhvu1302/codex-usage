@@ -4,26 +4,32 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { watch, type FSWatcher } from "chokidar";
-import { and, eq, isNull, ne } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 
+import { parseActivityRecord, type ParsedActivityEvent } from "@/server/activity-parser";
 import { backfillAllUnpricedUsage, reconcileUnknownModels } from "@/server/analytics";
 import { TIME_ZONE } from "@/server/config";
 import type { AppDatabase } from "@/server/db/client";
 import {
+  activityEvents,
+  archivedActivityEventIds,
   archivedUsageEventIds,
+  importDiagnostics,
   importStates,
   modelRates,
   sessionAgents,
   sessions,
   usageEvents,
 } from "@/server/db/schema";
-import type { ImportStatus, TokenUsage } from "@/shared/types";
+import { ensureProject } from "@/server/projects";
+import type { ActivityKind, ImportStatus, TokenUsage } from "@/shared/types";
 
 type JsonRecord = Record<string, unknown>;
 
 type MutableImportState = {
   activeModel: string | null;
   agentId: string | null;
+  projectId: string | null;
   sessionId: string | null;
 };
 
@@ -33,9 +39,30 @@ type RateSnapshot = {
   outputRate: number;
 };
 
-type AttributionCandidate = {
-  agentId: string;
-  timestamp: string;
+type CanonicalBoundary = {
+  resolved: boolean;
+  startLine: number;
+};
+
+type ParsedJsonLine = {
+  malformed: boolean;
+  rawLine: string;
+  record: JsonRecord | null;
+};
+
+type LargeLineProjection = { kind: "ignored" } | { kind: "record"; record: JsonRecord };
+
+type JsonStructureState = {
+  complete: boolean;
+  containerKinds: Uint8Array;
+  depth: number;
+  escaped: boolean;
+  expectations: Uint8Array;
+  invalid: boolean;
+  literalIndex: number;
+  numberState: number;
+  tokenKind: number;
+  unicodeDigits: number;
 };
 
 const DATE_PARTS = new Intl.DateTimeFormat("en-CA", {
@@ -44,7 +71,7 @@ const DATE_PARTS = new Intl.DateTimeFormat("en-CA", {
   timeZone: TIME_ZONE,
   year: "numeric",
 });
-const USAGE_DEDUPE_VERSION = 3;
+const USAGE_DEDUPE_VERSION = 5;
 
 export function normalizeTokenUsage(value: unknown): TokenUsage | null {
   if (!isRecord(value)) return null;
@@ -91,7 +118,8 @@ export function calculateCost(usage: TokenUsage, rate: RateSnapshot): number {
 }
 
 export class SessionImporter {
-  private attributionCandidates: Map<string, AttributionCandidate> | null = null;
+  private readonly activityResetAgents = new Set<string>();
+  private readonly legacyArchivedUsageClaims = new Set<string>();
   private readonly rateCache = new Map<string, RateSnapshot | null>();
   private readonly scheduledFiles = new Set<string>();
   private readonly sessionIndexPath: string;
@@ -152,6 +180,7 @@ export class SessionImporter {
   async stop() {
     await this.watcher?.close();
     this.watcher = null;
+    await this.queue;
   }
 
   syncAll(): Promise<ImportStatus> {
@@ -166,7 +195,6 @@ export class SessionImporter {
           this.status.filesProcessed += 1;
           this.status.recordsInserted += inserted;
         }
-        this.attributionCandidates = null;
         await this.refreshSessionTitles();
         this.reconcileUsage();
         this.refreshDeletedSources();
@@ -201,6 +229,8 @@ export class SessionImporter {
   }
 
   private beginSync() {
+    this.activityResetAgents.clear();
+    this.legacyArchivedUsageClaims.clear();
     this.status = {
       error: null,
       filesProcessed: 0,
@@ -287,9 +317,10 @@ export class SessionImporter {
         .run();
     }
 
-    this.attributionCandidates = files.length > 0 ? new Map() : null;
     if (unavailableStates.length > 0) {
-      this.status.error = `Không thể sửa attribution cho ${unavailableStates.length} JSONL source đã bị xóa; history hiện có vẫn được giữ.`;
+      console.warn(
+        `Bỏ qua attribution repair cho ${unavailableStates.length} JSONL source đã bị xóa; history hiện có vẫn được giữ.`,
+      );
     }
   }
 
@@ -311,17 +342,54 @@ export class SessionImporter {
       savedState && savedState.lastOffset <= fileInfo.size && !needsAgentAttribution
         ? savedState.lastOffset
         : 0;
+    const canonicalBoundary =
+      startOffset === 0 ? await findCanonicalBoundary(filePath) : { resolved: true, startLine: 0 };
+    const savedSession =
+      startOffset > 0 && savedState?.sessionId
+        ? this.database
+            .select({ projectId: sessions.projectId })
+            .from(sessions)
+            .where(eq(sessions.id, savedState.sessionId))
+            .get()
+        : null;
     const state: MutableImportState = {
       activeModel: startOffset === 0 ? null : (savedState?.activeModel ?? null),
       agentId: startOffset === 0 ? null : (savedState?.agentId ?? null),
+      projectId: startOffset === 0 ? null : (savedSession?.projectId ?? null),
       sessionId: startOffset === 0 ? null : (savedState?.sessionId ?? null),
     };
     let inserted = 0;
+    let lineIndex = 0;
+    let activityResetPending =
+      savedState !== undefined && savedState.dedupeVersion !== USAGE_DEDUPE_VERSION;
+    const previousDiagnostic = this.database
+      .select()
+      .from(importDiagnostics)
+      .where(eq(importDiagnostics.sourcePath, filePath))
+      .get();
+    let malformedLines = startOffset === 0 ? 0 : (previousDiagnostic?.malformedLines ?? 0);
+    let readResult: CompleteJsonLinesResult;
 
-    const lastCompleteOffset = await readCompleteJsonLines(filePath, startOffset, (rawLine) => {
-      inserted += this.handleLine(rawLine, filePath, state);
-      return Promise.resolve();
-    });
+    try {
+      readResult = await readCompleteJsonLines(filePath, startOffset, (line) => {
+        if (line.malformed) malformedLines += 1;
+        inserted += this.handleLine(
+          line,
+          filePath,
+          state,
+          lineIndex >= canonicalBoundary.startLine,
+          activityResetPending,
+        );
+        if (state.agentId && activityResetPending) activityResetPending = false;
+        lineIndex += 1;
+        return Promise.resolve();
+      });
+    } catch (error) {
+      this.saveImportDiagnostic(filePath, malformedLines, false, errorMessage(error));
+      throw error;
+    }
+
+    this.saveImportDiagnostic(filePath, malformedLines, readResult.incompleteLine, null);
 
     this.database
       .insert(importStates)
@@ -329,7 +397,7 @@ export class SessionImporter {
         activeModel: state.activeModel,
         agentId: state.agentId,
         dedupeVersion: USAGE_DEDUPE_VERSION,
-        lastOffset: lastCompleteOffset,
+        lastOffset: canonicalBoundary.resolved ? readResult.lastCompleteOffset : 0,
         sessionId: state.sessionId,
         sourcePath: filePath,
         updatedAt: Date.now(),
@@ -340,7 +408,7 @@ export class SessionImporter {
           activeModel: state.activeModel,
           agentId: state.agentId,
           dedupeVersion: USAGE_DEDUPE_VERSION,
-          lastOffset: lastCompleteOffset,
+          lastOffset: canonicalBoundary.resolved ? readResult.lastCompleteOffset : 0,
           sessionId: state.sessionId,
           updatedAt: Date.now(),
         },
@@ -350,24 +418,15 @@ export class SessionImporter {
     return inserted;
   }
 
-  private handleLine(rawLine: string, sourcePath: string, state: MutableImportState): number {
-    if (
-      !rawLine.includes('"session_meta"') &&
-      !rawLine.includes('"turn_context"') &&
-      !rawLine.includes('"user_message"') &&
-      !rawLine.includes('"token_count"')
-    ) {
-      return 0;
-    }
-
-    let record: JsonRecord;
-    try {
-      const parsed: unknown = JSON.parse(rawLine);
-      if (!isRecord(parsed)) return 0;
-      record = parsed;
-    } catch {
-      return 0;
-    }
+  private handleLine(
+    line: ParsedJsonLine,
+    sourcePath: string,
+    state: MutableImportState,
+    isCanonicalLine: boolean,
+    resetActivityForAgent: boolean,
+  ): number {
+    const { rawLine, record } = line;
+    if (!record) return 0;
 
     const payload = asRecord(record["payload"]);
     if (!payload) return 0;
@@ -384,6 +443,10 @@ export class SessionImporter {
       state.sessionId = sessionId;
       const agentId = asString(payload["id"]) ?? sessionId;
       state.agentId = agentId;
+      if (resetActivityForAgent && !this.activityResetAgents.has(agentId)) {
+        this.database.delete(activityEvents).where(eq(activityEvents.agentId, agentId)).run();
+        this.activityResetAgents.add(agentId);
+      }
       const timestamp = asString(payload["timestamp"]) ?? asString(record["timestamp"]) ?? null;
       const parentThreadId = asString(payload["parent_thread_id"]);
       const threadSource =
@@ -394,12 +457,24 @@ export class SessionImporter {
       const depth =
         toNonNegativeInteger(threadSpawn?.["depth"]) ?? (threadSource === "subagent" ? 1 : 0);
       const now = Date.now();
+      const cwd = asString(payload["cwd"]);
+      const existingSession = this.database
+        .select({ cwd: sessions.cwd, projectId: sessions.projectId })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId))
+        .get();
+      const projectId =
+        agentId !== sessionId && existingSession
+          ? (existingSession.projectId ?? ensureProject(this.database, existingSession.cwd ?? cwd))
+          : ensureProject(this.database, cwd);
+      state.projectId = projectId;
       this.database
         .insert(sessions)
         .values({
-          cwd: asString(payload["cwd"]) ?? null,
+          cwd,
           id: sessionId,
           lastSeenAt: now,
+          projectId,
           sourceDeleted: false,
           sourcePath,
           startedAt: timestamp,
@@ -408,10 +483,9 @@ export class SessionImporter {
         .onConflictDoUpdate({
           target: sessions.id,
           set: {
-            cwd: asString(payload["cwd"]) ?? null,
             lastSeenAt: now,
             sourceDeleted: false,
-            ...(agentId === sessionId ? { sourcePath, startedAt: timestamp } : {}),
+            ...(agentId === sessionId ? { cwd, projectId, sourcePath, startedAt: timestamp } : {}),
           },
         })
         .run();
@@ -448,6 +522,10 @@ export class SessionImporter {
       return 0;
     }
 
+    if (!isCanonicalLine) return 0;
+
+    this.insertActivity(record, state);
+
     if (record["type"] === "turn_context") {
       state.activeModel = asString(payload["model"]) ?? state.activeModel;
       return 0;
@@ -470,9 +548,13 @@ export class SessionImporter {
     const cumulativeUsage = normalizeTokenUsage(info?.["total_token_usage"]);
     const model = state.activeModel ?? "unknown";
     const agentId = state.agentId ?? state.sessionId;
-    const sourceHash = createUsageFingerprint(rawLine, usage, cumulativeUsage);
+    const sourceHash = createUsageFingerprint(rawLine, usage, cumulativeUsage, agentId, model);
     const eventId = createHash("sha256")
       .update(`${state.sessionId}\u0000${sourceHash}`)
+      .digest("hex");
+    const legacySourceHash = createLegacyUsageFingerprint(rawLine, usage, cumulativeUsage);
+    const legacyEventId = createHash("sha256")
+      .update(`${state.sessionId}\u0000${legacySourceHash}`)
       .digest("hex");
     const archived = this.database
       .select({ id: archivedUsageEventIds.id })
@@ -480,8 +562,25 @@ export class SessionImporter {
       .where(eq(archivedUsageEventIds.id, eventId))
       .get();
     if (archived) return 0;
-
-    this.reattributeExistingEvent(eventId, agentId, timestamp);
+    const currentEvent = this.database
+      .select()
+      .from(usageEvents)
+      .where(eq(usageEvents.id, eventId))
+      .get();
+    const legacyArchived = this.database
+      .select()
+      .from(archivedUsageEventIds)
+      .where(eq(archivedUsageEventIds.id, legacyEventId))
+      .get();
+    if (legacyArchived && !currentEvent && !this.legacyArchivedUsageClaims.has(legacyEventId)) {
+      this.legacyArchivedUsageClaims.add(legacyEventId);
+      this.database
+        .insert(archivedUsageEventIds)
+        .values({ archivedAt: legacyArchived.archivedAt, id: eventId })
+        .onConflictDoNothing()
+        .run();
+      return 0;
+    }
 
     const rate = this.getRate(model);
     const usageEventValues = {
@@ -499,6 +598,65 @@ export class SessionImporter {
       timestamp,
       totalTokens: usage.totalTokens,
     };
+    if (currentEvent) {
+      const needsRepair =
+        currentEvent.agentId !== agentId ||
+        currentEvent.cachedInputTokens !== usage.cachedInputTokens ||
+        currentEvent.inputTokens !== usage.inputTokens ||
+        currentEvent.localDate !== localDate ||
+        currentEvent.model !== model ||
+        currentEvent.outputTokens !== usage.outputTokens ||
+        currentEvent.reasoningOutputTokens !== usage.reasoningOutputTokens ||
+        currentEvent.sourceHash !== sourceHash ||
+        timestamp < currentEvent.timestamp ||
+        currentEvent.totalTokens !== usage.totalTokens;
+      if (needsRepair) {
+        const repaired = this.database
+          .update(usageEvents)
+          .set({
+            agentId,
+            cachedInputTokens: usage.cachedInputTokens,
+            inputTokens: usage.inputTokens,
+            localDate,
+            model,
+            outputTokens: usage.outputTokens,
+            reasoningOutputTokens: usage.reasoningOutputTokens,
+            sourceHash,
+            ...(timestamp < currentEvent.timestamp ? { timestamp } : {}),
+            totalTokens: usage.totalTokens,
+          })
+          .where(eq(usageEvents.id, eventId))
+          .run();
+        this.status.recordsReclassified += repaired.changes;
+      }
+      return 0;
+    }
+    const legacyEvent = this.database
+      .select()
+      .from(usageEvents)
+      .where(eq(usageEvents.id, legacyEventId))
+      .get();
+    if (legacyEvent) {
+      const migrated = this.database
+        .update(usageEvents)
+        .set({
+          agentId,
+          cachedInputTokens: usage.cachedInputTokens,
+          id: eventId,
+          inputTokens: usage.inputTokens,
+          localDate,
+          model,
+          outputTokens: usage.outputTokens,
+          reasoningOutputTokens: usage.reasoningOutputTokens,
+          sourceHash,
+          timestamp,
+          totalTokens: usage.totalTokens,
+        })
+        .where(eq(usageEvents.id, legacyEventId))
+        .run();
+      this.status.recordsReclassified += migrated.changes;
+      return 0;
+    }
     const result = this.database
       .insert(usageEvents)
       .values({
@@ -522,7 +680,7 @@ export class SessionImporter {
       if (!existing || timestamp >= existing.timestamp) return 0;
       this.database
         .update(usageEvents)
-        .set(usageEventValues)
+        .set({ localDate, timestamp })
         .where(eq(usageEvents.id, existing.id))
         .run();
     }
@@ -530,19 +688,71 @@ export class SessionImporter {
     return result.changes;
   }
 
-  private reattributeExistingEvent(eventId: string, agentId: string, timestamp: string) {
-    if (!this.attributionCandidates) return;
+  private insertActivity(record: JsonRecord, state: MutableImportState) {
+    if (!state.sessionId) return;
+    const activity = parseActivityRecord(record, state.sessionId);
+    if (!activity) return;
 
-    const current = this.attributionCandidates.get(eventId);
-    if (current && timestamp >= current.timestamp) return;
-    this.attributionCandidates.set(eventId, { agentId, timestamp });
+    const agentId = state.agentId ?? state.sessionId;
+    const id = createHash("sha256").update(`${agentId}\u0000${activity.eventHash}`).digest("hex");
+    const legacyId = createHash("sha256")
+      .update(`${agentId}\u0000${activity.legacyEventHash}`)
+      .digest("hex");
+    const archived = this.database
+      .select()
+      .from(archivedActivityEventIds)
+      .where(eq(archivedActivityEventIds.id, id))
+      .get();
+    if (archived) return;
+    const legacyArchived = this.database
+      .select()
+      .from(archivedActivityEventIds)
+      .where(eq(archivedActivityEventIds.id, legacyId))
+      .get();
+    if (legacyArchived) {
+      this.database
+        .insert(archivedActivityEventIds)
+        .values({ archivedAt: legacyArchived.archivedAt, id })
+        .onConflictDoNothing()
+        .run();
+      return;
+    }
 
-    const result = this.database
-      .update(usageEvents)
-      .set({ agentId })
-      .where(and(eq(usageEvents.id, eventId), ne(usageEvents.agentId, agentId)))
+    const localDate = toLocalDate(activity.timestamp);
+    if (!localDate) return;
+    const agentKind = agentId === state.sessionId ? "main" : "subagent";
+    const projectId = state.projectId ?? "legacy-unknown";
+    this.database
+      .insert(activityEvents)
+      .values({
+        agentId,
+        agentKind,
+        createdAt: Date.now(),
+        id,
+        kind: toActivityKind(activity),
+        localDate,
+        projectId,
+        sessionId: state.sessionId,
+        timestamp: activity.timestamp,
+      })
+      .onConflictDoNothing()
       .run();
-    this.status.recordsReclassified += result.changes;
+  }
+
+  private saveImportDiagnostic(
+    sourcePath: string,
+    malformedLines: number,
+    incompleteLine: boolean,
+    lastError: string | null,
+  ) {
+    this.database
+      .insert(importDiagnostics)
+      .values({ incompleteLine, lastError, malformedLines, sourcePath, updatedAt: Date.now() })
+      .onConflictDoUpdate({
+        target: importDiagnostics.sourcePath,
+        set: { incompleteLine, lastError, malformedLines, updatedAt: Date.now() },
+      })
+      .run();
   }
 
   private getRate(model: string): RateSnapshot | null {
@@ -626,6 +836,58 @@ async function findSessionFiles(directory: string): Promise<string[]> {
   }
 }
 
+async function findCanonicalBoundary(filePath: string): Promise<CanonicalBoundary> {
+  let lineIndex = 0;
+  let isSubagent = false;
+  let sessionMetaCount = 0;
+  let lastTaskStartLine = -1;
+  let boundary: CanonicalBoundary | null = null;
+
+  await readCompleteJsonLines(
+    filePath,
+    0,
+    (line) => {
+      const { record } = line;
+      const payload = asRecord(record?.["payload"]);
+      if (record?.["type"] === "session_meta" && payload) {
+        sessionMetaCount += 1;
+        if (sessionMetaCount === 1) {
+          isSubagent =
+            asString(payload["thread_source"]) === "subagent" ||
+            asString(payload["parent_thread_id"]) !== null;
+          if (!isSubagent) {
+            boundary = { resolved: true, startLine: 0 };
+            return false;
+          }
+        }
+      }
+      if (record?.["type"] === "event_msg" && payload?.["type"] === "task_started" && isSubagent) {
+        lastTaskStartLine = lineIndex;
+      }
+      if (record?.["type"] === "inter_agent_communication_metadata" && isSubagent) {
+        boundary = {
+          resolved: true,
+          startLine: sessionMetaCount > 1 && lastTaskStartLine >= 0 ? lastTaskStartLine : 0,
+        };
+        return false;
+      }
+
+      lineIndex += 1;
+      return true;
+    },
+    "boundary",
+  );
+
+  if (boundary) return boundary;
+
+  // Standalone subagent files contain one session_meta and are canonical from the start.
+  // A multi-meta file without its handoff tail is conservatively ignored until a later rescan.
+  return {
+    resolved: sessionMetaCount <= 1,
+    startLine: sessionMetaCount > 1 ? lineIndex : 0,
+  };
+}
+
 async function readIndexedSessionTitles(filePath: string): Promise<Map<string, string>> {
   let content: string;
   try {
@@ -654,32 +916,741 @@ async function readIndexedSessionTitles(filePath: string): Promise<Map<string, s
   return new Map([...titles].map(([id, value]) => [id, value.title]));
 }
 
+type CompleteJsonLinesResult = {
+  incompleteLine: boolean;
+  lastCompleteOffset: number;
+};
+
+const JSON_LINE_PREFIX_BYTES = 8 * 1024;
+const JSON_LINE_PROJECTION_BYTES = JSON_LINE_PREFIX_BYTES;
+
 async function readCompleteJsonLines(
   filePath: string,
   offset: number,
-  onLine: (line: string) => Promise<void>,
-): Promise<number> {
+  onLine: (line: ParsedJsonLine) => boolean | Promise<boolean> | Promise<void> | void,
+  purpose: "boundary" | "import" = "import",
+): Promise<CompleteJsonLinesResult> {
   const stream = createReadStream(filePath, { start: offset });
-  let pending = Buffer.alloc(0);
+  let bufferedSegments: Buffer[] = [];
+  let bufferedBytes = 0;
+  let projection: LargeLineProjection | null = null;
+  let projectionAttempted = false;
+  let projectedStructure: JsonStructureState | null = null;
   let lastCompleteOffset = offset;
+  const chunks: AsyncIterable<unknown> = stream;
+  const reusableStructure = createJsonStructureState();
 
-  for await (const chunk of stream) {
-    const bytes = Buffer.concat([pending, chunk]);
+  for await (const chunkValue of chunks) {
+    if (!Buffer.isBuffer(chunkValue)) throw new TypeError("Expected a binary JSONL stream chunk");
+    const chunk = chunkValue;
     let cursor = 0;
-    let newlineIndex = bytes.indexOf(0x0a, cursor);
+    let newlineIndex = chunk.indexOf(0x0a, cursor);
 
     while (newlineIndex !== -1) {
-      const line = bytes.subarray(cursor, newlineIndex).toString("utf8").replace(/\r$/, "");
-      await onLine(line);
-      lastCompleteOffset += newlineIndex + 1 - cursor;
+      const segment = chunk.subarray(cursor, newlineIndex);
+      ({ bufferedBytes, bufferedSegments, projectedStructure, projection, projectionAttempted } =
+        appendLineSegment(
+          segment,
+          bufferedSegments,
+          bufferedBytes,
+          projection,
+          projectionAttempted,
+          projectedStructure,
+          purpose,
+          reusableStructure,
+        ));
+      const line = finalizeJsonLine(
+        bufferedSegments,
+        bufferedBytes,
+        projection,
+        projectedStructure,
+        purpose,
+        reusableStructure,
+      );
+      const shouldContinue = await onLine(line);
+      lastCompleteOffset += bufferedBytes + 1;
+      bufferedSegments = [];
+      bufferedBytes = 0;
+      projection = null;
+      projectionAttempted = false;
+      projectedStructure = null;
+      if (shouldContinue === false) {
+        return { incompleteLine: false, lastCompleteOffset };
+      }
       cursor = newlineIndex + 1;
-      newlineIndex = bytes.indexOf(0x0a, cursor);
+      newlineIndex = chunk.indexOf(0x0a, cursor);
     }
 
-    pending = bytes.subarray(cursor);
+    const segment = chunk.subarray(cursor);
+    ({ bufferedBytes, bufferedSegments, projectedStructure, projection, projectionAttempted } =
+      appendLineSegment(
+        segment,
+        bufferedSegments,
+        bufferedBytes,
+        projection,
+        projectionAttempted,
+        projectedStructure,
+        purpose,
+        reusableStructure,
+      ));
   }
 
-  return lastCompleteOffset;
+  return { incompleteLine: bufferedBytes > 0, lastCompleteOffset };
+}
+
+function appendLineSegment(
+  segment: Buffer,
+  bufferedSegments: Buffer[],
+  bufferedBytes: number,
+  projection: LargeLineProjection | null,
+  projectionAttempted: boolean,
+  projectedStructure: JsonStructureState | null,
+  purpose: "boundary" | "import",
+  reusableStructure: JsonStructureState,
+) {
+  const nextBytes = bufferedBytes + segment.length;
+  if (projection && projectedStructure) {
+    updateJsonStructure(projectedStructure, segment);
+    return {
+      bufferedBytes: nextBytes,
+      bufferedSegments,
+      projectedStructure,
+      projection,
+      projectionAttempted,
+    };
+  }
+
+  bufferedSegments.push(segment);
+  if (nextBytes < JSON_LINE_PROJECTION_BYTES || projectionAttempted) {
+    return {
+      bufferedBytes: nextBytes,
+      bufferedSegments,
+      projectedStructure,
+      projection,
+      projectionAttempted,
+    };
+  }
+
+  const prefix = copyBufferPrefix(bufferedSegments, JSON_LINE_PREFIX_BYTES).toString("utf8");
+  const nextProjection = projectLargeRecord(prefix, purpose);
+  if (!nextProjection) {
+    return {
+      bufferedBytes: nextBytes,
+      bufferedSegments,
+      projectedStructure,
+      projection,
+      projectionAttempted: true,
+    };
+  }
+
+  const nextStructure = resetJsonStructure(reusableStructure);
+  for (const bufferedSegment of bufferedSegments) {
+    updateJsonStructure(nextStructure, bufferedSegment);
+  }
+
+  return {
+    bufferedBytes: nextBytes,
+    bufferedSegments: [],
+    projectedStructure: nextStructure,
+    projection: nextProjection,
+    projectionAttempted: true,
+  };
+}
+
+function finalizeJsonLine(
+  bufferedSegments: Buffer[],
+  bufferedBytes: number,
+  projection: LargeLineProjection | null,
+  projectedStructure: JsonStructureState | null,
+  purpose: "boundary" | "import",
+  reusableStructure: JsonStructureState,
+): ParsedJsonLine {
+  if (projection && projectedStructure) {
+    return finalizeProjectedJsonLine(projection, projectedStructure);
+  }
+
+  const onlySegment = bufferedSegments[0];
+  const prefixBytes =
+    bufferedSegments.length === 1 && onlySegment
+      ? onlySegment.subarray(0, JSON_LINE_PREFIX_BYTES)
+      : copyBufferPrefix(bufferedSegments, JSON_LINE_PREFIX_BYTES);
+  const prefix = prefixBytes.toString("utf8");
+  const completeProjection = projectLargeRecord(prefix, purpose);
+  if (completeProjection) {
+    const structure = resetJsonStructure(reusableStructure);
+    for (const segment of bufferedSegments) updateJsonStructure(structure, segment);
+    return finalizeProjectedJsonLine(completeProjection, structure);
+  }
+
+  const lineBytes =
+    bufferedSegments.length === 1 && onlySegment
+      ? onlySegment
+      : Buffer.concat(bufferedSegments, bufferedBytes);
+  const rawLine = (
+    bufferedBytes <= JSON_LINE_PREFIX_BYTES ? prefix : lineBytes.toString("utf8")
+  ).replace(/\r$/, "");
+  if (!rawLine.trim()) return { malformed: false, rawLine, record: null };
+  try {
+    const parsed: unknown = JSON.parse(rawLine);
+    return { malformed: !isRecord(parsed), rawLine, record: isRecord(parsed) ? parsed : null };
+  } catch {
+    return { malformed: true, rawLine, record: null };
+  }
+}
+
+function finalizeProjectedJsonLine(
+  projection: LargeLineProjection,
+  structure: JsonStructureState,
+): ParsedJsonLine {
+  const structurallyValid = finishJsonStructure(structure);
+  return {
+    malformed: !structurallyValid,
+    rawLine: "",
+    record: structurallyValid && projection.kind === "record" ? projection.record : null,
+  };
+}
+
+const RELEVANT_EVENT_TYPES = new Set([
+  "context_compacted",
+  "mcp_tool_call_end",
+  "patch_apply_end",
+  "task_complete",
+  "task_started",
+  "token_count",
+  "turn_aborted",
+  "user_message",
+  "web_search_end",
+]);
+const RELEVANT_RESPONSE_ITEM_TYPES = new Set([
+  "custom_tool_call",
+  "function_call",
+  "web_search_call",
+]);
+const CANONICAL_RECORD_PREFIX_PATTERN =
+  /^\s*\{\s*"timestamp"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"type"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"payload"\s*:\s*\{/;
+
+function projectLargeRecord(
+  prefix: string,
+  purpose: "boundary" | "import",
+): LargeLineProjection | null {
+  const envelope = CANONICAL_RECORD_PREFIX_PATTERN.exec(prefix);
+  if (!envelope?.[1] || !envelope[2]) return null;
+  const timestamp = parseJsonString(envelope[1]);
+  const recordType = parseJsonString(envelope[2]);
+  if (!timestamp || !recordType) return null;
+  const payloadFields = readShallowStringFields(prefix.slice(envelope[0].length));
+  const payloadType = payloadFields.get("type");
+
+  if (purpose === "boundary") {
+    if (recordType === "session_meta" || recordType === "inter_agent_communication_metadata") {
+      return null;
+    }
+    if (recordType === "event_msg" && payloadType === "task_started") return null;
+    return payloadType || ["compacted", "turn_context", "world_state"].includes(recordType)
+      ? { kind: "ignored" }
+      : null;
+  }
+
+  if (recordType === "world_state") return { kind: "ignored" };
+  if (recordType === "event_msg" || recordType === "response_item") {
+    if (!payloadType) return null;
+    const relevantTypes =
+      recordType === "event_msg" ? RELEVANT_EVENT_TYPES : RELEVANT_RESPONSE_ITEM_TYPES;
+    if (!relevantTypes.has(payloadType)) return { kind: "ignored" };
+    if (
+      recordType === "event_msg" &&
+      (payloadType === "mcp_tool_call_end" || payloadType === "patch_apply_end")
+    ) {
+      const callId = payloadFields.get("call_id");
+      if (!callId) return null;
+      return {
+        kind: "record",
+        record: {
+          payload: { call_id: callId, type: payloadType },
+          timestamp,
+          type: recordType,
+        },
+      };
+    }
+    return null;
+  }
+
+  if (recordType !== "compacted") return null;
+  return {
+    kind: "record",
+    record: { payload: {}, timestamp, type: "compacted" },
+  };
+}
+
+function readShallowStringFields(fragment: string): Map<string, string> {
+  const fields = new Map<string, string>();
+  let cursor = 0;
+  while (cursor < fragment.length) {
+    cursor = skipStringWhitespace(fragment, cursor);
+    if (fragment.charAt(cursor) === "}") return fields;
+    const key = readJsonStringToken(fragment, cursor);
+    if (!key) return fields;
+    cursor = skipStringWhitespace(fragment, key.end);
+    if (fragment.charAt(cursor) !== ":") return fields;
+    cursor = skipStringWhitespace(fragment, cursor + 1);
+    const stringValue = readJsonStringToken(fragment, cursor);
+    if (stringValue) {
+      fields.set(key.value, stringValue.value);
+      cursor = stringValue.end;
+    } else {
+      const valueEnd = skipJsonValuePrefix(fragment, cursor);
+      if (valueEnd === null) return fields;
+      cursor = valueEnd;
+    }
+    cursor = skipStringWhitespace(fragment, cursor);
+    if (fragment.charAt(cursor) === "}") return fields;
+    if (fragment.charAt(cursor) !== ",") return fields;
+    cursor += 1;
+  }
+  return fields;
+}
+
+function readJsonStringToken(value: string, start: number): { end: number; value: string } | null {
+  if (value.charAt(start) !== '"') return null;
+  let escaped = false;
+  for (let index = start + 1; index < value.length; index += 1) {
+    const character = value.charAt(index);
+    if (escaped) {
+      escaped = false;
+    } else if (character === "\\") {
+      escaped = true;
+    } else if (character === '"') {
+      const parsed = parseJsonString(value.slice(start, index + 1));
+      return parsed === null ? null : { end: index + 1, value: parsed };
+    }
+  }
+  return null;
+}
+
+function skipJsonValuePrefix(value: string, start: number): number | null {
+  const opening = value.charAt(start);
+  if (opening !== "{" && opening !== "[") {
+    for (let index = start; index < value.length; index += 1) {
+      if (value.charAt(index) === "," || value.charAt(index) === "}") return index;
+    }
+    return null;
+  }
+
+  const stack = [opening === "{" ? "}" : "]"];
+  let inString = false;
+  let escaped = false;
+  for (let index = start + 1; index < value.length; index += 1) {
+    const character = value.charAt(index);
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === "{") stack.push("}");
+    else if (character === "[") stack.push("]");
+    else if (character === "}" || character === "]") {
+      if (stack.pop() !== character) return null;
+      if (stack.length === 0) return index + 1;
+    }
+  }
+  return null;
+}
+
+function skipStringWhitespace(value: string, start: number): number {
+  let index = start;
+  while (
+    value.charAt(index) === " " ||
+    value.charAt(index) === "\t" ||
+    value.charAt(index) === "\n" ||
+    value.charAt(index) === "\r"
+  ) {
+    index += 1;
+  }
+  return index;
+}
+
+function parseJsonString(value: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function copyBufferPrefix(segments: Buffer[], maximumBytes: number): Buffer {
+  const prefix = Buffer.allocUnsafe(
+    Math.min(
+      maximumBytes,
+      segments.reduce((total, segment) => total + segment.length, 0),
+    ),
+  );
+  let written = 0;
+  for (const segment of segments) {
+    if (written >= prefix.length) break;
+    written += segment.copy(prefix, written, 0, prefix.length - written);
+  }
+  return prefix;
+}
+
+const JSON_MAX_DEPTH = 256;
+const CONTAINER_OBJECT = 1;
+const CONTAINER_ARRAY = 2;
+const EXPECT_OBJECT_KEY_OR_END = 1;
+const EXPECT_OBJECT_KEY = 2;
+const EXPECT_OBJECT_COLON = 3;
+const EXPECT_OBJECT_VALUE = 4;
+const EXPECT_OBJECT_COMMA_OR_END = 5;
+const EXPECT_ARRAY_VALUE_OR_END = 6;
+const EXPECT_ARRAY_VALUE = 7;
+const EXPECT_ARRAY_COMMA_OR_END = 8;
+const TOKEN_NONE = 0;
+const TOKEN_STRING_KEY = 1;
+const TOKEN_STRING_VALUE = 2;
+const TOKEN_TRUE = 3;
+const TOKEN_FALSE = 4;
+const TOKEN_NULL = 5;
+const TOKEN_NUMBER = 6;
+const NUMBER_AFTER_MINUS = 1;
+const NUMBER_ZERO = 2;
+const NUMBER_INTEGER = 3;
+const NUMBER_AFTER_DECIMAL = 4;
+const NUMBER_FRACTION = 5;
+const NUMBER_AFTER_EXPONENT = 6;
+const NUMBER_AFTER_EXPONENT_SIGN = 7;
+const NUMBER_EXPONENT = 8;
+
+function createJsonStructureState(): JsonStructureState {
+  return resetJsonStructure({
+    complete: false,
+    containerKinds: new Uint8Array(JSON_MAX_DEPTH),
+    depth: 0,
+    escaped: false,
+    expectations: new Uint8Array(JSON_MAX_DEPTH),
+    invalid: false,
+    literalIndex: 0,
+    numberState: 0,
+    tokenKind: TOKEN_NONE,
+    unicodeDigits: 0,
+  });
+}
+
+function resetJsonStructure(state: JsonStructureState): JsonStructureState {
+  state.complete = false;
+  state.depth = 0;
+  state.escaped = false;
+  state.invalid = false;
+  state.literalIndex = 0;
+  state.numberState = 0;
+  state.tokenKind = TOKEN_NONE;
+  state.unicodeDigits = 0;
+  return state;
+}
+
+function updateJsonStructure(state: JsonStructureState, buffer: Buffer) {
+  let index = 0;
+  while (index < buffer.length) {
+    if (state.invalid) return;
+    const byte = buffer.readUInt8(index);
+    if (state.tokenKind !== TOKEN_NONE) {
+      if (consumeJsonToken(state, byte)) index += 1;
+      continue;
+    }
+
+    if (isJsonWhitespace(byte)) {
+      index += 1;
+      continue;
+    }
+    if (state.complete) {
+      state.invalid = true;
+      return;
+    }
+
+    if (state.depth === 0) {
+      startJsonValue(state, byte);
+    } else {
+      const top = state.depth - 1;
+      const kind = state.containerKinds.at(top);
+      const expectation = state.expectations.at(top);
+      if (kind === CONTAINER_OBJECT) {
+        if (expectation === EXPECT_OBJECT_KEY || expectation === EXPECT_OBJECT_KEY_OR_END) {
+          if (byte === 0x7d && expectation === EXPECT_OBJECT_KEY_OR_END) {
+            closeJsonContainer(state, CONTAINER_OBJECT);
+          } else if (byte === 0x22) {
+            startJsonString(state, TOKEN_STRING_KEY);
+          } else {
+            state.invalid = true;
+          }
+        } else if (expectation === EXPECT_OBJECT_COLON) {
+          if (byte === 0x3a) setTopExpectation(state, EXPECT_OBJECT_VALUE);
+          else state.invalid = true;
+        } else if (expectation === EXPECT_OBJECT_VALUE) {
+          startJsonValue(state, byte);
+        } else if (byte === 0x2c) {
+          setTopExpectation(state, EXPECT_OBJECT_KEY);
+        } else if (byte === 0x7d) {
+          closeJsonContainer(state, CONTAINER_OBJECT);
+        } else {
+          state.invalid = true;
+        }
+      } else if (expectation === EXPECT_ARRAY_VALUE || expectation === EXPECT_ARRAY_VALUE_OR_END) {
+        if (byte === 0x5d && expectation === EXPECT_ARRAY_VALUE_OR_END) {
+          closeJsonContainer(state, CONTAINER_ARRAY);
+        } else if (byte === 0x22) {
+          startJsonString(state, TOKEN_STRING_VALUE);
+        } else {
+          startJsonValue(state, byte);
+        }
+      } else if (byte === 0x2c) {
+        setTopExpectation(state, EXPECT_ARRAY_VALUE);
+      } else if (byte === 0x5d) {
+        closeJsonContainer(state, CONTAINER_ARRAY);
+      } else {
+        state.invalid = true;
+      }
+    }
+    index += 1;
+  }
+}
+
+function startJsonValue(state: JsonStructureState, byte: number) {
+  if (byte === 0x7b) {
+    pushJsonContainer(state, CONTAINER_OBJECT, EXPECT_OBJECT_KEY_OR_END);
+  } else if (byte === 0x5b) {
+    pushJsonContainer(state, CONTAINER_ARRAY, EXPECT_ARRAY_VALUE_OR_END);
+  } else if (byte === 0x22) {
+    startJsonString(state, TOKEN_STRING_VALUE);
+  } else if (byte === 0x74) {
+    startJsonLiteral(state, TOKEN_TRUE);
+  } else if (byte === 0x66) {
+    startJsonLiteral(state, TOKEN_FALSE);
+  } else if (byte === 0x6e) {
+    startJsonLiteral(state, TOKEN_NULL);
+  } else if (byte === 0x2d || (byte >= 0x30 && byte <= 0x39)) {
+    state.tokenKind = TOKEN_NUMBER;
+    state.numberState =
+      byte === 0x2d ? NUMBER_AFTER_MINUS : byte === 0x30 ? NUMBER_ZERO : NUMBER_INTEGER;
+  } else {
+    state.invalid = true;
+  }
+}
+
+function startJsonString(state: JsonStructureState, tokenKind: number) {
+  state.tokenKind = tokenKind;
+  state.escaped = false;
+  state.unicodeDigits = 0;
+}
+
+function startJsonLiteral(state: JsonStructureState, tokenKind: number) {
+  state.tokenKind = tokenKind;
+  state.literalIndex = 1;
+}
+
+function pushJsonContainer(state: JsonStructureState, kind: number, expectation: number) {
+  if (state.depth >= JSON_MAX_DEPTH) {
+    state.invalid = true;
+    return;
+  }
+  state.containerKinds.fill(kind, state.depth, state.depth + 1);
+  state.expectations.fill(expectation, state.depth, state.depth + 1);
+  state.depth += 1;
+}
+
+function closeJsonContainer(state: JsonStructureState, kind: number) {
+  if (state.depth === 0 || state.containerKinds.at(state.depth - 1) !== kind) {
+    state.invalid = true;
+    return;
+  }
+  state.depth -= 1;
+  finishJsonValue(state);
+}
+
+function consumeJsonToken(state: JsonStructureState, byte: number): boolean {
+  if (state.tokenKind === TOKEN_STRING_KEY || state.tokenKind === TOKEN_STRING_VALUE) {
+    if (state.unicodeDigits > 0) {
+      if (!isHexDigit(byte)) state.invalid = true;
+      else state.unicodeDigits -= 1;
+    } else if (state.escaped) {
+      state.escaped = false;
+      if (byte === 0x75) state.unicodeDigits = 4;
+      else if (!isJsonEscapeByte(byte)) {
+        state.invalid = true;
+      }
+    } else if (byte === 0x5c) {
+      state.escaped = true;
+    } else if (byte === 0x22) {
+      const completedToken = state.tokenKind;
+      state.tokenKind = TOKEN_NONE;
+      if (completedToken === TOKEN_STRING_KEY) finishJsonKey(state);
+      else finishJsonValue(state);
+    } else if (byte < 0x20) {
+      state.invalid = true;
+    }
+    return true;
+  }
+
+  if (
+    state.tokenKind === TOKEN_TRUE ||
+    state.tokenKind === TOKEN_FALSE ||
+    state.tokenKind === TOKEN_NULL
+  ) {
+    if (byte !== expectedJsonLiteralByte(state.tokenKind, state.literalIndex)) {
+      state.invalid = true;
+      return true;
+    }
+    state.literalIndex += 1;
+    if (state.literalIndex === jsonLiteralLength(state.tokenKind)) {
+      state.tokenKind = TOKEN_NONE;
+      finishJsonValue(state);
+    }
+    return true;
+  }
+
+  return consumeJsonNumber(state, byte);
+}
+
+function finishJsonKey(state: JsonStructureState) {
+  if (state.depth === 0 || state.containerKinds.at(state.depth - 1) !== CONTAINER_OBJECT) {
+    state.invalid = true;
+    return;
+  }
+  const expectation = state.expectations.at(state.depth - 1);
+  if (expectation !== EXPECT_OBJECT_KEY && expectation !== EXPECT_OBJECT_KEY_OR_END) {
+    state.invalid = true;
+    return;
+  }
+  setTopExpectation(state, EXPECT_OBJECT_COLON);
+}
+
+function finishJsonValue(state: JsonStructureState) {
+  if (state.depth === 0) {
+    state.complete = true;
+    return;
+  }
+  const top = state.depth - 1;
+  const kind = state.containerKinds.at(top);
+  const expectation = state.expectations.at(top);
+  if (kind === CONTAINER_OBJECT && expectation === EXPECT_OBJECT_VALUE) {
+    setTopExpectation(state, EXPECT_OBJECT_COMMA_OR_END);
+  } else if (
+    kind === CONTAINER_ARRAY &&
+    (expectation === EXPECT_ARRAY_VALUE || expectation === EXPECT_ARRAY_VALUE_OR_END)
+  ) {
+    setTopExpectation(state, EXPECT_ARRAY_COMMA_OR_END);
+  } else {
+    state.invalid = true;
+  }
+}
+
+function consumeJsonNumber(state: JsonStructureState, byte: number): boolean {
+  const isDigit = byte >= 0x30 && byte <= 0x39;
+  switch (state.numberState) {
+    case NUMBER_AFTER_MINUS:
+      if (!isDigit) state.invalid = true;
+      else state.numberState = byte === 0x30 ? NUMBER_ZERO : NUMBER_INTEGER;
+      return true;
+    case NUMBER_ZERO:
+      if (byte === 0x2e) state.numberState = NUMBER_AFTER_DECIMAL;
+      else if (byte === 0x45 || byte === 0x65) state.numberState = NUMBER_AFTER_EXPONENT;
+      else if (isDigit) state.invalid = true;
+      else return finishJsonNumber(state);
+      return true;
+    case NUMBER_INTEGER:
+      if (isDigit) return true;
+      if (byte === 0x2e) state.numberState = NUMBER_AFTER_DECIMAL;
+      else if (byte === 0x45 || byte === 0x65) state.numberState = NUMBER_AFTER_EXPONENT;
+      else return finishJsonNumber(state);
+      return true;
+    case NUMBER_AFTER_DECIMAL:
+      if (!isDigit) state.invalid = true;
+      else state.numberState = NUMBER_FRACTION;
+      return true;
+    case NUMBER_FRACTION:
+      if (isDigit) return true;
+      if (byte === 0x45 || byte === 0x65) state.numberState = NUMBER_AFTER_EXPONENT;
+      else return finishJsonNumber(state);
+      return true;
+    case NUMBER_AFTER_EXPONENT:
+      if (byte === 0x2b || byte === 0x2d) state.numberState = NUMBER_AFTER_EXPONENT_SIGN;
+      else if (isDigit) state.numberState = NUMBER_EXPONENT;
+      else state.invalid = true;
+      return true;
+    case NUMBER_AFTER_EXPONENT_SIGN:
+      if (!isDigit) state.invalid = true;
+      else state.numberState = NUMBER_EXPONENT;
+      return true;
+    case NUMBER_EXPONENT:
+      if (isDigit) return true;
+      return finishJsonNumber(state);
+    default:
+      state.invalid = true;
+      return true;
+  }
+}
+
+function finishJsonNumber(state: JsonStructureState): false {
+  state.tokenKind = TOKEN_NONE;
+  finishJsonValue(state);
+  return false;
+}
+
+function expectedJsonLiteralByte(tokenKind: number, index: number): number {
+  if (tokenKind === TOKEN_TRUE) return "true".charCodeAt(index);
+  if (tokenKind === TOKEN_FALSE) return "false".charCodeAt(index);
+  if (tokenKind === TOKEN_NULL) return "null".charCodeAt(index);
+  return -1;
+}
+
+function jsonLiteralLength(tokenKind: number): number {
+  return tokenKind === TOKEN_FALSE ? 5 : 4;
+}
+
+function setTopExpectation(state: JsonStructureState, expectation: number) {
+  if (state.depth === 0) {
+    state.invalid = true;
+    return;
+  }
+  state.expectations.fill(expectation, state.depth - 1, state.depth);
+}
+
+function finishJsonStructure(state: JsonStructureState): boolean {
+  if (
+    state.tokenKind === TOKEN_NUMBER &&
+    (state.numberState === NUMBER_ZERO ||
+      state.numberState === NUMBER_INTEGER ||
+      state.numberState === NUMBER_FRACTION ||
+      state.numberState === NUMBER_EXPONENT)
+  ) {
+    finishJsonNumber(state);
+  }
+  return !state.invalid && state.tokenKind === TOKEN_NONE && state.complete && state.depth === 0;
+}
+
+function isJsonWhitespace(byte: number): boolean {
+  return byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d;
+}
+
+function isJsonEscapeByte(byte: number): boolean {
+  return (
+    byte === 0x22 ||
+    byte === 0x2f ||
+    byte === 0x5c ||
+    byte === 0x62 ||
+    byte === 0x66 ||
+    byte === 0x6e ||
+    byte === 0x72 ||
+    byte === 0x74
+  );
+}
+
+function isHexDigit(byte: number): boolean {
+  return (
+    (byte >= 0x30 && byte <= 0x39) ||
+    (byte >= 0x41 && byte <= 0x46) ||
+    (byte >= 0x61 && byte <= 0x66)
+  );
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -694,6 +1665,12 @@ function asString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function toActivityKind(activity: ParsedActivityEvent): ActivityKind {
+  if (activity.category === "task_start") return "task_started";
+  if (activity.category === "task_complete") return "task_completed";
+  return activity.category;
+}
+
 function summarizeTask(message: string): string | null {
   const request = message.split(/##\s*My request for Codex:\s*/i)[1] ?? message;
   const compact = request.replace(/\s+/g, " ").trim();
@@ -702,6 +1679,18 @@ function summarizeTask(message: string): string | null {
 }
 
 function createUsageFingerprint(
+  rawLine: string,
+  lastUsage: TokenUsage,
+  cumulativeUsage: TokenUsage | null,
+  agentId: string,
+  model: string,
+): string {
+  const observation = cumulativeUsage ? { cumulativeUsage, lastUsage } : rawLine;
+  const value = JSON.stringify({ agentId, model, observation });
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function createLegacyUsageFingerprint(
   rawLine: string,
   lastUsage: TokenUsage,
   cumulativeUsage: TokenUsage | null,

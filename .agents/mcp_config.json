@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": [
+        "serve",
+        "--mcp",
+        "--path",
+        "/Users/VanAnh/WorkSpace/Personal/codex-usage"
+      ]
+    }
+  }
+}

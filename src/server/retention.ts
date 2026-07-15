@@ -6,9 +6,14 @@ import { and, eq, lt, sql } from "drizzle-orm";
 import type { AppDatabase } from "@/server/db/client";
 import { reclaimDatabaseSpace } from "@/server/db/client";
 import {
+  activityDailyRollups,
+  activityEvents,
+  archivedActivityEventIds,
   archivedUsageEventIds,
   retentionState,
   sessionAgents,
+  sessions,
+  usageAgentDailyRollups,
   usageDailyRollups,
   usageEvents,
   usageHourlyRollups,
@@ -184,7 +189,7 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
   return database.transaction((transaction) => {
     const hourlyWrite = transaction.run(sql`
       insert into ${usageHourlyRollups} (
-        local_date, local_hour, model, agent_kind,
+        local_date, local_hour, model, agent_kind, project_id,
         input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
         request_count, cost_usd, unpriced_usage_count,
         unpriced_input_tokens, unpriced_cached_input_tokens, unpriced_output_tokens
@@ -194,6 +199,7 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
         strftime('%H:00', datetime(${usageEvents.timestamp}, '+7 hours')),
         ${usageEvents.model},
         case when ${sessionAgents.threadSource} = 'subagent' then 'subagent' else 'main' end,
+        coalesce(${sessions.projectId}, 'legacy-unknown'),
         sum(${usageEvents.inputTokens}),
         sum(${usageEvents.cachedInputTokens}),
         sum(${usageEvents.outputTokens}),
@@ -207,9 +213,10 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
         sum(case when ${usageEvents.costUsd} is null then ${usageEvents.outputTokens} else 0 end)
       from ${usageEvents}
       left join ${sessionAgents} on ${sessionAgents.id} = ${usageEvents.agentId}
+      left join ${sessions} on ${sessions.id} = ${usageEvents.sessionId}
       where ${usageEvents.localDate} < ${rawFrom}
-      group by ${usageEvents.localDate}, 2, ${usageEvents.model}, 4
-      on conflict(local_date, local_hour, model, agent_kind) do update set
+      group by ${usageEvents.localDate}, 2, ${usageEvents.model}, 4, 5
+      on conflict(local_date, local_hour, model, agent_kind, project_id) do update set
         input_tokens = input_tokens + excluded.input_tokens,
         cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
         output_tokens = output_tokens + excluded.output_tokens,
@@ -224,7 +231,7 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
     `);
     const dailyWrite = transaction.run(sql`
       insert into ${usageDailyRollups} (
-        local_date, model, agent_kind,
+        local_date, model, agent_kind, project_id,
         input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
         request_count, cost_usd, unpriced_usage_count,
         unpriced_input_tokens, unpriced_cached_input_tokens, unpriced_output_tokens
@@ -233,6 +240,7 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
         ${usageEvents.localDate},
         ${usageEvents.model},
         case when ${sessionAgents.threadSource} = 'subagent' then 'subagent' else 'main' end,
+        coalesce(${sessions.projectId}, 'legacy-unknown'),
         sum(${usageEvents.inputTokens}),
         sum(${usageEvents.cachedInputTokens}),
         sum(${usageEvents.outputTokens}),
@@ -246,9 +254,10 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
         sum(case when ${usageEvents.costUsd} is null then ${usageEvents.outputTokens} else 0 end)
       from ${usageEvents}
       left join ${sessionAgents} on ${sessionAgents.id} = ${usageEvents.agentId}
+      left join ${sessions} on ${sessions.id} = ${usageEvents.sessionId}
       where ${usageEvents.localDate} < ${rawFrom}
-      group by ${usageEvents.localDate}, ${usageEvents.model}, 3
-      on conflict(local_date, model, agent_kind) do update set
+      group by ${usageEvents.localDate}, ${usageEvents.model}, 3, 4
+      on conflict(local_date, model, agent_kind, project_id) do update set
         input_tokens = input_tokens + excluded.input_tokens,
         cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
         output_tokens = output_tokens + excluded.output_tokens,
@@ -261,31 +270,104 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
         unpriced_cached_input_tokens = unpriced_cached_input_tokens + excluded.unpriced_cached_input_tokens,
         unpriced_output_tokens = unpriced_output_tokens + excluded.unpriced_output_tokens
     `);
+    const agentDailyWrite = transaction.run(sql`
+      insert into ${usageAgentDailyRollups} (
+        local_date, agent_id, session_id, model, agent_kind, project_id,
+        input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+        request_count, cost_usd, unpriced_usage_count,
+        unpriced_input_tokens, unpriced_cached_input_tokens, unpriced_output_tokens
+      )
+      select
+        ${usageEvents.localDate},
+        ${usageEvents.agentId},
+        ${usageEvents.sessionId},
+        ${usageEvents.model},
+        case when ${sessionAgents.threadSource} = 'subagent' then 'subagent' else 'main' end,
+        coalesce(${sessions.projectId}, 'legacy-unknown'),
+        sum(${usageEvents.inputTokens}),
+        sum(${usageEvents.cachedInputTokens}),
+        sum(${usageEvents.outputTokens}),
+        sum(${usageEvents.reasoningOutputTokens}),
+        sum(${usageEvents.totalTokens}),
+        count(*),
+        coalesce(sum(${usageEvents.costUsd}), 0),
+        sum(case when ${usageEvents.costUsd} is null then 1 else 0 end),
+        sum(case when ${usageEvents.costUsd} is null then ${usageEvents.inputTokens} else 0 end),
+        sum(case when ${usageEvents.costUsd} is null then ${usageEvents.cachedInputTokens} else 0 end),
+        sum(case when ${usageEvents.costUsd} is null then ${usageEvents.outputTokens} else 0 end)
+      from ${usageEvents}
+      left join ${sessionAgents} on ${sessionAgents.id} = ${usageEvents.agentId}
+      left join ${sessions} on ${sessions.id} = ${usageEvents.sessionId}
+      where ${usageEvents.localDate} < ${rawFrom}
+      group by
+        ${usageEvents.localDate},
+        ${usageEvents.agentId},
+        ${usageEvents.sessionId},
+        ${usageEvents.model},
+        5,
+        6
+      on conflict(local_date, agent_id, session_id, model, agent_kind, project_id) do update set
+        input_tokens = input_tokens + excluded.input_tokens,
+        cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
+        output_tokens = output_tokens + excluded.output_tokens,
+        reasoning_output_tokens = reasoning_output_tokens + excluded.reasoning_output_tokens,
+        total_tokens = total_tokens + excluded.total_tokens,
+        request_count = request_count + excluded.request_count,
+        cost_usd = cost_usd + excluded.cost_usd,
+        unpriced_usage_count = unpriced_usage_count + excluded.unpriced_usage_count,
+        unpriced_input_tokens = unpriced_input_tokens + excluded.unpriced_input_tokens,
+        unpriced_cached_input_tokens = unpriced_cached_input_tokens + excluded.unpriced_cached_input_tokens,
+        unpriced_output_tokens = unpriced_output_tokens + excluded.unpriced_output_tokens
+    `);
+    transaction.run(sql`
+      insert into ${activityDailyRollups} (
+        local_date, kind, agent_kind, project_id, event_count
+      )
+      select
+        ${activityEvents.localDate},
+        ${activityEvents.kind},
+        ${activityEvents.agentKind},
+        ${activityEvents.projectId},
+        count(*)
+      from ${activityEvents}
+      where ${activityEvents.localDate} < ${rawFrom}
+      group by
+        ${activityEvents.localDate},
+        ${activityEvents.kind},
+        ${activityEvents.agentKind},
+        ${activityEvents.projectId}
+      on conflict(local_date, kind, agent_kind, project_id) do update set
+        event_count = event_count + excluded.event_count
+    `);
 
     transaction.run(sql`
       insert or ignore into ${usageRollupSessionMemberships}
-        (bucket_type, bucket_start, model, agent_kind, session_id)
+        (bucket_type, bucket_start, model, agent_kind, project_id, session_id)
       select
         'hour',
         ${usageEvents.localDate} || 'T' || strftime('%H:00', datetime(${usageEvents.timestamp}, '+7 hours')),
         ${usageEvents.model},
         case when ${sessionAgents.threadSource} = 'subagent' then 'subagent' else 'main' end,
+        coalesce(${sessions.projectId}, 'legacy-unknown'),
         ${usageEvents.sessionId}
       from ${usageEvents}
       left join ${sessionAgents} on ${sessionAgents.id} = ${usageEvents.agentId}
+      left join ${sessions} on ${sessions.id} = ${usageEvents.sessionId}
       where ${usageEvents.localDate} < ${rawFrom}
     `);
     transaction.run(sql`
       insert or ignore into ${usageRollupSessionMemberships}
-        (bucket_type, bucket_start, model, agent_kind, session_id)
+        (bucket_type, bucket_start, model, agent_kind, project_id, session_id)
       select
         'day',
         ${usageEvents.localDate},
         ${usageEvents.model},
         case when ${sessionAgents.threadSource} = 'subagent' then 'subagent' else 'main' end,
+        coalesce(${sessions.projectId}, 'legacy-unknown'),
         ${usageEvents.sessionId}
       from ${usageEvents}
       left join ${sessionAgents} on ${sessionAgents.id} = ${usageEvents.agentId}
+      left join ${sessions} on ${sessions.id} = ${usageEvents.sessionId}
       where ${usageEvents.localDate} < ${rawFrom}
     `);
     transaction.run(sql`
@@ -294,11 +376,18 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
       from ${usageEvents}
       where ${usageEvents.localDate} < ${rawFrom}
     `);
+    transaction.run(sql`
+      insert or ignore into ${archivedActivityEventIds} (id, archived_at)
+      select ${activityEvents.id}, ${archivedAt}
+      from ${activityEvents}
+      where ${activityEvents.localDate} < ${rawFrom}
+    `);
 
     const rawDelete = transaction
       .delete(usageEvents)
       .where(lt(usageEvents.localDate, rawFrom))
       .run();
+    transaction.delete(activityEvents).where(lt(activityEvents.localDate, rawFrom)).run();
     const hourlyDelete = transaction
       .delete(usageHourlyRollups)
       .where(lt(usageHourlyRollups.localDate, hourlyFrom))
@@ -316,7 +405,7 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
     return {
       hourlyRowsDeleted: hourlyDelete.changes + hourlyMembershipDelete.changes,
       rawEventsDeleted: rawDelete.changes,
-      rollupRowsWritten: hourlyWrite.changes + dailyWrite.changes,
+      rollupRowsWritten: hourlyWrite.changes + dailyWrite.changes + agentDailyWrite.changes,
     };
   });
 }

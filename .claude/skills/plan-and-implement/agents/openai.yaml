@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan and Implement"
+  short_description: "Plan-first implementation for Codex Usage"
+  default_prompt: "Use $plan-and-implement to plan a Codex Usage change, wait for approval, then implement and verify it."

@@ -7,11 +7,13 @@ import { createApp } from "@/server/app";
 import { getConfig } from "@/server/config";
 import { createDatabase, migrateDatabase } from "@/server/db/client";
 import { SessionImporter } from "@/server/importer";
+import { backfillProjects } from "@/server/projects";
 import { RetentionService } from "@/server/retention";
 
 const config = getConfig();
 const database = createDatabase(config.databasePath);
 migrateDatabase(database);
+backfillProjects(database);
 
 const importer = new SessionImporter(database, config.sessionsDirectory);
 await importer.start();

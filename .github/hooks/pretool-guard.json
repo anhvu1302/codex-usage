@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "bash .github/hooks/pretool-guard.sh",
+        "cwd": ".",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

@@ -3,12 +3,14 @@ import type { ReactNode } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/web/components/ui/card";
 
 type MetricCardProps = {
+  detail?: string;
   icon: ReactNode;
   label: string;
+  trend?: string | null;
   value: string;
 };
 
-export function MetricCard({ icon, label, value }: MetricCardProps) {
+export function MetricCard({ detail, icon, label, trend, value }: MetricCardProps) {
   return (
     <Card className="metric-card group">
       <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
@@ -16,9 +18,25 @@ export function MetricCard({ icon, label, value }: MetricCardProps) {
         <span className="metric-card-icon text-muted-foreground rounded-lg p-1.5">{icon}</span>
       </CardHeader>
       <CardContent>
-        <p key={value} className="metric-value text-2xl font-bold tracking-tight">
+        <p key={value} className="metric-value text-2xl font-bold tracking-tight tabular-nums">
           {value}
         </p>
+        {detail || trend ? (
+          <div className="text-muted-foreground mt-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <span>{detail}</span>
+            {trend ? (
+              <span
+                className={
+                  trend.startsWith("+")
+                    ? "text-amber-600 dark:text-amber-400"
+                    : "text-emerald-600 dark:text-emerald-400"
+                }
+              >
+                {trend} kỳ trước
+              </span>
+            ) : null}
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );

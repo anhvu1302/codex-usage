@@ -13,7 +13,7 @@
     "build": "pnpm build:web && pnpm build:server",
     "build:web": "vite build",
     "build:server": "tsup",
-    "start": "cross-env NODE_ENV=production node build-server/index.js",
+    "start": "cross-env NODE_ENV=production node --max-old-space-size=64 --max-semi-space-size=4 build-server/index.js",
     "prod": "pnpm build && pnpm start",
     "pm2:start": "pnpm build && pm2 startOrRestart ecosystem.config.cjs --env production --update-env && pm2 save",
     "pm2:restart": "pnpm build && pm2 restart ecosystem.config.cjs --env production --update-env && pm2 save",
@@ -58,6 +58,7 @@
     "react-day-picker": "^10.0.1",
     "react-dom": "^19.2.7",
     "react-hook-form": "^7.81.0",
+    "react-router": "^8.2.0",
     "recharts": "^3.8.0",
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.6.0",
@@ -65,6 +66,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
     "@eslint/js": "^9.39.5",
     "@playwright/test": "^1.61.1",
     "@tailwindcss/vite": "^4.3.2",

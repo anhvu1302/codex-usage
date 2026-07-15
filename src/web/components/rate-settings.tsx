@@ -84,9 +84,9 @@ export function RateSettings() {
 
   return (
     <div className="motion-stagger space-y-6">
-      <Card>
+      <Card id="rate-cards" className="scroll-mt-20">
         <CardHeader>
-          <CardTitle>Rate cards</CardTitle>
+          <CardTitle>Bảng giá model</CardTitle>
           <CardDescription>
             Giá USD trên 1 triệu token. Usage giữ price snapshot lúc import; Backfill chỉ cập nhật
             record chưa có cost.
@@ -100,8 +100,8 @@ export function RateSettings() {
                 <TableHead>Input</TableHead>
                 <TableHead>Cached input</TableHead>
                 <TableHead>Output</TableHead>
-                <TableHead>Updated</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
+                <TableHead>Cập nhật</TableHead>
+                <TableHead className="text-right">Thao tác</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -128,7 +128,7 @@ export function RateSettings() {
                           onClick={() => setEditing({ model, rate })}
                         >
                           <Pencil className="size-3.5" />
-                          Edit
+                          Sửa
                         </Button>
                         {rate ? (
                           <Button
@@ -189,7 +189,7 @@ function StorageSettings() {
       <CardHeader className="flex flex-row items-start justify-between gap-4">
         <div>
           <CardTitle className="flex items-center gap-2">
-            <Archive className="size-4" /> Storage retention
+            <Archive className="size-4" /> Chính sách lưu trữ
           </CardTitle>
           <CardDescription className="mt-1">
             Raw 30 ngày, hourly 90 ngày, daily theo model và main/subagent được giữ vĩnh viễn.
@@ -203,7 +203,7 @@ function StorageSettings() {
           <RefreshCw
             className={compact.isPending || data?.isCompacting ? "size-4 animate-spin" : "size-4"}
           />
-          Compact now
+          Compact ngay
         </Button>
       </CardHeader>
       <CardContent className="space-y-4">

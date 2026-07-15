@@ -12,8 +12,13 @@ export type DateRange = {
 };
 
 export type DashboardFilters = DateRange & {
+  agentKind?: AgentKind;
   model?: string;
+  models?: string[];
+  projectId?: string;
 };
+
+type AgentKind = "all" | "main" | "subagent";
 
 export type DashboardKpis = TokenUsage & {
   estimatedCostUsd: number;
@@ -28,7 +33,9 @@ export type DailyUsage = DashboardKpis & {
 
 export type DailyModelUsage = {
   date: string;
+  estimatedCostUsd: number;
   model: string;
+  requestCount: number;
   totalTokens: number;
 };
 
@@ -37,8 +44,10 @@ export type HourlyUsage = DashboardKpis & {
 };
 
 export type HourlyModelUsage = {
+  estimatedCostUsd: number;
   hour: string;
   model: string;
+  requestCount: number;
   totalTokens: number;
 };
 
@@ -53,6 +62,7 @@ export type SessionUsage = DashboardKpis & {
   firstEventAt: string;
   lastEventAt: string;
   models: string[];
+  projectId: string | null;
   sessionId: string;
   sourceDeleted: boolean;
   title: string | null;
@@ -61,11 +71,12 @@ export type SessionUsage = DashboardKpis & {
 export type SessionAgentUsage = Omit<DashboardKpis, "sessionCount"> & {
   agentId: string;
   depth: number;
-  firstEventAt: string;
+  firstEventAt: string | null;
   isSubagent: boolean;
-  lastEventAt: string;
+  lastEventAt: string | null;
   models: string[];
   name: string | null;
+  parentAgentId: string | null;
   role: string | null;
   sourceDeleted: boolean;
   taskSummary: string | null;
@@ -104,7 +115,19 @@ export type SessionCoverage = {
 
 export type SessionsResponse = {
   coverage: SessionCoverage;
+  page: number;
+  pageSize: number;
   sessions: SessionUsage[];
+  total: number;
+};
+
+export type SessionFilters = DashboardFilters & {
+  hasSubagents?: boolean;
+  order?: "asc" | "desc";
+  page?: number;
+  pageSize?: number;
+  query?: string;
+  sort?: "cost" | "lastActivity" | "tokens";
 };
 
 export type StorageStatus = {
@@ -139,4 +162,187 @@ export type DashboardResponse = {
   kpis: DashboardKpis;
   models: ModelUsage[];
   retention: RetentionCoverage;
+};
+
+export type EfficiencyMetrics = {
+  averageCostPerDay: number;
+  averageTokensPerDay: number;
+  cacheRate: number;
+  costPerRequest: number;
+  reasoningShare: number;
+  tokensPerSession: number;
+};
+
+export type MetricDelta = {
+  absolute: number;
+  percent: number | null;
+};
+
+export type InsightAlert = {
+  date: string;
+  kind: "cost" | "tokens";
+  value: number;
+};
+
+export type InsightsResponse = {
+  anomalies: InsightAlert[];
+  current: DashboardKpis;
+  deltas: {
+    cost: MetricDelta;
+    requests: MetricDelta;
+    tokens: MetricDelta;
+  };
+  efficiency: EfficiencyMetrics;
+  modelCostMover: {
+    currentCostUsd: number;
+    deltaUsd: number;
+    model: string;
+    previousCostUsd: number;
+  } | null;
+  monthlyCostProjection: number | null;
+  previous: DashboardKpis;
+  previousRange: DateRange;
+  unusualSession: {
+    estimatedCostUsd: number;
+    reasons: ("cost" | "tokens")[];
+    sessionId: string;
+    title: string | null;
+    totalTokens: number;
+  } | null;
+};
+
+export type ProjectSummary = DashboardKpis & {
+  daily: DailyUsage[];
+  displayName: string;
+  displayPath: string;
+  id: string;
+  modelMix: { model: string; totalTokens: number }[];
+  subagentCostUsd: number;
+  subagentShare: number;
+  subagentTokens: number;
+  topSessions: SessionUsage[];
+};
+
+export type ProjectsResponse = {
+  projects: ProjectSummary[];
+};
+
+export type AgentUsageSummary = Omit<SessionAgentUsage, "firstEventAt" | "lastEventAt"> & {
+  firstEventAt: string | null;
+  lastEventAt: string | null;
+  projectIds: string[];
+  sessionCount: number;
+};
+
+export type AgentsResponse = {
+  agents: AgentUsageSummary[];
+  coverage: SessionCoverage;
+  daily: {
+    date: string;
+    main: DashboardKpis;
+    subagent: DashboardKpis;
+  }[];
+  main: DashboardKpis;
+  subagent: DashboardKpis;
+};
+
+export type AgentFilters = DashboardFilters & {
+  depth?: number;
+  role?: string;
+};
+
+export type BudgetPeriod = "daily" | "monthly";
+
+export type BudgetSetting = {
+  enabled: boolean;
+  limitUsd: number;
+  period: BudgetPeriod;
+  updatedAt: string;
+  warningThresholds: number[];
+};
+
+export type AlertEvent = {
+  createdAt: string;
+  dismissedAt: string | null;
+  id: string;
+  message: string;
+  periodStart: string;
+  seenAt: string | null;
+  severity: "critical" | "info" | "warning";
+  title: string;
+  type: "anomaly" | "budget" | "data-health";
+};
+
+export type PricingSimulationRequest = DashboardFilters & {
+  rates: Omit<ModelRate, "updatedAt">[];
+};
+
+export type PricingSimulationResponse = {
+  currentCostUsd: number;
+  deltaUsd: number;
+  simulatedCostUsd: number;
+};
+
+export type ActivityKind =
+  | "abort"
+  | "compaction"
+  | "file"
+  | "mcp"
+  | "other"
+  | "patch"
+  | "shell"
+  | "task_completed"
+  | "task_started"
+  | "turn"
+  | "web";
+
+export type ActivitySummary = {
+  agentKind: Exclude<AgentKind, "all">;
+  count: number;
+  date: string;
+  kind: ActivityKind;
+  projectId: string;
+};
+
+export type ActivityFilters = DashboardFilters & {
+  kinds?: ActivityKind[];
+  sessionId?: string;
+};
+
+export type ActivityTimelineItem = {
+  agentId: string;
+  agentKind: Exclude<AgentKind, "all">;
+  depth: number;
+  id: string;
+  kind: ActivityKind;
+  name: string | null;
+  parentAgentId: string | null;
+  projectId: string;
+  role: string | null;
+  sessionId: string;
+  timestamp: string;
+};
+
+export type ActivityResponse = {
+  daily: ActivitySummary[];
+  timeline: ActivityTimelineItem[];
+  timelineCoverage: SessionCoverage;
+  timelineTruncated: boolean;
+};
+
+export type DataHealthResponse = {
+  activityDailyRows: number;
+  activityRawEvents: number;
+  hourlyCoverageFrom: string;
+  incompleteFiles: number;
+  importerError: string | null;
+  lastCompactionAt: string | null;
+  lastSyncAt: string | null;
+  malformedLines: number;
+  rawCoverageFrom: string;
+  retentionError: string | null;
+  sourceDeletedAgents: number;
+  sourceDeletedSessions: number;
+  unknownUsage: number;
+  unpricedUsage: number;
 };

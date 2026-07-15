@@ -1,4 +1,5 @@
-import { appendFile, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { appendFile, mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,14 +18,20 @@ import { createApp } from "@/server/app";
 import { getConfig } from "@/server/config";
 import { createDatabase, migrateDatabase, type AppDatabase } from "@/server/db/client";
 import {
+  activityEvents,
+  archivedActivityEventIds,
   archivedUsageEventIds,
+  importDiagnostics,
   importStates,
+  sessionAgents,
   sessions,
+  usageAgentDailyRollups,
   usageDailyRollups,
   usageEvents,
   usageHourlyRollups,
   usageRollupSessionMemberships,
 } from "@/server/db/schema";
+import { parseActivityRecord } from "@/server/activity-parser";
 import {
   calculateCost,
   normalizeTokenUsage,
@@ -123,12 +130,18 @@ describe("session importer", () => {
     });
 
     await rm(source);
-    await harness.importer.syncAll();
+    harness.database
+      .update(importStates)
+      .set({ dedupeVersion: 0 })
+      .where(eq(importStates.sourcePath, source))
+      .run();
+    const deletedSourceSync = await harness.importer.syncAll();
     const session = harness.database
       .select()
       .from(sessions)
       .where(eq(sessions.id, "session-idempotent"))
       .get();
+    expect(deletedSourceSync.error).toBeNull();
     expect(session?.sourceDeleted).toBe(true);
     expect(harness.database.select().from(usageEvents).all()).toHaveLength(3);
   });
@@ -172,6 +185,87 @@ describe("session importer", () => {
     expect(costs.map((event) => event.costUsd)).toEqual([0.00021, 0.00031]);
   });
 
+  it("rolls back cost backfill across raw and every rollup tier", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-backfill-atomic"),
+      turnContext("gpt-atomic"),
+      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await harness.importer.syncAll();
+    const aggregate = {
+      cachedInputTokens: 20,
+      costUsd: 0,
+      inputTokens: 100,
+      outputTokens: 10,
+      reasoningOutputTokens: 4,
+      requestCount: 1,
+      totalTokens: 110,
+      unpricedCachedInputTokens: 20,
+      unpricedInputTokens: 100,
+      unpricedOutputTokens: 10,
+      unpricedUsageCount: 1,
+    };
+    harness.database
+      .insert(usageDailyRollups)
+      .values({
+        ...aggregate,
+        agentKind: "main",
+        localDate: "2026-06-01",
+        model: "gpt-atomic",
+      })
+      .run();
+    harness.database
+      .insert(usageHourlyRollups)
+      .values({
+        ...aggregate,
+        agentKind: "main",
+        localDate: "2026-06-01",
+        localHour: "08:00",
+        model: "gpt-atomic",
+      })
+      .run();
+    harness.database
+      .insert(usageAgentDailyRollups)
+      .values({
+        ...aggregate,
+        agentId: "session-backfill-atomic",
+        agentKind: "main",
+        localDate: "2026-06-01",
+        model: "gpt-atomic",
+        sessionId: "session-backfill-atomic",
+      })
+      .run();
+    upsertModelRate(harness.database, {
+      cachedInputRate: 0.5,
+      inputRate: 2,
+      model: "gpt-atomic",
+      outputRate: 4,
+    });
+    harness.database.run(sql`
+      create trigger reject_hourly_backfill
+      before update on usage_hourly_rollups
+      begin
+        select raise(abort, 'forced backfill failure');
+      end
+    `);
+
+    expect(() => backfillUnpricedUsage(harness.database, "gpt-atomic")).toThrow();
+    expect(harness.database.select().from(usageEvents).get()?.costUsd).toBeNull();
+    expect(harness.database.select().from(usageDailyRollups).get()).toMatchObject({
+      costUsd: 0,
+      unpricedUsageCount: 1,
+    });
+    expect(harness.database.select().from(usageHourlyRollups).get()).toMatchObject({
+      costUsd: 0,
+      unpricedUsageCount: 1,
+    });
+    expect(harness.database.select().from(usageAgentDailyRollups).get()).toMatchObject({
+      costUsd: 0,
+      unpricedUsageCount: 1,
+    });
+  });
+
   it("names parent sessions and attributes child usage to individual subagents", async () => {
     const harness = await createHarness();
     upsertModelRate(harness.database, {
@@ -202,8 +296,12 @@ describe("session importer", () => {
         threadSource: "subagent",
       }),
       sessionMeta("session-parent"),
-      userMessage("Khảo sát source code dashboard"),
+      turnContext("gpt-parent"),
+      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+      taskStarted("turn-child", "2026-07-12T01:00:01.000Z"),
       turnContext("gpt-child"),
+      interAgentHandoff("2026-07-12T01:00:02.000Z"),
+      userMessage("Khảo sát source code dashboard"),
       tokenCount("2026-07-12T01:01:00.000Z", 200, 50, 30, 10),
     ]);
 
@@ -275,7 +373,9 @@ describe("session importer", () => {
         threadSource: "subagent",
       }),
       sessionMeta("session-repair"),
+      taskStarted("turn-repair", "2026-07-12T01:00:01.000Z"),
       turnContext("gpt-child"),
+      interAgentHandoff("2026-07-12T01:00:02.000Z"),
       tokenCount("2026-07-12T01:01:00.000Z", 200, 50, 30, 10),
     ]);
     await harness.importer.syncAll();
@@ -310,7 +410,7 @@ describe("session importer", () => {
     });
   });
 
-  it("deduplicates mirrored subagent token snapshots using cumulative usage", async () => {
+  it("does not collapse distinct agents that report the same cumulative token snapshot", async () => {
     const harness = await createHarness();
     const cumulativeUsage = { cached: 800, input: 1_000, output: 100, reasoning: 40 };
     await createSessionFile(harness.sessionsDirectory, [
@@ -330,15 +430,274 @@ describe("session importer", () => {
       tokenCount("2026-07-11T17:10:00.000Z", 100, 20, 10, 4, cumulativeUsage),
     ]);
 
-    expect((await harness.importer.syncAll()).recordsInserted).toBe(1);
+    expect((await harness.importer.syncAll()).recordsInserted).toBe(2);
     const events = harness.database.select().from(usageEvents).all();
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
-      agentId: "session-mirrored",
-      localDate: "2026-07-11",
-      timestamp: "2026-07-11T16:50:00.000Z",
+    expect(events).toHaveLength(2);
+    expect(events.map((event) => event.agentId).sort()).toEqual([
+      "agent-replay",
+      "session-mirrored",
+    ]);
+  });
+
+  it("retries an incomplete inherited prefix instead of advancing past its handoff", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-partial-handoff"),
+      turnContext("gpt-main"),
+      tokenCount("2026-07-12T01:00:00.000Z", 10, 2, 1, 0),
+    ]);
+    const childSource = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-partial-handoff", {
+        agentId: "agent-partial",
+        depth: 1,
+        parentThreadId: "session-partial-handoff",
+        threadSource: "subagent",
+      }),
+      sessionMeta("session-partial-handoff"),
+      turnContext("gpt-main"),
+      tokenCount("2026-07-12T01:00:00.000Z", 10, 2, 1, 0),
+      taskStarted("turn-partial", "2026-07-12T01:00:30.000Z"),
+      turnContext("gpt-child", "2026-07-12T01:00:31.000Z", "turn-partial"),
+      tokenCount("2026-07-12T01:01:00.000Z", 20, 4, 2, 1),
+    ]);
+
+    await harness.importer.syncAll();
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
+    expect(
+      harness.database
+        .select()
+        .from(importStates)
+        .where(eq(importStates.sourcePath, childSource))
+        .get()?.lastOffset,
+    ).toBe(0);
+
+    await appendFile(childSource, `${interAgentHandoff("2026-07-12T01:01:01.000Z")}\n`);
+    await harness.importer.syncAll();
+    expect(
+      harness.database
+        .select()
+        .from(usageEvents)
+        .all()
+        .map((event) => event.agentId)
+        .sort(),
+    ).toEqual(["agent-partial", "session-partial-handoff"]);
+  });
+
+  it("skips inherited main snapshots while preserving canonical child usage, activity, and cost", async () => {
+    const harness = await createHarness();
+    upsertModelRate(harness.database, {
+      cachedInputRate: 0.5,
+      inputRate: 2,
+      model: "gpt-main",
+      outputRate: 4,
+    });
+    upsertModelRate(harness.database, {
+      cachedInputRate: 0.25,
+      inputRate: 1,
+      model: "gpt-subagent",
+      outputRate: 2,
+    });
+    const mainCumulative = { cached: 20, input: 100, output: 10, reasoning: 4 };
+    const childCumulative = { cached: 70, input: 300, output: 40, reasoning: 14 };
+    const mainTask = taskStarted("turn-main", "2026-05-01T01:00:00.000Z");
+    const mainTurn = turnContext("gpt-main", "2026-05-01T01:00:01.000Z", "turn-main");
+    const mainCall = activityCall("call-main", "2026-05-01T01:00:02.000Z");
+    const mainUsage = tokenCount("2026-05-01T01:00:03.000Z", 100, 20, 10, 4, mainCumulative);
+    const inheritedLargeMessage = JSON.stringify({
+      timestamp: "2026-05-01T01:00:04.000Z",
+      type: "response_item",
+      payload: { type: "message", content: "x".repeat(512 * 1024) },
+    });
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-inherited"),
+      mainTask,
+      mainTurn,
+      mainCall,
+      mainUsage,
+    ]);
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-inherited", {
+        agentId: "agent-canonical",
+        depth: 1,
+        name: "Canonical",
+        parentThreadId: "session-inherited",
+        threadSource: "subagent",
+      }),
+      sessionMeta("session-inherited"),
+      mainTask,
+      mainTurn,
+      mainCall,
+      mainUsage,
+      inheritedLargeMessage,
+      taskStarted("turn-child", "2026-05-01T01:01:00.000Z"),
+      turnContext("gpt-subagent", "2026-05-01T01:01:01.000Z", "turn-child"),
+      interAgentHandoff("2026-05-01T01:01:02.000Z"),
+      activityCall("call-child", "2026-05-01T01:01:03.000Z"),
+      tokenCount("2026-05-01T01:01:04.000Z", 200, 50, 30, 10, childCumulative),
+    ]);
+
+    expect((await harness.importer.syncAll()).recordsInserted).toBe(2);
+    const usage = harness.database.select().from(usageEvents).orderBy(usageEvents.timestamp).all();
+    expect(usage).toHaveLength(2);
+    expect(usage[0]).toMatchObject({
+      agentId: "session-inherited",
+      costUsd: 0.00021,
+      model: "gpt-main",
       totalTokens: 110,
     });
+    expect(usage[1]).toMatchObject({
+      agentId: "agent-canonical",
+      costUsd: 0.0002225,
+      model: "gpt-subagent",
+      totalTokens: 230,
+    });
+    const activities = harness.database.select().from(activityEvents).all();
+    expect(activities).toHaveLength(6);
+    expect(
+      Object.fromEntries(
+        ["session-inherited", "agent-canonical"].map((agentId) => [
+          agentId,
+          activities.filter((event) => event.agentId === agentId).length,
+        ]),
+      ),
+    ).toEqual({ "agent-canonical": 3, "session-inherited": 3 });
+
+    harness.database.update(importStates).set({ lastOffset: 0 }).run();
+    await harness.importer.syncAll();
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(2);
+    expect(harness.database.select().from(activityEvents).all()).toHaveLength(6);
+
+    const parsedMainCall = parseActivityRecord(
+      JSON.parse(mainCall) as unknown,
+      "session-inherited",
+    );
+    if (!parsedMainCall) throw new Error("Expected a parsed main activity call");
+    const stableActivityId = createHash("sha256")
+      .update(`session-inherited\u0000${parsedMainCall.eventHash}`)
+      .digest("hex");
+    const legacyActivityId = createHash("sha256")
+      .update(`session-inherited\u0000${parsedMainCall.legacyEventHash}`)
+      .digest("hex");
+    compactUsage(harness.database, new Date("2026-07-13T00:00:00.000Z"));
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(0);
+    expect(harness.database.select().from(activityEvents).all()).toHaveLength(0);
+    harness.database
+      .delete(archivedActivityEventIds)
+      .where(eq(archivedActivityEventIds.id, stableActivityId))
+      .run();
+    harness.database
+      .insert(archivedActivityEventIds)
+      .values({ archivedAt: Date.now(), id: legacyActivityId })
+      .onConflictDoNothing()
+      .run();
+    harness.database.update(importStates).set({ lastOffset: 0 }).run();
+    await harness.importer.syncAll();
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(0);
+    expect(harness.database.select().from(activityEvents).all()).toHaveLength(0);
+    expect(
+      harness.database
+        .select()
+        .from(archivedActivityEventIds)
+        .where(eq(archivedActivityEventIds.id, stableActivityId))
+        .get(),
+    ).toBeTruthy();
+    expect(
+      harness.database
+        .select({ total: sql<number>`sum(${usageDailyRollups.totalTokens})` })
+        .from(usageDailyRollups)
+        .get()?.total,
+    ).toBe(340);
+  });
+
+  it("attributes nested subagents to their own models without overwriting the main workspace", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-nested", { cwd: "/workspace/main" }),
+      turnContext("gpt-main"),
+      tokenCount("2026-07-12T01:00:00.000Z", 10, 2, 1, 0),
+    ]);
+    await harness.importer.syncAll();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-nested", {
+        agentId: "agent-child",
+        cwd: "/workspace/child",
+        depth: 1,
+        parentThreadId: "session-nested",
+        threadSource: "subagent",
+      }),
+      turnContext("gpt-child"),
+      tokenCount("2026-07-12T01:01:00.000Z", 20, 4, 2, 1),
+    ]);
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-nested", {
+        agentId: "agent-grandchild",
+        cwd: "/workspace/grandchild",
+        depth: 2,
+        parentThreadId: "agent-child",
+        threadSource: "subagent",
+      }),
+      sessionMeta("session-nested", {
+        agentId: "agent-child",
+        depth: 1,
+        parentThreadId: "session-nested",
+        threadSource: "subagent",
+      }),
+      turnContext("gpt-child"),
+      tokenCount("2026-07-12T01:01:00.000Z", 20, 4, 2, 1),
+      taskStarted("turn-grandchild", "2026-07-12T01:01:30.000Z"),
+      turnContext("gpt-grandchild", "2026-07-12T01:01:31.000Z", "turn-grandchild"),
+      interAgentHandoff("2026-07-12T01:01:32.000Z"),
+      tokenCount("2026-07-12T01:02:00.000Z", 30, 6, 3, 1),
+    ]);
+
+    await harness.importer.syncAll();
+    const usage = harness.database.select().from(usageEvents).all();
+    expect(usage).toHaveLength(3);
+    expect(
+      usage
+        .map(({ agentId, model, totalTokens }) => ({ agentId, model, totalTokens }))
+        .sort((left, right) => left.agentId.localeCompare(right.agentId)),
+    ).toEqual([
+      { agentId: "agent-child", model: "gpt-child", totalTokens: 22 },
+      { agentId: "agent-grandchild", model: "gpt-grandchild", totalTokens: 33 },
+      { agentId: "session-nested", model: "gpt-main", totalTokens: 11 },
+    ]);
+    expect(
+      harness.database
+        .select()
+        .from(sessionAgents)
+        .where(eq(sessionAgents.id, "agent-grandchild"))
+        .get(),
+    ).toMatchObject({ depth: 2, parentThreadId: "agent-child" });
+    expect(
+      harness.database.select().from(sessions).where(eq(sessions.id, "session-nested")).get(),
+    ).toMatchObject({ cwd: "/workspace/main" });
+
+    const filteredAgents = getSessions(harness.database, {
+      from: "2026-07-12",
+      models: ["gpt-grandchild"],
+      to: "2026-07-12",
+    }).sessions[0]?.agents;
+    expect(filteredAgents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          agentId: "session-nested",
+          lastEventAt: null,
+          totalTokens: 0,
+        }),
+        expect.objectContaining({
+          agentId: "agent-child",
+          lastEventAt: null,
+          parentAgentId: "session-nested",
+          totalTokens: 0,
+        }),
+        expect.objectContaining({
+          agentId: "agent-grandchild",
+          parentAgentId: "agent-child",
+          totalTokens: 33,
+        }),
+      ]),
+    );
   });
 
   it("uses the newest Codex session-index title instead of a prompt-derived fallback", async () => {
@@ -431,14 +790,28 @@ describe("session importer", () => {
     expect(dashboard.models[0]?.model).toBe("gpt-api");
     expect(dashboard.models[0]?.tokenShare).toBe(1);
     expect(dashboard.dailyModels).toEqual([
-      { date: "2026-07-12", model: "gpt-api", totalTokens: 225 },
+      {
+        date: "2026-07-12",
+        estimatedCostUsd: 0.000395,
+        model: "gpt-api",
+        requestCount: 1,
+        totalTokens: 225,
+      },
     ]);
     expect(dashboard.hourly).toHaveLength(24);
     expect(dashboard.hourly.find((hour) => hour.hour === "09:00")).toMatchObject({
       requestCount: 1,
       totalTokens: 225,
     });
-    expect(dashboard.hourlyModels).toEqual([{ hour: "09:00", model: "gpt-api", totalTokens: 225 }]);
+    expect(dashboard.hourlyModels).toEqual([
+      {
+        estimatedCostUsd: 0.000395,
+        hour: "09:00",
+        model: "gpt-api",
+        requestCount: 1,
+        totalTokens: 225,
+      },
+    ]);
     expect(
       getDashboard(harness.database, { from: "2026-07-11", to: "2026-07-12" }).hourlyModels,
     ).toEqual([]);
@@ -506,7 +879,8 @@ describe("session importer", () => {
           method: "PUT",
         })
       ).status,
-    ).toBe(500);
+    ).toBe(400);
+    expect((await app.request("/api/dashboard?from=2026-02-30&to=2026-03-01")).status).toBe(400);
     expect((await app.request("/api/rates/%20/backfill", { method: "POST" })).status).toBe(400);
     expect((await app.request("/api/rates/gpt-api/backfill", { method: "POST" })).status).toBe(200);
   });
@@ -539,15 +913,23 @@ describe("session importer", () => {
       tokenCount("2026-04-14T02:00:00.000Z", 100, 20, 10, 4),
     ]);
     await harness.importer.syncAll();
+    const retainedProjectId = harness.database
+      .select({ projectId: sessions.projectId })
+      .from(sessions)
+      .where(eq(sessions.id, "session-hourly-edge"))
+      .get()?.projectId;
+    expect(retainedProjectId).toBeTruthy();
+    if (!retainedProjectId) throw new Error("Expected retained session project");
 
     expect(compactUsage(harness.database, now)).toMatchObject({
       hourlyRowsDeleted: 2,
       rawEventsDeleted: 3,
-      rollupRowsWritten: 6,
+      rollupRowsWritten: 9,
     });
     expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
     expect(harness.database.select().from(usageHourlyRollups).all()).toHaveLength(2);
     expect(harness.database.select().from(usageDailyRollups).all()).toHaveLength(3);
+    expect(harness.database.select().from(usageAgentDailyRollups).all()).toHaveLength(3);
     expect(harness.database.select().from(archivedUsageEventIds).all()).toHaveLength(3);
     expect(
       harness.database
@@ -569,6 +951,24 @@ describe("session importer", () => {
         (hour) => hour.hour === "09:00",
       ),
     ).toMatchObject({ sessionCount: 1, totalTokens: 110 });
+    expect(
+      getDashboard(
+        harness.database,
+        {
+          from: "2026-04-15",
+          projectId: retainedProjectId,
+          to: "2026-04-15",
+        },
+        now,
+      ).kpis,
+    ).toMatchObject({ sessionCount: 1, totalTokens: 110 });
+    expect(
+      getDashboard(
+        harness.database,
+        { from: "2026-04-15", projectId: "legacy-unknown", to: "2026-04-15" },
+        now,
+      ).kpis,
+    ).toMatchObject({ sessionCount: 0, totalTokens: 0 });
     expect(
       getDashboard(harness.database, { from: "2026-04-14", to: "2026-04-14" }, now),
     ).toMatchObject({ hourly: [], retention: { hourlyAvailable: false } });
@@ -695,6 +1095,216 @@ describe("session importer", () => {
     await appendFile(source, "\n");
   });
 
+  it("streams oversized compaction payloads while preserving activity and incomplete cursors", async () => {
+    const harness = await createHarness();
+    const oversizedPayload = "x".repeat(512 * 1024);
+    const completeCompaction = JSON.stringify({
+      timestamp: "2026-07-12T03:00:01.000Z",
+      type: "compacted",
+      payload: { replacement_history: oversizedPayload },
+    });
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-large-compaction"),
+      turnContext("gpt-large"),
+      tokenCount("2026-07-12T03:00:00.000Z", 10, 2, 1, 0),
+      completeCompaction,
+      tokenCount("2026-07-12T03:00:02.000Z", 20, 4, 2, 1),
+    ]);
+
+    await harness.importer.syncAll();
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(2);
+    expect(
+      harness.database
+        .select()
+        .from(activityEvents)
+        .all()
+        .filter((event) => event.kind === "compaction"),
+    ).toHaveLength(1);
+    const completeOffset = harness.database
+      .select()
+      .from(importStates)
+      .where(eq(importStates.sourcePath, source))
+      .get()?.lastOffset;
+
+    const incompleteCompaction = JSON.stringify({
+      timestamp: "2026-07-12T03:00:03.000Z",
+      type: "compacted",
+      payload: { replacement_history: oversizedPayload },
+    }).slice(0, -1);
+    await appendFile(source, incompleteCompaction);
+    await harness.importer.syncAll();
+    expect(
+      harness.database.select().from(importStates).where(eq(importStates.sourcePath, source)).get()
+        ?.lastOffset,
+    ).toBe(completeOffset);
+    expect(
+      harness.database
+        .select()
+        .from(importDiagnostics)
+        .where(eq(importDiagnostics.sourcePath, source))
+        .get()?.incompleteLine,
+    ).toBe(true);
+
+    await appendFile(source, "}\n");
+    await harness.importer.syncAll();
+    expect(
+      harness.database
+        .select()
+        .from(activityEvents)
+        .all()
+        .filter((event) => event.kind === "compaction"),
+    ).toHaveLength(2);
+    expect(
+      harness.database
+        .select()
+        .from(importDiagnostics)
+        .where(eq(importDiagnostics.sourcePath, source))
+        .get(),
+    ).toMatchObject({ incompleteLine: false, malformedLines: 0 });
+
+    const balancedInvalidCompaction = `{"timestamp":"2026-07-12T03:00:04.000Z","type":"compacted","payload":{"replacement_history":"${oversizedPayload}","invalid":truX}}`;
+    await appendFile(source, `${balancedInvalidCompaction}\n`);
+    await harness.importer.syncAll();
+    expect(
+      harness.database
+        .select()
+        .from(activityEvents)
+        .all()
+        .filter((event) => event.kind === "compaction"),
+    ).toHaveLength(2);
+    expect(
+      harness.database
+        .select()
+        .from(importDiagnostics)
+        .where(eq(importDiagnostics.sourcePath, source))
+        .get(),
+    ).toMatchObject({ incompleteLine: false, malformedLines: 1 });
+
+    const reorderedTokenCount = JSON.stringify({
+      timestamp: "2026-07-12T03:00:05.000Z",
+      type: "event_msg",
+      payload: {
+        decoy: { type: "message" },
+        type: "token_count",
+        info: {
+          last_token_usage: {
+            cached_input_tokens: 6,
+            input_tokens: 30,
+            output_tokens: 3,
+            reasoning_output_tokens: 1,
+            total_tokens: 33,
+          },
+        },
+        padding: oversizedPayload,
+      },
+    });
+    await appendFile(source, `${reorderedTokenCount}\n`);
+    await harness.importer.syncAll();
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(3);
+    expect(
+      harness.database
+        .select()
+        .from(usageEvents)
+        .where(eq(usageEvents.timestamp, "2026-07-12T03:00:05.000Z"))
+        .get(),
+    ).toMatchObject({ cachedInputTokens: 6, model: "gpt-large", totalTokens: 33 });
+
+    const largePatch = JSON.stringify({
+      timestamp: "2026-07-12T03:00:06.000Z",
+      type: "event_msg",
+      payload: {
+        type: "patch_apply_end",
+        call_id: "call-large-patch",
+        turn_id: "turn-large-patch",
+        stdout: oversizedPayload,
+      },
+    });
+    const parsedPatch = parseActivityRecord(
+      JSON.parse(largePatch) as unknown,
+      "session-large-compaction",
+    );
+    if (!parsedPatch) throw new Error("Expected the oversized patch to produce activity metadata");
+    await appendFile(source, `${largePatch}\n`);
+    await harness.importer.syncAll();
+    const projectedPatchId = createHash("sha256")
+      .update(`session-large-compaction\u0000${parsedPatch.eventHash}`)
+      .digest("hex");
+    expect(
+      harness.database
+        .select()
+        .from(activityEvents)
+        .where(eq(activityEvents.id, projectedPatchId))
+        .get(),
+    ).toMatchObject({ kind: "patch", timestamp: "2026-07-12T03:00:06.000Z" });
+    expect(
+      harness.database.select().from(importStates).where(eq(importStates.sourcePath, source)).get()
+        ?.lastOffset,
+    ).toBe((await stat(source)).size);
+  });
+
+  it("validates the complete JSON grammar for projected records with bounded nesting", async () => {
+    const harness = await createHarness();
+    const padding = "x".repeat(10 * 1024);
+    const validCompaction = JSON.stringify({
+      timestamp: "2026-07-12T03:10:00.000Z",
+      type: "compacted",
+      payload: {
+        padding,
+        nested: {
+          emptyObject: {},
+          emptyArray: [],
+          values: [true, false, null, 0, -1, 12, 1.5, 1e3, -2.5e-2],
+          escaped: 'quote:" slash:/ backslash:\\ controls:\b\f\n\r\t unicode:A',
+        },
+      },
+    });
+    const invalidPrefix = `{"timestamp":"2026-07-12T03:10:01.000Z","type":"compacted","payload":{"padding":"${padding}",`;
+    const invalidLines = [
+      `${invalidPrefix}"bad":truX}}`,
+      `${invalidPrefix}"bad":01}}`,
+      `${invalidPrefix}"bad":-x}}`,
+      `${invalidPrefix}"bad":1.}}`,
+      `${invalidPrefix}"bad":1e}}`,
+      `${invalidPrefix}"bad":1e+}}`,
+      `${invalidPrefix}"bad":"\\q"}}`,
+      `${invalidPrefix}"bad":"\\uZZZQ"}}`,
+      `${invalidPrefix}"bad":{"x" 1}}}`,
+      `${invalidPrefix}"bad":{"x":1 "y":2}}}`,
+      `${invalidPrefix}"bad":{"x":}}}`,
+      `${invalidPrefix}"bad":{"x":1,}}}`,
+      `${invalidPrefix}"bad":[1 2]}}`,
+      `${invalidPrefix}"bad":[1,]}}`,
+      `${invalidPrefix}"bad":[}}`,
+      `${invalidPrefix}"bad":${"[".repeat(257)}0${"]".repeat(257)}}}`,
+      `${invalidPrefix}"bad":true}} trailing`,
+    ];
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-projected-grammar"),
+      validCompaction,
+      ...invalidLines,
+    ]);
+
+    await harness.importer.syncAll();
+    expect(
+      harness.database
+        .select()
+        .from(activityEvents)
+        .all()
+        .filter((event) => event.kind === "compaction"),
+    ).toHaveLength(1);
+    expect(
+      harness.database
+        .select()
+        .from(importDiagnostics)
+        .where(eq(importDiagnostics.sourcePath, source))
+        .get(),
+    ).toMatchObject({ incompleteLine: false, malformedLines: invalidLines.length });
+    expect(
+      harness.database.select().from(importStates).where(eq(importStates.sourcePath, source)).get()
+        ?.lastOffset,
+    ).toBe((await stat(source)).size);
+  });
+
   it("treats a missing sessions root as an empty source", async () => {
     const harness = await createHarness();
     const missing = new SessionImporter(
@@ -702,6 +1312,22 @@ describe("session importer", () => {
       join(harness.sessionsDirectory, "does-not-exist"),
     );
     await expect(missing.syncAll()).resolves.toMatchObject({ error: null, filesProcessed: 0 });
+  });
+
+  it("drains an in-flight import before stop resolves", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-stop-drain"),
+      turnContext("gpt-stop"),
+      tokenCount("2026-07-12T03:00:00.000Z", 10, 2, 1, 0),
+    ]);
+
+    const syncing = harness.importer.syncAll();
+    await harness.importer.stop();
+
+    await expect(syncing).resolves.toMatchObject({ error: null, recordsInserted: 1 });
+    expect(harness.importer.getStatus().isSyncing).toBe(false);
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
   });
 
   it("reclassifies an inferred model and backfills its existing rate during sync", async () => {
@@ -781,6 +1407,7 @@ function sessionMeta(
   sessionId: string,
   options: {
     agentId?: string;
+    cwd?: string;
     depth?: number;
     name?: string;
     parentThreadId?: string;
@@ -798,7 +1425,7 @@ function sessionMeta(
       ...(options.parentThreadId ? { parent_thread_id: options.parentThreadId } : {}),
       ...(options.role ? { agent_role: options.role } : {}),
       ...(options.threadSource ? { thread_source: options.threadSource } : {}),
-      cwd: "/workspace",
+      cwd: options.cwd ?? "/workspace",
       session_id: sessionId,
       timestamp: "2026-07-12T00:00:00.000Z",
     },
@@ -815,11 +1442,39 @@ function userMessage(message: string): string {
   });
 }
 
-function turnContext(model: string): string {
+function turnContext(
+  model: string,
+  timestamp = "2026-07-12T00:00:01.000Z",
+  turnId?: string,
+): string {
   return JSON.stringify({
-    payload: { model },
-    timestamp: "2026-07-12T00:00:01.000Z",
+    payload: { model, ...(turnId ? { turn_id: turnId } : {}) },
+    timestamp,
     type: "turn_context",
+  });
+}
+
+function taskStarted(turnId: string, timestamp: string): string {
+  return JSON.stringify({
+    payload: { started_at: timestamp, turn_id: turnId, type: "task_started" },
+    timestamp,
+    type: "event_msg",
+  });
+}
+
+function interAgentHandoff(timestamp: string): string {
+  return JSON.stringify({
+    payload: { trigger_turn: true },
+    timestamp,
+    type: "inter_agent_communication_metadata",
+  });
+}
+
+function activityCall(callId: string, timestamp: string): string {
+  return JSON.stringify({
+    payload: { call_id: callId, name: "exec_command", type: "function_call" },
+    timestamp,
+    type: "response_item",
   });
 }
 

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "agent": "codex-usage-coordinator",
+  "permissions": {
+    "defaultMode": "auto",
+    "disableBypassPermissionsMode": "disable",
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Edit(*)",
+      "Write(*)",
+      "mcp__codegraph__codegraph_explore"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(**/.env)",
+      "Read(**/.env.local)",
+      "Read(**/.env.*.local)",
+      "Read(**/secrets/**)",
+      "Read(**/credentials/**)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(/Users/VanAnh/.codex/**)",
+      "Read(/Users/VanAnh/.claude/**)",
+      "Bash(rm -rf *)",
+      "Bash(git reset --hard*)",
+      "Bash(git checkout --*)",
+      "Bash(git clean -*)",
+      "Bash(* DROP DATABASE*)",
+      "Bash(* DROP TABLE*)",
+      "Bash(* TRUNCATE TABLE*)"
+    ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(pnpm install *)",
+      "Bash(pnpm add *)",
+      "Bash(pnpm remove *)",
+      "Bash(pnpm update *)",
+      "Bash(pnpm db:migrate*)",
+      "Bash(pnpm pm2:start*)",
+      "Bash(pnpm pm2:restart*)",
+      "Bash(pnpm pm2:stop*)",
+      "Bash(pnpm pm2:delete*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/pretool-guard.sh",
+            "args": [],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

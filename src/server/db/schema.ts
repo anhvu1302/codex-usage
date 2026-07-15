@@ -12,6 +12,7 @@ export const sessions = sqliteTable(
   "sessions",
   {
     id: text("id").primaryKey(),
+    projectId: text("project_id"),
     sourcePath: text("source_path").notNull(),
     cwd: text("cwd"),
     title: text("title"),
@@ -19,7 +20,23 @@ export const sessions = sqliteTable(
     lastSeenAt: integer("last_seen_at").notNull(),
     sourceDeleted: integer("source_deleted", { mode: "boolean" }).notNull().default(false),
   },
-  (table) => [index("sessions_source_path_index").on(table.sourcePath)],
+  (table) => [
+    index("sessions_project_index").on(table.projectId),
+    index("sessions_source_path_index").on(table.sourcePath),
+  ],
+);
+
+export const projects = sqliteTable(
+  "projects",
+  {
+    id: text("id").primaryKey(),
+    displayName: text("display_name").notNull(),
+    displayPath: text("display_path").notNull(),
+    normalizedPath: text("normalized_path").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [uniqueIndex("projects_normalized_path_unique").on(table.normalizedPath)],
 );
 
 export const sessionAgents = sqliteTable(
@@ -118,11 +135,15 @@ export const usageHourlyRollups = sqliteTable(
     localHour: text("local_hour").notNull(),
     model: text("model").notNull(),
     agentKind: text("agent_kind").notNull(),
+    projectId: text("project_id").notNull().default("legacy-unknown"),
     ...rollupFields(),
   },
   (table) => [
-    primaryKey({ columns: [table.localDate, table.localHour, table.model, table.agentKind] }),
+    primaryKey({
+      columns: [table.localDate, table.localHour, table.model, table.agentKind, table.projectId],
+    }),
     index("usage_hourly_rollups_model_date_index").on(table.model, table.localDate),
+    index("usage_hourly_rollups_project_date_index").on(table.projectId, table.localDate),
   ],
 );
 
@@ -132,11 +153,40 @@ export const usageDailyRollups = sqliteTable(
     localDate: text("local_date").notNull(),
     model: text("model").notNull(),
     agentKind: text("agent_kind").notNull(),
+    projectId: text("project_id").notNull().default("legacy-unknown"),
     ...rollupFields(),
   },
   (table) => [
-    primaryKey({ columns: [table.localDate, table.model, table.agentKind] }),
+    primaryKey({ columns: [table.localDate, table.model, table.agentKind, table.projectId] }),
     index("usage_daily_rollups_model_date_index").on(table.model, table.localDate),
+    index("usage_daily_rollups_project_date_index").on(table.projectId, table.localDate),
+  ],
+);
+
+export const usageAgentDailyRollups = sqliteTable(
+  "usage_agent_daily_rollups",
+  {
+    localDate: text("local_date").notNull(),
+    agentId: text("agent_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    model: text("model").notNull(),
+    agentKind: text("agent_kind").notNull(),
+    projectId: text("project_id").notNull().default("legacy-unknown"),
+    ...rollupFields(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [
+        table.localDate,
+        table.agentId,
+        table.sessionId,
+        table.model,
+        table.agentKind,
+        table.projectId,
+      ],
+    }),
+    index("usage_agent_daily_rollups_project_date_index").on(table.projectId, table.localDate),
+    index("usage_agent_daily_rollups_agent_date_index").on(table.agentId, table.localDate),
   ],
 );
 
@@ -147,14 +197,27 @@ export const usageRollupSessionMemberships = sqliteTable(
     bucketStart: text("bucket_start").notNull(),
     model: text("model").notNull(),
     agentKind: text("agent_kind").notNull(),
+    projectId: text("project_id").notNull().default("legacy-unknown"),
     sessionId: text("session_id").notNull(),
   },
   (table) => [
     primaryKey({
-      columns: [table.bucketType, table.bucketStart, table.model, table.agentKind, table.sessionId],
+      columns: [
+        table.bucketType,
+        table.bucketStart,
+        table.model,
+        table.agentKind,
+        table.projectId,
+        table.sessionId,
+      ],
     }),
     index("usage_rollup_memberships_model_bucket_index").on(
       table.model,
+      table.bucketType,
+      table.bucketStart,
+    ),
+    index("usage_rollup_memberships_project_bucket_index").on(
+      table.projectId,
       table.bucketType,
       table.bucketStart,
     ),
@@ -173,4 +236,83 @@ export const retentionState = sqliteTable("retention_state", {
   lastCompactionAt: integer("last_compaction_at"),
   rawEventsDeleted: integer("raw_events_deleted").notNull().default(0),
   rollupRowsWritten: integer("rollup_rows_written").notNull().default(0),
+});
+
+export const budgetSettings = sqliteTable("budget_settings", {
+  period: text("period").primaryKey(),
+  enabled: integer("enabled", { mode: "boolean" }).notNull().default(false),
+  limitUsd: real("limit_usd").notNull().default(0),
+  warningThresholds: text("warning_thresholds").notNull().default("[50,80,100]"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export const alertEvents = sqliteTable(
+  "alert_events",
+  {
+    id: text("id").primaryKey(),
+    type: text("type").notNull(),
+    severity: text("severity").notNull(),
+    scopeKey: text("scope_key").notNull(),
+    periodStart: text("period_start").notNull(),
+    title: text("title").notNull(),
+    message: text("message").notNull(),
+    createdAt: integer("created_at").notNull(),
+    seenAt: integer("seen_at"),
+    dismissedAt: integer("dismissed_at"),
+  },
+  (table) => [
+    uniqueIndex("alert_events_scope_unique").on(table.type, table.scopeKey, table.periodStart),
+    index("alert_events_created_index").on(table.createdAt),
+  ],
+);
+
+export const activityEvents = sqliteTable(
+  "activity_events",
+  {
+    id: text("id").primaryKey(),
+    sessionId: text("session_id")
+      .notNull()
+      .references(() => sessions.id, { onDelete: "restrict" }),
+    agentId: text("agent_id").notNull(),
+    timestamp: text("timestamp").notNull(),
+    localDate: text("local_date").notNull(),
+    kind: text("kind").notNull(),
+    agentKind: text("agent_kind").notNull(),
+    projectId: text("project_id").notNull().default("legacy-unknown"),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    index("activity_events_date_index").on(table.localDate),
+    index("activity_events_project_date_index").on(table.projectId, table.localDate),
+    index("activity_events_session_timestamp_index").on(table.sessionId, table.timestamp),
+    index("activity_events_agent_date_index").on(table.agentId, table.localDate),
+  ],
+);
+
+export const activityDailyRollups = sqliteTable(
+  "activity_daily_rollups",
+  {
+    localDate: text("local_date").notNull(),
+    kind: text("kind").notNull(),
+    agentKind: text("agent_kind").notNull(),
+    projectId: text("project_id").notNull().default("legacy-unknown"),
+    eventCount: integer("event_count").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.localDate, table.kind, table.agentKind, table.projectId] }),
+    index("activity_daily_rollups_project_date_index").on(table.projectId, table.localDate),
+  ],
+);
+
+export const archivedActivityEventIds = sqliteTable("archived_activity_event_ids", {
+  id: text("id").primaryKey(),
+  archivedAt: integer("archived_at").notNull(),
+});
+
+export const importDiagnostics = sqliteTable("import_diagnostics", {
+  sourcePath: text("source_path").primaryKey(),
+  malformedLines: integer("malformed_lines").notNull().default(0),
+  incompleteLine: integer("incomplete_line", { mode: "boolean" }).notNull().default(false),
+  lastError: text("last_error"),
+  updatedAt: integer("updated_at").notNull(),
 });

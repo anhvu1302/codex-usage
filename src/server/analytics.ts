@@ -1,10 +1,11 @@
-import { and, asc, desc, eq, gte, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lte, sql } from "drizzle-orm";
 
 import type { AppDatabase } from "@/server/db/client";
 import {
   modelRates,
   sessionAgents,
   sessions,
+  usageAgentDailyRollups,
   usageDailyRollups,
   usageEvents,
   usageHourlyRollups,
@@ -17,6 +18,7 @@ import type {
   DashboardResponse,
   ModelRate,
   SessionAgentUsage,
+  SessionFilters,
   SessionsResponse,
 } from "@/shared/types";
 
@@ -60,7 +62,9 @@ export function getDashboard(
     daily,
     dailyModels: dailyModelRows.map((row) => ({
       date: row.date,
+      estimatedCostUsd: row.estimatedCostUsd,
       model: row.model,
+      requestCount: row.requestCount,
       totalTokens: row.totalTokens,
     })),
     hourly: retention.hourlyAvailable
@@ -73,8 +77,10 @@ export function getDashboard(
         })
       : [],
     hourlyModels: hourlyRows.map((row) => ({
+      estimatedCostUsd: row.estimatedCostUsd,
       hour: row.hour,
       model: row.model,
+      requestCount: row.requestCount,
       totalTokens: row.totalTokens,
     })),
     kpis,
@@ -136,14 +142,19 @@ function getHourlyModelRows(database: AppDatabase, filters: DashboardFilters): H
 
 export function getSessions(
   database: AppDatabase,
-  filters: DashboardFilters,
+  filters: SessionFilters,
   now = new Date(),
 ): SessionsResponse {
   const coverage = getSessionCoverage(filters, now);
-  if (!coverage.from || !coverage.to) return { coverage, sessions: [] };
+  const page = filters.page ?? 1;
+  const pageSize = filters.pageSize ?? 25;
+  if (!coverage.from || !coverage.to) return { coverage, page, pageSize, sessions: [], total: 0 };
   const effectiveFilters = {
+    ...(filters.agentKind ? { agentKind: filters.agentKind } : {}),
     from: coverage.from,
     ...(filters.model ? { model: filters.model } : {}),
+    ...(filters.models ? { models: filters.models } : {}),
+    ...(filters.projectId ? { projectId: filters.projectId } : {}),
     to: coverage.to,
   };
   const where = usageWhere(effectiveFilters);
@@ -153,6 +164,7 @@ export function getSessions(
       firstEventAt: sql<string>`min(${usageEvents.timestamp})`,
       lastEventAt: sql<string>`max(${usageEvents.timestamp})`,
       models: sql<string>`group_concat(distinct ${usageEvents.model})`,
+      projectId: sessions.projectId,
       sessionId: usageEvents.sessionId,
       sourceDeleted: sessions.sourceDeleted,
       title: sessions.title,
@@ -161,7 +173,13 @@ export function getSessions(
     .from(usageEvents)
     .leftJoin(sessions, eq(usageEvents.sessionId, sessions.id))
     .where(where)
-    .groupBy(usageEvents.sessionId, sessions.cwd, sessions.sourceDeleted, sessions.title)
+    .groupBy(
+      usageEvents.sessionId,
+      sessions.cwd,
+      sessions.projectId,
+      sessions.sourceDeleted,
+      sessions.title,
+    )
     .orderBy(desc(sql`max(${usageEvents.timestamp})`))
     .all();
 
@@ -172,19 +190,50 @@ export function getSessions(
     agentsBySession.set(agent.sessionId, agents);
   }
 
+  let values = rows.map((row) => ({
+    agents: agentsBySession.get(row.sessionId) ?? [],
+    cwd: row.cwd,
+    firstEventAt: row.firstEventAt,
+    lastEventAt: row.lastEventAt,
+    models: row.models.split(",").filter(Boolean),
+    projectId: row.projectId,
+    sessionId: row.sessionId,
+    sourceDeleted: row.sourceDeleted ?? true,
+    title: row.title,
+    ...toKpis(row),
+  }));
+  const query = filters.query?.trim().toLocaleLowerCase();
+  if (query) {
+    values = values.filter((session) =>
+      [
+        session.title,
+        session.sessionId,
+        session.cwd,
+        ...session.agents.flatMap((agent) => [agent.name, agent.role]),
+      ].some((value) => value?.toLocaleLowerCase().includes(query)),
+    );
+  }
+  if (filters.hasSubagents !== undefined) {
+    values = values.filter(
+      (session) => session.agents.some((agent) => agent.isSubagent) === filters.hasSubagents,
+    );
+  }
+  const direction = filters.order === "asc" ? 1 : -1;
+  values.sort((left, right) => {
+    if (filters.sort === "tokens") return (left.totalTokens - right.totalTokens) * direction;
+    if (filters.sort === "cost")
+      return (left.estimatedCostUsd - right.estimatedCostUsd) * direction;
+    return left.lastEventAt.localeCompare(right.lastEventAt) * direction;
+  });
+  const total = values.length;
+  const start = (page - 1) * pageSize;
+
   return {
     coverage,
-    sessions: rows.map((row) => ({
-      agents: agentsBySession.get(row.sessionId) ?? [],
-      cwd: row.cwd,
-      firstEventAt: row.firstEventAt,
-      lastEventAt: row.lastEventAt,
-      models: row.models.split(",").filter(Boolean),
-      sessionId: row.sessionId,
-      sourceDeleted: row.sourceDeleted ?? true,
-      title: row.title,
-      ...toKpis(row),
-    })),
+    page,
+    pageSize,
+    sessions: values.slice(start, start + pageSize),
+    total,
   };
 }
 
@@ -200,6 +249,7 @@ function getSessionAgents(
       lastEventAt: sql<string | null>`max(${usageEvents.timestamp})`,
       models: sql<string | null>`group_concat(distinct ${usageEvents.model})`,
       name: sessionAgents.name,
+      parentAgentId: sessionAgents.parentThreadId,
       role: sessionAgents.role,
       sessionId: sessionAgents.sessionId,
       sourceDeleted: sessionAgents.sourceDeleted,
@@ -213,6 +263,7 @@ function getSessionAgents(
       sessionAgents.id,
       sessionAgents.depth,
       sessionAgents.name,
+      sessionAgents.parentThreadId,
       sessionAgents.role,
       sessionAgents.sessionId,
       sessionAgents.sourceDeleted,
@@ -221,32 +272,30 @@ function getSessionAgents(
     )
     .all();
 
-  return rows.flatMap((row) => {
-    if (!row.firstEventAt || !row.lastEventAt) return [];
+  return rows.map((row) => {
     const kpis = toKpis(row);
-    return [
-      {
-        agentId: row.agentId,
-        cachedInputTokens: kpis.cachedInputTokens,
-        depth: row.depth,
-        estimatedCostUsd: kpis.estimatedCostUsd,
-        firstEventAt: row.firstEventAt,
-        inputTokens: kpis.inputTokens,
-        isSubagent: row.threadSource === "subagent",
-        lastEventAt: row.lastEventAt,
-        models: row.models?.split(",").filter(Boolean) ?? [],
-        name: row.name,
-        outputTokens: kpis.outputTokens,
-        reasoningOutputTokens: kpis.reasoningOutputTokens,
-        requestCount: kpis.requestCount,
-        role: row.role,
-        sessionId: row.sessionId,
-        sourceDeleted: row.sourceDeleted,
-        taskSummary: row.taskSummary,
-        totalTokens: kpis.totalTokens,
-        unpricedUsageCount: kpis.unpricedUsageCount,
-      },
-    ];
+    return {
+      agentId: row.agentId,
+      cachedInputTokens: kpis.cachedInputTokens,
+      depth: row.depth,
+      estimatedCostUsd: kpis.estimatedCostUsd,
+      firstEventAt: row.firstEventAt,
+      inputTokens: kpis.inputTokens,
+      isSubagent: row.threadSource === "subagent",
+      lastEventAt: row.lastEventAt,
+      models: row.models?.split(",").filter(Boolean) ?? [],
+      name: row.name,
+      outputTokens: kpis.outputTokens,
+      parentAgentId: row.parentAgentId,
+      reasoningOutputTokens: kpis.reasoningOutputTokens,
+      requestCount: kpis.requestCount,
+      role: row.role,
+      sessionId: row.sessionId,
+      sourceDeleted: row.sourceDeleted,
+      taskSummary: row.taskSummary,
+      totalTokens: kpis.totalTokens,
+      unpricedUsageCount: kpis.unpricedUsageCount,
+    };
   });
 }
 
@@ -455,17 +504,18 @@ export function backfillUnpricedUsage(database: AppDatabase, model: string): num
   const rate = database.select().from(modelRates).where(eq(modelRates.model, model)).get();
   if (!rate) return 0;
 
-  const rawResult = database
-    .update(usageEvents)
-    .set({
-      cachedInputRate: rate.cachedInputRate,
-      costUsd: sql<number>`((${usageEvents.inputTokens} - ${usageEvents.cachedInputTokens}) * ${rate.inputRate} + ${usageEvents.cachedInputTokens} * ${rate.cachedInputRate} + ${usageEvents.outputTokens} * ${rate.outputRate}) / 1000000.0`,
-      inputRate: rate.inputRate,
-      outputRate: rate.outputRate,
-    })
-    .where(and(eq(usageEvents.model, model), isNull(usageEvents.costUsd)))
-    .run();
-  const dailyResult = database.run(sql`
+  return database.transaction((transaction) => {
+    const rawResult = transaction
+      .update(usageEvents)
+      .set({
+        cachedInputRate: rate.cachedInputRate,
+        costUsd: sql<number>`((${usageEvents.inputTokens} - ${usageEvents.cachedInputTokens}) * ${rate.inputRate} + ${usageEvents.cachedInputTokens} * ${rate.cachedInputRate} + ${usageEvents.outputTokens} * ${rate.outputRate}) / 1000000.0`,
+        inputRate: rate.inputRate,
+        outputRate: rate.outputRate,
+      })
+      .where(and(eq(usageEvents.model, model), isNull(usageEvents.costUsd)))
+      .run();
+    const dailyResult = transaction.run(sql`
     update ${usageDailyRollups}
     set
       cost_usd = cost_usd + ((unpriced_input_tokens - unpriced_cached_input_tokens) * ${rate.inputRate} + unpriced_cached_input_tokens * ${rate.cachedInputRate} + unpriced_output_tokens * ${rate.outputRate}) / 1000000.0,
@@ -475,7 +525,7 @@ export function backfillUnpricedUsage(database: AppDatabase, model: string): num
       unpriced_output_tokens = 0
     where model = ${model} and unpriced_usage_count > 0
   `);
-  const hourlyResult = database.run(sql`
+    const hourlyResult = transaction.run(sql`
     update ${usageHourlyRollups}
     set
       cost_usd = cost_usd + ((unpriced_input_tokens - unpriced_cached_input_tokens) * ${rate.inputRate} + unpriced_cached_input_tokens * ${rate.cachedInputRate} + unpriced_output_tokens * ${rate.outputRate}) / 1000000.0,
@@ -485,7 +535,20 @@ export function backfillUnpricedUsage(database: AppDatabase, model: string): num
       unpriced_output_tokens = 0
     where model = ${model} and unpriced_usage_count > 0
   `);
-  return rawResult.changes + dailyResult.changes + hourlyResult.changes;
+    const agentDailyResult = transaction.run(sql`
+    update ${usageAgentDailyRollups}
+    set
+      cost_usd = cost_usd + ((unpriced_input_tokens - unpriced_cached_input_tokens) * ${rate.inputRate} + unpriced_cached_input_tokens * ${rate.cachedInputRate} + unpriced_output_tokens * ${rate.outputRate}) / 1000000.0,
+      unpriced_usage_count = 0,
+      unpriced_input_tokens = 0,
+      unpriced_cached_input_tokens = 0,
+      unpriced_output_tokens = 0
+    where model = ${model} and unpriced_usage_count > 0
+  `);
+    return (
+      rawResult.changes + dailyResult.changes + hourlyResult.changes + agentDailyResult.changes
+    );
+  });
 }
 
 export function backfillAllUnpricedUsage(database: AppDatabase): number {
@@ -561,7 +624,25 @@ function usageWhere(filters: DashboardFilters) {
     gte(usageEvents.localDate, filters.from),
     lte(usageEvents.localDate, filters.to),
   ];
-  if (filters.model) conditions.push(eq(usageEvents.model, filters.model));
+  const models = selectedModels(filters);
+  if (models.length === 1) conditions.push(eq(usageEvents.model, models[0]!));
+  if (models.length > 1) conditions.push(inArray(usageEvents.model, models));
+  if (filters.agentKind && filters.agentKind !== "all") {
+    conditions.push(sql`exists (
+      select 1 from ${sessionAgents}
+      where ${sessionAgents.id} = ${usageEvents.agentId}
+        and ${sessionAgents.threadSource} ${
+          filters.agentKind === "subagent" ? sql`= 'subagent'` : sql`!= 'subagent'`
+        }
+    )`);
+  }
+  if (filters.projectId) {
+    conditions.push(sql`exists (
+      select 1 from ${sessions}
+      where ${sessions.id} = ${usageEvents.sessionId}
+        and ${sessions.projectId} = ${filters.projectId}
+    )`);
+  }
   return and(...conditions);
 }
 
@@ -570,7 +651,12 @@ function dailyRollupWhere(filters: DashboardFilters) {
     gte(usageDailyRollups.localDate, filters.from),
     lte(usageDailyRollups.localDate, filters.to),
   ];
-  if (filters.model) conditions.push(eq(usageDailyRollups.model, filters.model));
+  const models = selectedModels(filters);
+  if (models.length === 1) conditions.push(eq(usageDailyRollups.model, models[0]!));
+  if (models.length > 1) conditions.push(inArray(usageDailyRollups.model, models));
+  if (filters.agentKind && filters.agentKind !== "all")
+    conditions.push(eq(usageDailyRollups.agentKind, filters.agentKind));
+  if (filters.projectId) conditions.push(eq(usageDailyRollups.projectId, filters.projectId));
   return and(...conditions);
 }
 
@@ -579,7 +665,12 @@ function hourlyRollupWhere(filters: DashboardFilters) {
     gte(usageHourlyRollups.localDate, filters.from),
     lte(usageHourlyRollups.localDate, filters.to),
   ];
-  if (filters.model) conditions.push(eq(usageHourlyRollups.model, filters.model));
+  const models = selectedModels(filters);
+  if (models.length === 1) conditions.push(eq(usageHourlyRollups.model, models[0]!));
+  if (models.length > 1) conditions.push(inArray(usageHourlyRollups.model, models));
+  if (filters.agentKind && filters.agentKind !== "all")
+    conditions.push(eq(usageHourlyRollups.agentKind, filters.agentKind));
+  if (filters.projectId) conditions.push(eq(usageHourlyRollups.projectId, filters.projectId));
   return and(...conditions);
 }
 
@@ -591,8 +682,19 @@ function membershipWhere(filters: DashboardFilters, bucketType: "day" | "hour") 
     gte(usageRollupSessionMemberships.bucketStart, from),
     lte(usageRollupSessionMemberships.bucketStart, to),
   ];
-  if (filters.model) conditions.push(eq(usageRollupSessionMemberships.model, filters.model));
+  const models = selectedModels(filters);
+  if (models.length === 1) conditions.push(eq(usageRollupSessionMemberships.model, models[0]!));
+  if (models.length > 1) conditions.push(inArray(usageRollupSessionMemberships.model, models));
+  if (filters.agentKind && filters.agentKind !== "all")
+    conditions.push(eq(usageRollupSessionMemberships.agentKind, filters.agentKind));
+  if (filters.projectId)
+    conditions.push(eq(usageRollupSessionMemberships.projectId, filters.projectId));
   return and(...conditions);
+}
+
+function selectedModels(filters: DashboardFilters): string[] {
+  if (filters.models && filters.models.length > 0) return [...new Set(filters.models)];
+  return filters.model ? [filters.model] : [];
 }
 
 type AggregateRow = {

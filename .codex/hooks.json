@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|exec_command|Read|apply_patch|Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -lc 'd=\"$PWD\"; while [ \"$d\" != \"/\" ] && [ ! -f \"$d/.codex/hooks/pretool-guard.sh\" ]; do d=\"$(dirname \"$d\")\"; done; [ -f \"$d/.codex/hooks/pretool-guard.sh\" ] && exec bash \"$d/.codex/hooks/pretool-guard.sh\"'",
+            "timeout": 10,
+            "statusMessage": "Checking Codex Usage repository policy"
+          }
+        ]
+      }
+    ]
+  }
+}

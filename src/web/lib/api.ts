@@ -3,6 +3,7 @@ import type {
   DashboardResponse,
   ImportStatus,
   ModelRate,
+  SessionFilters,
   SessionsResponse,
   StorageStatus,
 } from "@/shared/types";
@@ -22,7 +23,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 function query(filters: DashboardFilters) {
   const values = new URLSearchParams({ from: filters.from, to: filters.to });
-  if (filters.model) values.set("model", filters.model);
+  const models = filters.models?.length ? filters.models : filters.model ? [filters.model] : [];
+  if (models.length > 0) values.set("models", models.join(","));
+  if (filters.projectId) values.set("project", filters.projectId);
+  if (filters.agentKind && filters.agentKind !== "all") values.set("agentKind", filters.agentKind);
   return values.toString();
 }
 
@@ -30,8 +34,15 @@ export function fetchDashboard(filters: DashboardFilters) {
   return request<DashboardResponse>(`/api/dashboard?${query(filters)}`);
 }
 
-export function fetchSessions(filters: DashboardFilters) {
-  return request<SessionsResponse>(`/api/sessions?${query(filters)}`);
+export function fetchSessions(filters: SessionFilters) {
+  const values = new URLSearchParams(query(filters));
+  if (filters.query) values.set("q", filters.query);
+  if (filters.hasSubagents !== undefined) values.set("hasSubagents", String(filters.hasSubagents));
+  if (filters.order) values.set("order", filters.order);
+  if (filters.page) values.set("page", String(filters.page));
+  if (filters.pageSize) values.set("pageSize", String(filters.pageSize));
+  if (filters.sort) values.set("sort", filters.sort);
+  return request<SessionsResponse>(`/api/sessions?${values.toString()}`);
 }
 
 export function fetchStorageStatus() {

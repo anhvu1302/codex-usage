@@ -5,7 +5,16 @@ coverage/
 playwright-report/
 test-results/
 .env
+.env.*
+!.env.example
+!.env.template
+!.env.sample
 .local/
+.codegraph/
+.claude/settings.local.json
+.claude/agent-memory/
+.claude/agent-memory-local/
+CLAUDE.local.md
 *.db
 *.db-shm
 *.db-wal

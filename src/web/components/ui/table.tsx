@@ -8,9 +8,18 @@ import { forwardRef } from "react";
 
 import { cn } from "@/web/lib/utils";
 
-const Table = forwardRef<HTMLTableElement, TableHTMLAttributes<HTMLTableElement>>(
-  ({ className, ...props }, reference) => (
-    <div className="relative w-full overflow-auto">
+type TableProps = TableHTMLAttributes<HTMLTableElement> & { scrollLabel?: string };
+
+const Table = forwardRef<HTMLTableElement, TableProps>(
+  ({ className, scrollLabel = "Bảng dữ liệu có thể cuộn", ...props }, reference) => (
+    <div
+      aria-label={scrollLabel}
+      className="relative w-full overflow-auto"
+      role="region"
+      // A focusable scroll container is required for keyboard access when the table overflows.
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+      tabIndex={0}
+    >
       <table
         ref={reference}
         className={cn("w-full caption-bottom text-sm", className)}

@@ -7,6 +7,8 @@ module.exports = {
       instances: 1,
       exec_mode: "fork",
       interpreter: "node",
+      // Keep full JSONL rescans below the 256 MB PM2 restart threshold.
+      node_args: "--max-old-space-size=64 --max-semi-space-size=4",
       autorestart: true,
       watch: false,
       restart_delay: 1000,
