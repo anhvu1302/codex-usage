@@ -8,10 +8,12 @@ import {
   HardDrive,
   LoaderCircle,
   RefreshCw,
+  ScanSearch,
   Settings2,
   Trash2,
 } from "lucide-react";
 import { Link } from "react-router";
+import { useState } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/web/components/ui/badge";
@@ -24,10 +26,19 @@ import {
   CardTitle,
 } from "@/web/components/ui/card";
 import { Skeleton } from "@/web/components/ui/skeleton";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/web/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/web/components/ui/tabs";
 import {
   compactActivityStorage,
   fetchDataHealth,
+  queueDeepVerification,
   syncActivitySources,
 } from "@/web/lib/activity-api";
 import { formatTokens } from "@/web/lib/product-api";
@@ -35,11 +46,24 @@ import { cn } from "@/web/lib/utils";
 import type { DataHealthResponse } from "@/shared/types";
 
 export function DataHealthCenter({ className }: { className?: string }) {
+  const [deepDialogOpen, setDeepDialogOpen] = useState(false);
   const queryClient = useQueryClient();
   const health = useQuery({
     queryKey: ["data-health"],
     queryFn: fetchDataHealth,
-    refetchInterval: 30_000,
+    refetchInterval: (query) => {
+      const scan = query.state.data?.sourceScan;
+      return scan?.deepQueued || scan?.current?.mode === "deep" ? 2_000 : 30_000;
+    },
+  });
+  const deepVerify = useMutation({
+    mutationFn: queueDeepVerification,
+    onError: (error) => toast.error(error.message),
+    onSuccess: () => {
+      setDeepDialogOpen(false);
+      toast.success("Đã xếp hàng kiểm chứng sâu. Tiến độ sẽ tự động cập nhật.");
+      void invalidateHealth(queryClient);
+    },
   });
   const sync = useMutation({
     mutationFn: syncActivitySources,
@@ -82,6 +106,8 @@ export function DataHealthCenter({ className }: { className?: string }) {
   const data = health.data;
   if (!data) return <HealthSkeleton className={className} />;
   const issueCount = countIssues(data);
+  const deepBusy =
+    deepVerify.isPending || data.sourceScan.deepQueued || data.sourceScan.current?.mode === "deep";
 
   return (
     <section className={cn("space-y-4", className)} aria-labelledby="data-health-title">
@@ -96,7 +122,7 @@ export function DataHealthCenter({ className }: { className?: string }) {
             </Badge>
           </div>
           <p className="text-muted-foreground mt-1 text-sm">
-            Chẩn đoán được cập nhật tự động mỗi 30 giây.
+            Chẩn đoán được cập nhật tự động mỗi {deepBusy ? "2" : "30"} giây.
           </p>
         </div>
         <div className="flex flex-wrap gap-2" aria-live="polite">
@@ -104,12 +130,18 @@ export function DataHealthCenter({ className }: { className?: string }) {
             <RefreshCw className={cn("size-4", sync.isPending && "animate-spin")} />
             Sync ngay
           </Button>
+          <Button disabled={deepBusy} variant="outline" onClick={() => setDeepDialogOpen(true)}>
+            <ScanSearch className={cn("size-4", deepBusy && "animate-pulse")} />
+            {data.sourceScan.deepQueued ? "Đang chờ kiểm chứng" : "Kiểm chứng sâu"}
+          </Button>
           <Button disabled={compact.isPending} variant="outline" onClick={() => compact.mutate()}>
             <Database className={cn("size-4", compact.isPending && "animate-pulse")} />
             Compact ngay
           </Button>
         </div>
       </div>
+
+      <SourceScanSummary scan={data.sourceScan} />
 
       {(data.importerError ?? data.retentionError) && (
         <Card className="border-destructive/50 bg-destructive/5" role="alert">
@@ -303,7 +335,97 @@ export function DataHealthCenter({ className }: { className?: string }) {
           </div>
         </TabsContent>
       </Tabs>
+
+      <Dialog open={deepDialogOpen} onOpenChange={setDeepDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Kiểm chứng sâu toàn bộ session?</DialogTitle>
+            <DialogDescription>
+              Tác vụ này sẽ inventory lại thư mục rồi đọc toàn bộ JSONL từ đầu. Có thể dùng thêm
+              CPU, RAM và I/O trong lúc chạy, nhưng tuyệt đối không sửa, di chuyển hay xoá source
+              JSONL.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="bg-muted/60 rounded-lg border p-3 text-sm">
+            Lịch sử đã import vẫn được giữ; quá trình chỉ bổ sung và dedupe dữ liệu để kiểm chứng
+            aggregate hiện tại.
+          </div>
+          <DialogFooter>
+            <Button
+              disabled={deepVerify.isPending}
+              variant="outline"
+              onClick={() => setDeepDialogOpen(false)}
+            >
+              Huỷ
+            </Button>
+            <Button disabled={deepVerify.isPending} onClick={() => deepVerify.mutate()}>
+              <ScanSearch className={cn("size-4", deepVerify.isPending && "animate-pulse")} />
+              Bắt đầu kiểm chứng
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </section>
+  );
+}
+
+function SourceScanSummary({ scan }: { scan: DataHealthResponse["sourceScan"] }) {
+  const current = scan.current;
+  const last = scan.lastCompleted;
+  const state = scan.deepQueued
+    ? "Đang chờ kiểm chứng sâu"
+    : current
+      ? `${current.mode === "deep" ? "Kiểm chứng sâu" : "Inventory"} · ${formatScanPhase(current.phase)}`
+      : "Sẵn sàng";
+
+  return (
+    <Card aria-live="polite">
+      <CardHeader className="pb-3">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ScanSearch className="text-primary size-4" /> Quét source session
+            </CardTitle>
+            <CardDescription>
+              Inventory vẫn duyệt toàn bộ thư mục, nhưng chỉ đọc nội dung JSONL mới hoặc thay đổi.
+            </CardDescription>
+          </div>
+          <Badge variant={current || scan.deepQueued ? "secondary" : "outline"}>{state}</Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <RetentionStat
+          label="Tiến độ hiện tại"
+          value={
+            current
+              ? `${formatTokens(current.filesRead)} đọc · ${formatTokens(current.filesSkipped)} bỏ qua / ${formatTokens(current.discoveredFiles)} file`
+              : scan.deepQueued
+                ? "Đang chờ tác vụ trước hoàn tất"
+                : "Không có scan đang chạy"
+          }
+        />
+        <RetentionStat
+          label="Scan hoàn tất gần nhất"
+          value={
+            last
+              ? `${last.mode === "deep" ? "Deep" : "Inventory"} · ${formatDuration(last.durationMs)}`
+              : "Chưa chạy"
+          }
+        />
+        <RetentionStat
+          label="Kết quả đọc / bỏ qua"
+          value={
+            last
+              ? `${formatTokens(last.filesRead)} / ${formatTokens(last.filesSkipped)} file · ${formatBytes(last.sourceBytes)}`
+              : "Chưa có snapshot"
+          }
+        />
+        <RetentionStat
+          label="Snapshot / scan kế tiếp"
+          value={`Cập nhật ${formatDateTime(last?.completedAt ?? null)} · Kế tiếp ${formatDateTime(scan.nextScheduledAt)}`}
+        />
+      </CardContent>
+    </Card>
   );
 }
 
@@ -428,6 +550,33 @@ function formatDateTime(value: string | null): string {
     timeStyle: "short",
     timeZone: "Asia/Ho_Chi_Minh",
   }).format(new Date(value));
+}
+
+function formatScanPhase(phase: NonNullable<DataHealthResponse["sourceScan"]["current"]>["phase"]) {
+  if (phase === "discovering") return "đang duyệt thư mục";
+  if (phase === "reading") return "đang đọc JSONL";
+  return "đang đối soát";
+}
+
+function formatDuration(durationMs: number): string {
+  if (durationMs < 1_000) return `${Math.round(durationMs)} ms`;
+  if (durationMs < 60_000) return `${(durationMs / 1_000).toFixed(1)} giây`;
+  const minutes = Math.floor(durationMs / 60_000);
+  const seconds = Math.round((durationMs % 60_000) / 1_000);
+  return `${minutes} phút ${seconds} giây`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1_024) return `${formatTokens(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1_024;
+  let unit = units[0]!;
+  for (const candidate of units.slice(1)) {
+    if (value < 1_024) break;
+    value /= 1_024;
+    unit = candidate;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${unit}`;
 }
 
 async function invalidateHealth(queryClient: ReturnType<typeof useQueryClient>) {

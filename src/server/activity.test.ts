@@ -217,6 +217,10 @@ describe("activity import and retention", () => {
     client.exec(await migrationSql(7));
     client.exec(await migrationSql(8));
     client.exec(await migrationSql(9));
+    client
+      .prepare("insert into import_states (source_path, updated_at) values (?, ?)")
+      .run("/legacy/source.jsonl", 1);
+    client.exec(await migrationSql(10));
 
     expect(
       client
@@ -237,6 +241,35 @@ describe("activity import and retention", () => {
         )
         .get(),
     ).toEqual({ turnKey: null, version: 0 });
+    expect(
+      client
+        .prepare(
+          `select name, "notnull" as "notNull"
+           from pragma_table_info('import_states')
+           where name in ('source_size', 'source_mtime_ns', 'source_ctime_ns', 'source_file_id')
+           order by name`,
+        )
+        .all(),
+    ).toEqual([
+      { name: "source_ctime_ns", notNull: 0 },
+      { name: "source_file_id", notNull: 0 },
+      { name: "source_mtime_ns", notNull: 0 },
+      { name: "source_size", notNull: 0 },
+    ]);
+    expect(
+      client
+        .prepare(
+          `select source_size as sourceSize, source_mtime_ns as sourceMtimeNs,
+                  source_ctime_ns as sourceCtimeNs, source_file_id as sourceFileId
+           from import_states where source_path = '/legacy/source.jsonl'`,
+        )
+        .get(),
+    ).toEqual({
+      sourceCtimeNs: null,
+      sourceFileId: null,
+      sourceMtimeNs: null,
+      sourceSize: null,
+    });
     expect(
       client
         .prepare(
@@ -460,6 +493,9 @@ describe("activity import and retention", () => {
       importerError: null,
       malformedLines: 1,
       sourceDeletedSessions: 1,
+      sourceScan: {
+        lastCompleted: expect.objectContaining({ mode: "inventory" }),
+      },
       unknownUsage: 1,
       unpricedUsage: 1,
     });

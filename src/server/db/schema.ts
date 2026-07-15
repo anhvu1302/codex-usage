@@ -109,7 +109,11 @@ export const importStates = sqliteTable("import_states", {
   activeModel: text("active_model"),
   activeTurnKey: text("active_turn_key"),
   sessionContextWindow: integer("session_context_window"),
+  sourceCtimeNs: text("source_ctime_ns"),
+  sourceFileId: text("source_file_id"),
+  sourceMtimeNs: text("source_mtime_ns"),
   turnAttributionVersion: integer("turn_attribution_version").notNull().default(0),
+  sourceSize: integer("source_size"),
   updatedAt: integer("updated_at").notNull(),
 });
 

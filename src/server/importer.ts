@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { watch, type FSWatcher } from "chokidar";
@@ -26,10 +25,19 @@ import {
   usageEvents,
 } from "@/server/db/schema";
 import { ensureProject } from "@/server/projects";
+import {
+  readSourceFileMetadata,
+  sameSourceMetadata,
+  SourceInventory,
+  type SourceFileMetadata,
+} from "@/server/source-inventory";
 import { TURN_ATTRIBUTION_VERSION, TURN_BACKFILL_STATE_ID } from "@/server/turn-constants";
 import type {
   ActivityKind,
   ImportStatus,
+  SourceScanMode,
+  SourceScanStatus,
+  SourceScanTrigger,
   TokenUsage,
   TurnBackfillStatus,
   TurnStatus,
@@ -89,6 +97,22 @@ type JsonStructureState = {
   unicodeDigits: number;
 };
 
+type ImportFileResult = {
+  bytesRead: number;
+  inserted: number;
+};
+
+type IndexedTitle = {
+  title: string;
+  updatedAt: number;
+};
+
+export type SessionImporterOptions = {
+  inventory?: SourceInventory;
+  now?: () => Date;
+  scanIntervalMs?: number;
+};
+
 const DATE_PARTS = new Intl.DateTimeFormat("en-CA", {
   day: "2-digit",
   month: "2-digit",
@@ -96,6 +120,7 @@ const DATE_PARTS = new Intl.DateTimeFormat("en-CA", {
   year: "numeric",
 });
 const USAGE_DEDUPE_VERSION = 5;
+const DEFAULT_SCAN_INTERVAL_MS = 15 * 60 * 1_000;
 
 const EMPTY_TURN_BACKFILL: TurnBackfillStatus = {
   attributionVersion: TURN_ATTRIBUTION_VERSION,
@@ -156,10 +181,20 @@ export class SessionImporter {
   private readonly activityResetAgents = new Set<string>();
   private readonly legacyArchivedUsageClaims = new Set<string>();
   private readonly rateCache = new Map<string, RateSnapshot | null>();
-  private readonly scheduledFiles = new Set<string>();
+  private readonly fileTimers = new Map<string, NodeJS.Timeout>();
+  private readonly inventory: SourceInventory;
+  private readonly now: () => Date;
+  private readonly scanIntervalMs: number;
   private readonly sessionIndexPath: string;
-  private sessionIndexRefreshScheduled = false;
+  private deepSyncPromise: Promise<ImportStatus> | null = null;
+  private inventorySyncPromise: Promise<ImportStatus> | null = null;
+  private periodicTimer: NodeJS.Timeout | null = null;
   private queue: Promise<void> = Promise.resolve();
+  private sessionIndexMetadata: SourceFileMetadata | null = null;
+  private sessionIndexOffset = 0;
+  private sessionIndexTimer: NodeJS.Timeout | null = null;
+  private sessionIndexTitles = new Map<string, IndexedTitle>();
+  private stopping = false;
   private watcher: FSWatcher | null = null;
   private status: ImportStatus = {
     error: null,
@@ -169,19 +204,28 @@ export class SessionImporter {
     recordsBackfilled: 0,
     recordsInserted: 0,
     recordsReclassified: 0,
+    sourceScan: emptySourceScanStatus(),
     turnBackfill: EMPTY_TURN_BACKFILL,
   };
 
   constructor(
     private readonly database: AppDatabase,
     private readonly sessionsDirectory: string,
+    options: SessionImporterOptions = {},
   ) {
+    this.now = options.now ?? (() => new Date());
+    this.inventory = options.inventory ?? new SourceInventory(sessionsDirectory, this.now);
+    this.scanIntervalMs = options.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
     this.sessionIndexPath = join(dirname(sessionsDirectory), "session_index.jsonl");
     this.status.turnBackfill = this.readTurnBackfillStatus();
   }
 
   getStatus(): ImportStatus {
-    return { ...this.status, turnBackfill: { ...this.status.turnBackfill } };
+    return {
+      ...this.status,
+      sourceScan: cloneSourceScanStatus(this.status.sourceScan),
+      turnBackfill: { ...this.status.turnBackfill },
+    };
   }
 
   clearRateCache() {
@@ -190,11 +234,13 @@ export class SessionImporter {
 
   start(): Promise<void> {
     if (this.watcher) return Promise.resolve();
+    this.stopping = false;
 
     this.watcher = watch([this.sessionsDirectory, this.sessionIndexPath], {
       awaitWriteFinish: { stabilityThreshold: 750, pollInterval: 100 },
       ignoreInitial: true,
     });
+    const ready = new Promise<void>((resolve) => this.watcher?.once("ready", () => resolve()));
     this.watcher.on("add", (filePath) => {
       if (filePath === this.sessionIndexPath) {
         this.scheduleSessionIndexRefresh();
@@ -209,40 +255,85 @@ export class SessionImporter {
       }
       this.scheduleFile(filePath);
     });
+    this.watcher.on("unlink", (filePath) => {
+      if (this.stopping) return;
+      if (filePath === this.sessionIndexPath) {
+        this.clearSessionIndexTimer();
+        this.sessionIndexMetadata = null;
+        this.sessionIndexOffset = 0;
+        return;
+      }
+      this.clearFileTimer(filePath);
+      void this.enqueue(() => Promise.resolve(this.markSourceDeleted(filePath)));
+    });
 
-    void this.syncAll();
-    return Promise.resolve();
+    void this.requestInventory("startup");
+    return ready;
   }
 
   async stop() {
+    this.stopping = true;
+    this.clearPeriodicTimer();
+    this.clearSessionIndexTimer();
+    for (const timer of this.fileTimers.values()) clearTimeout(timer);
+    this.fileTimers.clear();
     await this.watcher?.close();
     this.watcher = null;
     await this.queue;
   }
 
   syncAll(): Promise<ImportStatus> {
-    return this.enqueue(() => this.runFullSync());
+    return this.requestInventory("manual");
+  }
+
+  queueDeepSync(): boolean {
+    if (
+      this.stopping ||
+      this.deepSyncPromise ||
+      this.status.sourceScan.deepQueued ||
+      this.status.sourceScan.current?.mode === "deep"
+    ) {
+      return false;
+    }
+
+    this.clearPeriodicTimer();
+    this.status.sourceScan.deepQueued = true;
+    const execution = this.enqueue(async () => {
+      this.status.sourceScan.deepQueued = false;
+      return this.runFullSync("manual", "deep");
+    });
+    this.deepSyncPromise = execution;
+    void execution.then(
+      () => this.completeDeepRequest(execution),
+      () => this.completeDeepRequest(execution),
+    );
+    return true;
   }
 
   syncFile(filePath: string): Promise<number> {
-    return this.enqueue(async () => {
-      const savedState = this.database
-        .select({ turnAttributionVersion: importStates.turnAttributionVersion })
-        .from(importStates)
-        .where(eq(importStates.sourcePath, filePath))
-        .get();
-      if (savedState && savedState.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION) {
-        const status = await this.runFullSync();
-        return status.recordsInserted;
-      }
+    if (this.stopping) return Promise.resolve(0);
+    const savedState = this.database
+      .select({ turnAttributionVersion: importStates.turnAttributionVersion })
+      .from(importStates)
+      .where(eq(importStates.sourcePath, filePath))
+      .get();
+    if (savedState && savedState.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION) {
+      return this.requestInventory("scheduled").then((status) => status.recordsInserted);
+    }
 
+    return this.enqueue(async () => {
       this.beginSync();
       try {
-        const inserted = await this.importFile(filePath);
+        const metadata = await readSourceFileMetadata(filePath);
+        if (!metadata) {
+          this.markSourceDeleted(filePath);
+          throw new Error(`ENOENT: no such source file, stat '${filePath}'`);
+        }
+        const { bytesRead, inserted } = await this.importFile(metadata);
         this.status.filesProcessed += 1;
         this.status.recordsInserted += inserted;
-        this.reconcileUsage();
-        this.status.lastSyncAt = new Date().toISOString();
+        if (bytesRead > 0) this.reconcileUsage();
+        this.status.lastSyncAt = this.now().toISOString();
         return inserted;
       } catch (error) {
         this.status.error = errorMessage(error);
@@ -253,13 +344,61 @@ export class SessionImporter {
     });
   }
 
-  private async runFullSync(): Promise<ImportStatus> {
+  private requestInventory(trigger: SourceScanTrigger): Promise<ImportStatus> {
+    if (this.stopping) return Promise.resolve(this.getStatus());
+    if (trigger !== "scheduled") this.clearPeriodicTimer();
+    if (this.deepSyncPromise) return this.deepSyncPromise;
+    if (this.inventorySyncPromise) return this.inventorySyncPromise;
+
+    const execution = this.enqueue(() => this.runFullSync(trigger, "inventory"));
+    this.inventorySyncPromise = execution;
+    void execution.then(
+      () => this.completeInventoryRequest(execution),
+      () => this.completeInventoryRequest(execution),
+    );
+    return execution;
+  }
+
+  private completeInventoryRequest(execution: Promise<ImportStatus>) {
+    if (this.inventorySyncPromise === execution) this.inventorySyncPromise = null;
+    if (!this.deepSyncPromise) this.scheduleNextInventory();
+  }
+
+  private completeDeepRequest(execution: Promise<ImportStatus>) {
+    if (this.deepSyncPromise === execution) this.deepSyncPromise = null;
+    this.status.sourceScan.deepQueued = false;
+    this.scheduleNextInventory();
+  }
+
+  private async runFullSync(
+    trigger: SourceScanTrigger,
+    mode: SourceScanMode,
+  ): Promise<ImportStatus> {
     this.beginSync();
+    const startedAt = this.now();
+    this.status.sourceScan.current = {
+      discoveredFiles: 0,
+      filesRead: 0,
+      filesSkipped: 0,
+      mode,
+      phase: "discovering",
+      startedAt: startedAt.toISOString(),
+      trigger,
+    };
 
     try {
-      const files = await findSessionFiles(this.sessionsDirectory);
-      this.prepareUsageHistoryForDeduplication(files);
+      const snapshot = await this.inventory.refresh();
+      const files = snapshot.files.map((file) => file.path);
+      const availablePaths = new Set(files);
+      const currentScan = this.status.sourceScan.current;
+      if (!currentScan) throw new Error("Source scan state was cleared unexpectedly");
+      currentScan.discoveredFiles = files.length;
+      currentScan.phase = "reading";
+      this.status.filesProcessed = files.length;
+
+      const usageRepairRequired = this.prepareUsageHistoryForDeduplication(files);
       const turnBackfill = this.prepareTurnAttribution(files);
+      const repairRequired = usageRepairRequired || turnBackfill.required;
       if (
         turnBackfill.required ||
         this.status.turnBackfill.isRunning ||
@@ -269,21 +408,40 @@ export class SessionImporter {
       ) {
         this.beginTurnBackfill(files.length, turnBackfill.sourceDeletedGaps);
       }
-      for (const filePath of files) {
-        const inserted = await this.importFile(filePath);
-        this.status.filesProcessed += 1;
-        this.status.recordsInserted += inserted;
+
+      for (const metadata of snapshot.files) {
+        if (mode === "inventory" && !repairRequired && this.canSkipFile(metadata)) {
+          currentScan.filesSkipped += 1;
+          continue;
+        }
+        const result = await this.importFile(metadata, mode === "deep");
+        currentScan.filesRead += 1;
+        this.status.recordsInserted += result.inserted;
         if (this.status.turnBackfill.isRunning) this.advanceTurnBackfill();
       }
-      await this.refreshSessionTitles();
-      this.reconcileUsage();
-      this.refreshDeletedSources();
+
+      currentScan.phase = "reconciling";
+      await this.refreshSessionTitles(mode === "deep");
+      if (currentScan.filesRead > 0 || repairRequired) this.reconcileUsage();
+      this.refreshDeletedSources(availablePaths);
       if (this.status.turnBackfill.isRunning) this.finishTurnBackfill(null);
-      this.status.lastSyncAt = new Date().toISOString();
+      const completedAt = this.now();
+      this.status.lastSyncAt = completedAt.toISOString();
+      this.status.sourceScan.lastCompleted = {
+        completedAt: completedAt.toISOString(),
+        discoveredFiles: currentScan.discoveredFiles,
+        durationMs: Math.max(0, completedAt.getTime() - startedAt.getTime()),
+        filesRead: currentScan.filesRead,
+        filesSkipped: currentScan.filesSkipped,
+        mode,
+        sourceBytes: snapshot.sourceBytes,
+        trigger,
+      };
     } catch (error) {
       this.status.error = errorMessage(error);
       if (this.status.turnBackfill.isRunning) this.finishTurnBackfill(this.status.error);
     } finally {
+      this.status.sourceScan.current = null;
       this.status.isSyncing = false;
     }
 
@@ -301,6 +459,7 @@ export class SessionImporter {
       recordsBackfilled: 0,
       recordsInserted: 0,
       recordsReclassified: 0,
+      sourceScan: cloneSourceScanStatus(this.status.sourceScan),
       turnBackfill: this.readTurnBackfillStatus(),
     };
   }
@@ -315,25 +474,26 @@ export class SessionImporter {
   }
 
   private scheduleFile(filePath: string) {
-    if (!filePath.endsWith(".jsonl") || this.scheduledFiles.has(filePath)) return;
+    if (this.stopping || !filePath.endsWith(".jsonl") || this.fileTimers.has(filePath)) return;
 
-    this.scheduledFiles.add(filePath);
-    setTimeout(() => {
-      this.scheduledFiles.delete(filePath);
+    const timer = setTimeout(() => {
+      this.fileTimers.delete(filePath);
+      if (this.stopping) return;
       void this.syncFile(filePath);
     }, 350);
+    this.fileTimers.set(filePath, timer);
   }
 
   private scheduleSessionIndexRefresh() {
-    if (this.sessionIndexRefreshScheduled) return;
-    this.sessionIndexRefreshScheduled = true;
-    setTimeout(() => {
-      this.sessionIndexRefreshScheduled = false;
+    if (this.stopping || this.sessionIndexTimer) return;
+    this.sessionIndexTimer = setTimeout(() => {
+      this.sessionIndexTimer = null;
+      if (this.stopping) return;
       void this.enqueue(async () => {
         this.beginSync();
         try {
-          await this.refreshSessionTitles();
-          this.status.lastSyncAt = new Date().toISOString();
+          await this.refreshSessionTitles(false);
+          this.status.lastSyncAt = this.now().toISOString();
         } catch (error) {
           this.status.error = errorMessage(error);
         } finally {
@@ -343,13 +503,43 @@ export class SessionImporter {
     }, 350);
   }
 
-  private prepareUsageHistoryForDeduplication(files: string[]) {
+  private clearFileTimer(filePath: string) {
+    const timer = this.fileTimers.get(filePath);
+    if (timer) clearTimeout(timer);
+    this.fileTimers.delete(filePath);
+  }
+
+  private clearSessionIndexTimer() {
+    if (this.sessionIndexTimer) clearTimeout(this.sessionIndexTimer);
+    this.sessionIndexTimer = null;
+  }
+
+  private clearPeriodicTimer() {
+    if (this.periodicTimer) clearTimeout(this.periodicTimer);
+    this.periodicTimer = null;
+    this.status.sourceScan.nextScheduledAt = null;
+  }
+
+  private scheduleNextInventory() {
+    if (this.stopping) return;
+    this.clearPeriodicTimer();
+    const nextAt = new Date(this.now().getTime() + this.scanIntervalMs);
+    this.status.sourceScan.nextScheduledAt = nextAt.toISOString();
+    this.periodicTimer = setTimeout(() => {
+      this.periodicTimer = null;
+      this.status.sourceScan.nextScheduledAt = null;
+      if (!this.stopping) void this.requestInventory("scheduled");
+    }, this.scanIntervalMs);
+    this.periodicTimer.unref();
+  }
+
+  private prepareUsageHistoryForDeduplication(files: string[]): boolean {
     const states = this.database.select().from(importStates).all();
     if (
       states.length === 0 ||
       states.every((state) => state.dedupeVersion === USAGE_DEDUPE_VERSION)
     ) {
-      return;
+      return false;
     }
 
     const availablePaths = new Set(files);
@@ -385,6 +575,7 @@ export class SessionImporter {
         `Bỏ qua attribution repair cho ${unavailableStates.length} JSONL source đã bị xóa; history hiện có vẫn được giữ.`,
       );
     }
+    return true;
   }
 
   private prepareTurnAttribution(files: string[]) {
@@ -533,8 +724,36 @@ export class SessionImporter {
     this.status.recordsBackfilled += backfillAllUnpricedUsage(this.database);
   }
 
-  private async importFile(filePath: string): Promise<number> {
-    const fileInfo = await stat(filePath);
+  private canSkipFile(metadata: SourceFileMetadata): boolean {
+    if (this.status.turnBackfill.isRunning) return false;
+    const savedState = this.database
+      .select()
+      .from(importStates)
+      .where(eq(importStates.sourcePath, metadata.path))
+      .get();
+    if (!savedState) return false;
+    if (
+      savedState.agentId === null ||
+      savedState.dedupeVersion !== USAGE_DEDUPE_VERSION ||
+      savedState.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION ||
+      savedState.lastOffset !== metadata.size ||
+      !sameSourceMetadata(metadata, savedState)
+    ) {
+      return false;
+    }
+    const diagnostic = this.database
+      .select()
+      .from(importDiagnostics)
+      .where(eq(importDiagnostics.sourcePath, metadata.path))
+      .get();
+    return diagnostic?.lastError === null && !diagnostic.incompleteLine;
+  }
+
+  private async importFile(
+    metadata: SourceFileMetadata,
+    forceFromStart = false,
+  ): Promise<ImportFileResult> {
+    const filePath = metadata.path;
     const savedState = this.database
       .select()
       .from(importStates)
@@ -544,8 +763,26 @@ export class SessionImporter {
       savedState?.agentId === null ||
       savedState?.dedupeVersion !== USAGE_DEDUPE_VERSION ||
       savedState?.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION;
+    const hasSavedMetadata =
+      savedState?.sourceSize !== null &&
+      savedState?.sourceSize !== undefined &&
+      savedState.sourceMtimeNs !== null &&
+      savedState.sourceCtimeNs !== null;
+    const sameIdentity = savedState?.sourceFileId === metadata.fileId;
+    const exactMetadata = savedState ? sameSourceMetadata(metadata, savedState) : false;
+    const grewInPlace =
+      hasSavedMetadata &&
+      sameIdentity &&
+      savedState !== undefined &&
+      metadata.size > savedState.sourceSize!;
+    const safeLegacyResume =
+      !hasSavedMetadata && savedState !== undefined && savedState.lastOffset <= metadata.size;
     const startOffset =
-      savedState && savedState.lastOffset <= fileInfo.size && !needsAgentAttribution
+      !forceFromStart &&
+      !needsAgentAttribution &&
+      savedState &&
+      savedState.lastOffset <= metadata.size &&
+      (exactMetadata || grewInPlace || safeLegacyResume)
         ? savedState.lastOffset
         : 0;
     const canonicalBoundary =
@@ -599,37 +836,40 @@ export class SessionImporter {
 
     this.saveImportDiagnostic(filePath, malformedLines, readResult.incompleteLine, null);
 
+    const currentMetadata = await readSourceFileMetadata(filePath);
+    const metadataToSave =
+      currentMetadata && sourceMetadataEquals(currentMetadata, metadata)
+        ? currentMetadata
+        : metadata;
+    const nextState = {
+      activeModel: state.activeModel,
+      activeTurnKey: state.activeTurnKey,
+      agentId: state.agentId,
+      dedupeVersion: USAGE_DEDUPE_VERSION,
+      lastOffset: canonicalBoundary.resolved ? readResult.lastCompleteOffset : 0,
+      sessionContextWindow: state.sessionContextWindow,
+      sessionId: state.sessionId,
+      sourceCtimeNs: metadataToSave.ctimeNs,
+      sourceFileId: metadataToSave.fileId,
+      sourceMtimeNs: metadataToSave.mtimeNs,
+      sourceSize: metadataToSave.size,
+      turnAttributionVersion: TURN_ATTRIBUTION_VERSION,
+      updatedAt: Date.now(),
+    };
+
     this.database
       .insert(importStates)
       .values({
-        activeModel: state.activeModel,
-        activeTurnKey: state.activeTurnKey,
-        agentId: state.agentId,
-        dedupeVersion: USAGE_DEDUPE_VERSION,
-        lastOffset: canonicalBoundary.resolved ? readResult.lastCompleteOffset : 0,
-        sessionContextWindow: state.sessionContextWindow,
-        sessionId: state.sessionId,
+        ...nextState,
         sourcePath: filePath,
-        turnAttributionVersion: TURN_ATTRIBUTION_VERSION,
-        updatedAt: Date.now(),
       })
       .onConflictDoUpdate({
         target: importStates.sourcePath,
-        set: {
-          activeModel: state.activeModel,
-          activeTurnKey: state.activeTurnKey,
-          agentId: state.agentId,
-          dedupeVersion: USAGE_DEDUPE_VERSION,
-          lastOffset: canonicalBoundary.resolved ? readResult.lastCompleteOffset : 0,
-          sessionContextWindow: state.sessionContextWindow,
-          sessionId: state.sessionId,
-          turnAttributionVersion: TURN_ATTRIBUTION_VERSION,
-          updatedAt: Date.now(),
-        },
+        set: nextState,
       })
       .run();
 
-    return inserted;
+    return { bytesRead: Math.max(0, metadata.size - startOffset), inserted };
   }
 
   private handleLine(
@@ -1577,9 +1817,23 @@ export class SessionImporter {
       .run();
   }
 
-  private refreshDeletedSources() {
+  private markSourceDeleted(sourcePath: string) {
+    if (!sourcePath.endsWith(".jsonl")) return;
+    this.database
+      .update(sessions)
+      .set({ sourceDeleted: true })
+      .where(eq(sessions.sourcePath, sourcePath))
+      .run();
+    this.database
+      .update(sessionAgents)
+      .set({ sourceDeleted: true })
+      .where(eq(sessionAgents.sourcePath, sourcePath))
+      .run();
+  }
+
+  private refreshDeletedSources(availablePaths: Set<string>) {
     for (const session of this.database.select().from(sessions).all()) {
-      const sourceDeleted = !existsSync(session.sourcePath);
+      const sourceDeleted = !availablePaths.has(session.sourcePath);
       if (sourceDeleted === session.sourceDeleted) continue;
       this.database
         .update(sessions)
@@ -1589,7 +1843,7 @@ export class SessionImporter {
     }
 
     for (const agent of this.database.select().from(sessionAgents).all()) {
-      const sourceDeleted = !existsSync(agent.sourcePath);
+      const sourceDeleted = !availablePaths.has(agent.sourcePath);
       if (sourceDeleted === agent.sourceDeleted) continue;
       this.database
         .update(sessionAgents)
@@ -1599,28 +1853,43 @@ export class SessionImporter {
     }
   }
 
-  private async refreshSessionTitles() {
-    const titles = await readIndexedSessionTitles(this.sessionIndexPath);
-    for (const [id, title] of titles) {
-      this.database.update(sessions).set({ title }).where(eq(sessions.id, id)).run();
-    }
-  }
-}
+  private async refreshSessionTitles(forceFull: boolean) {
+    const metadata = await readSourceFileMetadata(this.sessionIndexPath);
+    if (!metadata) return;
 
-async function findSessionFiles(directory: string): Promise<string[]> {
-  try {
-    const entries = await readdir(directory, { withFileTypes: true });
-    const nested = await Promise.all(
-      entries.map(async (entry) => {
-        const entryPath = join(directory, entry.name);
-        if (entry.isDirectory()) return findSessionFiles(entryPath);
-        return entry.isFile() && entry.name.endsWith(".jsonl") ? [entryPath] : [];
-      }),
-    );
-    return nested.flat().sort();
-  } catch (error) {
-    if (isRecord(error) && error["code"] === "ENOENT") return [];
-    throw error;
+    const previous = this.sessionIndexMetadata;
+    const rebuild =
+      forceFull ||
+      previous?.fileId !== metadata.fileId ||
+      metadata.size < this.sessionIndexOffset ||
+      (metadata.size === previous.size && !sourceMetadataEquals(metadata, previous));
+    if (
+      !rebuild &&
+      previous &&
+      sourceMetadataEquals(metadata, previous) &&
+      this.sessionIndexOffset === metadata.size
+    ) {
+      return;
+    }
+
+    const titles = rebuild
+      ? new Map<string, IndexedTitle>()
+      : new Map<string, IndexedTitle>(this.sessionIndexTitles);
+    const offset = rebuild ? 0 : this.sessionIndexOffset;
+    const result = await readSessionIndexLines(this.sessionIndexPath, offset, (rawLine) => {
+      mergeIndexedSessionTitle(titles, rawLine);
+    });
+    const currentMetadata = await readSourceFileMetadata(this.sessionIndexPath);
+    this.sessionIndexMetadata =
+      currentMetadata && sourceMetadataEquals(currentMetadata, metadata)
+        ? currentMetadata
+        : metadata;
+    this.sessionIndexOffset = result.lastCompleteOffset;
+    this.sessionIndexTitles = titles;
+
+    for (const [id, value] of titles) {
+      this.database.update(sessions).set({ title: value.title }).where(eq(sessions.id, id)).run();
+    }
   }
 }
 
@@ -1676,32 +1945,67 @@ async function findCanonicalBoundary(filePath: string): Promise<CanonicalBoundar
   };
 }
 
-async function readIndexedSessionTitles(filePath: string): Promise<Map<string, string>> {
-  let content: string;
+function mergeIndexedSessionTitle(titles: Map<string, IndexedTitle>, rawLine: string) {
+  let record: unknown;
   try {
-    content = await readFile(filePath, "utf8");
-  } catch (error) {
-    if (isRecord(error) && error["code"] === "ENOENT") return new Map();
-    throw error;
+    record = JSON.parse(rawLine);
+  } catch {
+    return;
   }
+  if (!isRecord(record)) return;
+  const id = asString(record["id"]);
+  const title = asString(record["thread_name"])?.trim();
+  if (!id || !title) return;
+  const updatedAt = Date.parse(asString(record["updated_at"]) ?? "") || 0;
+  const previous = titles.get(id);
+  if (!previous || updatedAt >= previous.updatedAt) titles.set(id, { title, updatedAt });
+}
 
-  const titles = new Map<string, { title: string; updatedAt: number }>();
-  for (const rawLine of content.split("\n")) {
-    try {
-      const record: unknown = JSON.parse(rawLine);
-      if (!isRecord(record)) continue;
-      const id = asString(record["id"]);
-      const title = asString(record["thread_name"])?.trim();
-      if (!id || !title) continue;
-      const updatedAt = Date.parse(asString(record["updated_at"]) ?? "") || 0;
-      const previous = titles.get(id);
-      if (!previous || updatedAt >= previous.updatedAt) titles.set(id, { title, updatedAt });
-    } catch {
-      // Session index records are append-only; an incomplete tail is retried on the next sync.
+async function readSessionIndexLines(
+  filePath: string,
+  offset: number,
+  onLine: (rawLine: string) => void,
+): Promise<{ lastCompleteOffset: number }> {
+  const stream = createReadStream(filePath, { start: offset });
+  const segments: Buffer[] = [];
+  let bufferedBytes = 0;
+  let lastCompleteOffset = offset;
+  const chunks: AsyncIterable<unknown> = stream;
+
+  for await (const chunkValue of chunks) {
+    if (!Buffer.isBuffer(chunkValue)) throw new TypeError("Expected a binary session index chunk");
+    let cursor = 0;
+    let newlineIndex = chunkValue.indexOf(0x0a, cursor);
+    while (newlineIndex !== -1) {
+      const segment = chunkValue.subarray(cursor, newlineIndex);
+      segments.push(segment);
+      bufferedBytes += segment.length;
+      const rawLine = Buffer.concat(segments, bufferedBytes).toString("utf8").replace(/\r$/, "");
+      if (rawLine.trim()) onLine(rawLine);
+      lastCompleteOffset += bufferedBytes + 1;
+      segments.length = 0;
+      bufferedBytes = 0;
+      cursor = newlineIndex + 1;
+      newlineIndex = chunkValue.indexOf(0x0a, cursor);
+    }
+    const tail = chunkValue.subarray(cursor);
+    if (tail.length > 0) {
+      segments.push(tail);
+      bufferedBytes += tail.length;
     }
   }
 
-  return new Map([...titles].map(([id, value]) => [id, value.title]));
+  if (bufferedBytes > 0) {
+    const rawLine = Buffer.concat(segments, bufferedBytes).toString("utf8").replace(/\r$/, "");
+    try {
+      JSON.parse(rawLine);
+      onLine(rawLine);
+      lastCompleteOffset += bufferedBytes;
+    } catch {
+      // A syntactically incomplete EOF fragment stays behind the cursor until the next append.
+    }
+  }
+  return { lastCompleteOffset };
 }
 
 type CompleteJsonLinesResult = {
@@ -2537,6 +2841,34 @@ function earlierTimestamp(left: string | null, right: string | null): string | n
 
 function laterTimestamp(left: string, right: string): string {
   return left >= right ? left : right;
+}
+
+function sourceMetadataEquals(left: SourceFileMetadata, right: SourceFileMetadata): boolean {
+  return (
+    left.path === right.path &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs &&
+    left.fileId === right.fileId
+  );
+}
+
+function emptySourceScanStatus(): SourceScanStatus {
+  return {
+    current: null,
+    deepQueued: false,
+    lastCompleted: null,
+    nextScheduledAt: null,
+  };
+}
+
+function cloneSourceScanStatus(status: SourceScanStatus): SourceScanStatus {
+  return {
+    current: status.current ? { ...status.current } : null,
+    deepQueued: status.deepQueued,
+    lastCompleted: status.lastCompleted ? { ...status.lastCompleted } : null,
+    nextScheduledAt: status.nextScheduledAt,
+  };
 }
 
 function toNonNegativeInteger(value: unknown): number | null {

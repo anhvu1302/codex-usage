@@ -108,6 +108,11 @@ export function createApp(
   });
   app.get("/api/status", (context) => context.json(importer.getStatus()));
   app.post("/api/sync", async (context) => context.json(await importer.syncAll()));
+  app.post("/api/sync/deep", (context) =>
+    importer.queueDeepSync()
+      ? context.json({ accepted: true as const }, 202)
+      : context.json({ error: "Deep verification is already queued or running" }, 409),
+  );
   app.get("/api/storage/status", async (context) => context.json(await retention.getStatus()));
   app.post("/api/storage/compact", async (context) => context.json(await retention.compact()));
   app.get("/api/activity", (context) => {

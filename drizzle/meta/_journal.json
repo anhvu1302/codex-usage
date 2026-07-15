@@ -71,6 +71,13 @@
       "when": 1784120614611,
       "tag": "0009_flowery_solo",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1784130089645,
+      "tag": "0010_loose_morgan_stark",
+      "breakpoints": true
     }
   ]
 }

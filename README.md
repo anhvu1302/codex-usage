@@ -22,7 +22,7 @@ Copy-Item .env.example .env
 pnpm dev
 ```
 
-In development, open `http://127.0.0.1:8787` (or the `PORT` in `.env`). One Node process hosts Hono API, Vite middleware, and HMR on that port. The first server run imports the `sessions` directory under `CODEX_HOME` in the background; the **Sync now** button can rescan at any time.
+In development, open `http://127.0.0.1:8787` (or the `PORT` in `.env`). One Node process hosts Hono API, Vite middleware, and HMR on that port. The first server run inventories the `sessions` directory under `CODEX_HOME` in the background. A watcher imports normal appends quickly, a full metadata inventory repairs missed watcher events every 15 minutes by default, and **Sync now** starts that same fast inventory on demand. **Deep verify** is the explicit, slower option that rereads every JSONL from the beginning without changing source files.
 
 Session titles use the newest matching `thread_name` in `session_index.jsonl` under `CODEX_HOME`, which is the name shown in Codex. A first-user-request summary is only a fallback when no index title exists. The session drawer separately attributes usage to the main agent and each Codex subagent using JSONL metadata such as nickname, role, parent thread, and depth.
 
@@ -38,12 +38,13 @@ Compaction runs once after startup and daily at 03:15 Asia/Ho_Chi_Minh. It is tr
 
 ## Environment
 
-| Variable             | Default                               | Purpose                                                              |
-| -------------------- | ------------------------------------- | -------------------------------------------------------------------- |
-| `PORT`               | `8787`                                | Local HTTP port. Set this in `.env`, for example `PORT=3000`.        |
-| `CODEX_HOME`         | Current user's `.codex` directory     | Codex data root; the app reads sessions and the session title index. |
-| `CODEX_SESSIONS_DIR` | `<CODEX_HOME>/sessions`               | Optional override for the directory containing Codex JSONL sessions. |
-| `CODEX_USAGE_DB`     | Current user's `.codex-usage` DB file | Persistent SQLite file, kept outside this repository.                |
+| Variable                            | Default                               | Purpose                                                                                  |
+| ----------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `PORT`                              | `8787`                                | Local HTTP port. Set this in `.env`, for example `PORT=3000`.                            |
+| `CODEX_HOME`                        | Current user's `.codex` directory     | Codex data root; the app reads sessions and the session title index.                     |
+| `CODEX_SESSIONS_DIR`                | `<CODEX_HOME>/sessions`               | Optional override for the directory containing Codex JSONL sessions.                     |
+| `CODEX_USAGE_DB`                    | Current user's `.codex-usage` DB file | Persistent SQLite file, kept outside this repository.                                    |
+| `CODEX_USAGE_SCAN_INTERVAL_MINUTES` | `15`                                  | Full metadata inventory cadence, as an integer from 1–1440; invalid values fall back 15. |
 
 On Windows the defaults resolve through the current user profile, for example `C:\Users\VanAnh\.codex\sessions` and `C:\Users\VanAnh\.codex-usage\codex-usage.db`. When writing paths in `.env`, forward slashes such as `C:/Users/VanAnh/.codex` avoid escaping issues.
 
@@ -63,6 +64,7 @@ pnpm pm2:logs     # follow logs (Ctrl+C only exits the log viewer)
 pnpm pm2:stop     # stop without removing the PM2 entry
 pnpm pm2:delete   # remove the PM2 entry and update the saved process list
 pnpm repair       # reclassifies inferable unknown events and backfills configured rate cards
+pnpm benchmark:importer -- --files 5000 --changed-percent 1
 pnpm verify       # format, lint, typecheck, tests, e2e, Knip and audit
 ```
 
@@ -82,7 +84,9 @@ This builds React into `dist/`, then one Node process serves both the dashboard 
 pnpm pm2:start
 ```
 
-PM2 runs exactly one `codex-usage` process from `build-server/index.js`. It reads `.env` from the project root, restarts after a crash or after memory exceeds 256 MB, and stores logs in the current user's `.pm2/logs` directory. `pm2 save` persists the process list for resurrection.
+PM2 runs exactly one `codex-usage` process from `build-server/index.js`. It reads `.env` from the project root, including `CODEX_USAGE_SCAN_INTERVAL_MINUTES`, restarts after a crash or after memory exceeds 256 MB, and stores logs in the current user's `.pm2/logs` directory. `pm2 save` persists the process list for resurrection. Scheduled inventories use metadata fast-paths; a full content reread only runs after an explicit **Deep verify** request.
+
+Before the first production restart that applies the source-metadata migration, back up the SQLite database. The migration only adds nullable columns and never touches source JSONL. After rollout, run **Deep verify** once from Data Health to establish a full verification baseline, then watch scan duration, read/skip counts, and process RSS for 24–72 hours. If an inventory fails, the last complete source-size snapshot and imported history remain available; retry with **Sync now** or let the next scheduled inventory run.
 
 On macOS/Linux, restore the saved process automatically after login/reboot by running the one-time `pnpm exec pm2 startup` command and executing the command it prints. Run `pnpm exec pm2 save` again whenever the managed process list changes.
 

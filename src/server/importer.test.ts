@@ -1,7 +1,18 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdtemp,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { and, eq, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -45,6 +56,12 @@ import {
   toLocalDate,
 } from "@/server/importer";
 import { compactUsage, RetentionService } from "@/server/retention";
+import {
+  readSourceFileMetadata,
+  SourceInventory,
+  type SourceInventoryScanner,
+} from "@/server/source-inventory";
+import type { DataHealthResponse, ImportStatus, StorageStatus } from "@/shared/types";
 
 const temporaryDirectories: string[] = [];
 
@@ -85,6 +102,9 @@ describe("token usage parsing", () => {
 
   it("uses safe local defaults and honours custom config", () => {
     expect(getConfig({ PORT: "not-a-port" }).port).toBe(8787);
+    expect(getConfig({ CODEX_USAGE_SCAN_INTERVAL_MINUTES: "0" }).scanIntervalMinutes).toBe(15);
+    expect(getConfig({ CODEX_USAGE_SCAN_INTERVAL_MINUTES: "1441" }).scanIntervalMinutes).toBe(15);
+    expect(getConfig({ CODEX_USAGE_SCAN_INTERVAL_MINUTES: "60" }).scanIntervalMinutes).toBe(60);
     expect(getConfig({ CODEX_HOME: "/custom/codex-home" }).sessionsDirectory).toBe(
       "/custom/codex-home/sessions",
     );
@@ -97,6 +117,7 @@ describe("token usage parsing", () => {
     ).toEqual({
       databasePath: "/tmp/usage.db",
       port: 9123,
+      scanIntervalMinutes: 15,
       sessionsDirectory: "/tmp/sessions",
     });
   });
@@ -313,6 +334,215 @@ describe("session importer", () => {
     expect(deletedSourceSync.error).toBeNull();
     expect(session?.sourceDeleted).toBe(true);
     expect(harness.database.select().from(usageEvents).all()).toHaveLength(3);
+  });
+
+  it("inventories every source while reading only metadata-stale JSONL", async () => {
+    const harness = await createHarness();
+    const firstSource = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-fast-one"),
+      turnContext("gpt-fast"),
+      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    const secondSource = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-fast-two"),
+      turnContext("gpt-fast"),
+      tokenCount("2026-07-12T01:01:00.000Z", 100, 20, 10, 4),
+    ]);
+
+    const cold = await harness.importer.syncAll();
+    expect(cold).toMatchObject({ filesProcessed: 2 });
+    expect(cold.sourceScan.lastCompleted).toMatchObject({
+      discoveredFiles: 2,
+      filesRead: 2,
+      filesSkipped: 0,
+      mode: "inventory",
+    });
+    expect(
+      harness.database
+        .select()
+        .from(importStates)
+        .all()
+        .every(
+          (state) =>
+            state.sourceSize !== null &&
+            state.sourceMtimeNs !== null &&
+            state.sourceCtimeNs !== null,
+        ),
+    ).toBe(true);
+
+    harness.database
+      .update(importStates)
+      .set({
+        sourceCtimeNs: null,
+        sourceFileId: null,
+        sourceMtimeNs: null,
+        sourceSize: null,
+      })
+      .where(eq(importStates.sourcePath, firstSource))
+      .run();
+    const legacyMetadata = await harness.importer.syncAll();
+    expect(legacyMetadata.sourceScan.lastCompleted).toMatchObject({
+      filesRead: 1,
+      filesSkipped: 1,
+    });
+    expect(
+      harness.database
+        .select()
+        .from(importStates)
+        .where(eq(importStates.sourcePath, firstSource))
+        .get(),
+    ).toMatchObject({
+      sourceCtimeNs: expect.any(String),
+      sourceMtimeNs: expect.any(String),
+      sourceSize: expect.any(Number),
+    });
+
+    const warm = await harness.importer.syncAll();
+    expect(warm).toMatchObject({ filesProcessed: 2, recordsInserted: 0 });
+    expect(warm.sourceScan.lastCompleted).toMatchObject({ filesRead: 0, filesSkipped: 2 });
+
+    await appendFile(firstSource, "\n");
+    const appended = await harness.importer.syncAll();
+    expect(appended.sourceScan.lastCompleted).toMatchObject({ filesRead: 1, filesSkipped: 1 });
+
+    const unchangedContent = await readFile(secondSource);
+    await writeFile(secondSource, unchangedContent);
+    const rewrittenAt = new Date(Date.now() + 2_000);
+    await utimes(secondSource, rewrittenAt, rewrittenAt);
+    const sameSizeRewrite = await harness.importer.syncAll();
+    expect(sameSizeRewrite.sourceScan.lastCompleted).toMatchObject({
+      filesRead: 1,
+      filesSkipped: 1,
+    });
+
+    harness.database
+      .update(importStates)
+      .set({ dedupeVersion: 0 })
+      .where(eq(importStates.sourcePath, secondSource))
+      .run();
+    const repair = await harness.importer.syncAll();
+    expect(repair.sourceScan.lastCompleted).toMatchObject({ filesRead: 2, filesSkipped: 0 });
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(2);
+  });
+
+  it("keeps exact dedupe and source flags across rename, delete and restore", async () => {
+    const harness = await createHarness();
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-source-lifecycle"),
+      turnContext("gpt-lifecycle"),
+      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    const content = await readFile(source);
+    await harness.importer.syncAll();
+
+    const renamed = join(dirname(source), "renamed.jsonl");
+    await rename(source, renamed);
+    const renamedStatus = await harness.importer.syncAll();
+    expect(renamedStatus.sourceScan.lastCompleted).toMatchObject({ filesRead: 1 });
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
+    expect(
+      harness.database
+        .select()
+        .from(sessions)
+        .where(eq(sessions.id, "session-source-lifecycle"))
+        .get(),
+    ).toMatchObject({ sourceDeleted: false, sourcePath: renamed });
+
+    await rm(renamed);
+    await harness.importer.syncAll();
+    expect(
+      harness.database
+        .select()
+        .from(sessions)
+        .where(eq(sessions.id, "session-source-lifecycle"))
+        .get(),
+    ).toMatchObject({ sourceDeleted: true });
+
+    await writeFile(renamed, content);
+    await harness.importer.syncAll();
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
+    expect(
+      harness.database
+        .select()
+        .from(sessions)
+        .where(eq(sessions.id, "session-source-lifecycle"))
+        .get(),
+    ).toMatchObject({ sourceDeleted: false });
+  });
+
+  it("keeps the last complete source snapshot when inventory fails", async () => {
+    let sourcePath = "";
+    let failInventory = false;
+    const harness = await createHarness({
+      createInventory: (directory) =>
+        new SourceInventory(
+          directory,
+          () => new Date(),
+          32,
+          async () => {
+            if (failInventory) throw new Error("forced inventory failure");
+            const metadata = sourcePath ? await readSourceFileMetadata(sourcePath) : null;
+            return {
+              files: metadata ? [metadata] : [],
+              sourceBytes: metadata?.size ?? 0,
+            };
+          },
+        ),
+    });
+    sourcePath = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-inventory-failure"),
+      turnContext("gpt-inventory-failure"),
+      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await harness.importer.syncAll();
+    await rm(sourcePath);
+    failInventory = true;
+
+    const failed = await harness.importer.syncAll();
+    expect(failed.error).toBe("forced inventory failure");
+    expect(harness.inventory.getSnapshot()).toMatchObject({ sourceFileCount: 1 });
+    expect(
+      harness.database
+        .select()
+        .from(sessions)
+        .where(eq(sessions.id, "session-inventory-failure"))
+        .get(),
+    ).toMatchObject({ sourceDeleted: false });
+  });
+
+  it("coalesces overlapping inventory requests, repairs watcher misses, and cancels scheduling on stop", async () => {
+    const harness = await createHarness({ scanIntervalMs: 25 });
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-scheduled-recovery"),
+      turnContext("gpt-scheduled"),
+      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    const scansBefore = harness.inventory.getScanCount();
+
+    const watcherReady = harness.importer.start();
+    const statuses = await Promise.all([
+      harness.importer.syncAll(),
+      harness.importer.syncAll(),
+      harness.importer.syncAll(),
+    ]);
+    await watcherReady;
+    expect(statuses.every((status) => status.error === null)).toBe(true);
+    expect(harness.inventory.getScanCount() - scansBefore).toBe(1);
+
+    await appendFile(source, `${tokenCount("2026-07-12T01:01:00.000Z", 120, 20, 10, 4)}\n`);
+    await vi.waitFor(
+      () => {
+        expect(harness.database.select().from(usageEvents).all()).toHaveLength(2);
+        expect(harness.importer.getStatus().sourceScan.lastCompleted?.trigger).toBe("scheduled");
+      },
+      { interval: 10, timeout: 2_000 },
+    );
+
+    await harness.importer.stop();
+    const scansAfterStop = harness.inventory.getScanCount();
+    harness.database.$client.close();
+    await new Promise<void>((resolve) => setTimeout(resolve, 75));
+    expect(harness.inventory.getScanCount()).toBe(scansAfterStop);
   });
 
   it("snapshots a current price and backfills only usage that was previously unpriced", async () => {
@@ -954,6 +1184,46 @@ describe("session importer", () => {
     ).toBe("Tên task chuẩn trong Codex");
   });
 
+  it("streams session-index appends, retains partial tails and rebuilds after rewrite", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-streamed-index"),
+      userMessage("Fallback title"),
+      turnContext("gpt-indexed"),
+      tokenCount("2026-07-12T01:00:00.000Z", 10, 0, 2, 0),
+    ]);
+    const indexPath = join(harness.sessionsDirectory, "..", "session_index.jsonl");
+    const indexedTitle = (title: string, updatedAt: string) =>
+      JSON.stringify({ id: "session-streamed-index", thread_name: title, updated_at: updatedAt });
+    await writeFile(indexPath, indexedTitle("Title newest", "2026-07-12T02:00:00.000Z"));
+    await harness.importer.syncAll();
+
+    await appendFile(indexPath, `\n${indexedTitle("Title older", "2026-07-12T01:00:00.000Z")}`);
+    await harness.importer.syncAll();
+    expect(
+      getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0]?.title,
+    ).toBe("Title newest");
+
+    const newest = indexedTitle("Title after partial", "2026-07-12T03:00:00.000Z");
+    const splitAt = Math.floor(newest.length / 2);
+    await appendFile(indexPath, `\n${newest.slice(0, splitAt)}`);
+    await harness.importer.syncAll();
+    expect(
+      getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0]?.title,
+    ).toBe("Title newest");
+    await appendFile(indexPath, newest.slice(splitAt));
+    await harness.importer.syncAll();
+    expect(
+      getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0]?.title,
+    ).toBe("Title after partial");
+
+    await writeFile(indexPath, indexedTitle("Title rebuilt", "2026-07-12T04:00:00.000Z"));
+    await harness.importer.syncAll();
+    expect(
+      getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0]?.title,
+    ).toBe("Title rebuilt");
+  });
+
   it("watches Codex session-index changes and refreshes titles", async () => {
     const harness = await createHarness();
     await createSessionFile(harness.sessionsDirectory, [
@@ -984,6 +1254,46 @@ describe("session importer", () => {
       },
       { interval: 50, timeout: 3_000 },
     );
+    await harness.importer.stop();
+  });
+
+  it("marks watcher unlinks immediately and restores the source without duplicating history", async () => {
+    const harness = await createHarness();
+    const lines = [
+      sessionMeta("session-watched-source"),
+      turnContext("gpt-watched-source"),
+      tokenCount("2026-07-12T01:00:00.000Z", 10, 0, 2, 0),
+    ];
+    const source = await createSessionFile(harness.sessionsDirectory, lines);
+    await harness.importer.syncAll();
+    await harness.importer.start();
+
+    await rm(source);
+    await vi.waitFor(
+      () =>
+        expect(
+          harness.database
+            .select()
+            .from(sessions)
+            .where(eq(sessions.id, "session-watched-source"))
+            .get(),
+        ).toMatchObject({ sourceDeleted: true }),
+      { interval: 50, timeout: 3_000 },
+    );
+
+    await writeFile(source, `${lines.join("\n")}\n`);
+    await vi.waitFor(
+      () =>
+        expect(
+          harness.database
+            .select()
+            .from(sessions)
+            .where(eq(sessions.id, "session-watched-source"))
+            .get(),
+        ).toMatchObject({ sourceDeleted: false }),
+      { interval: 50, timeout: 3_000 },
+    );
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
     await harness.importer.stop();
   });
 
@@ -1072,7 +1382,12 @@ describe("session importer", () => {
     expect((await app.request("/api/models")).status).toBe(200);
     expect((await app.request("/api/rates")).status).toBe(200);
     expect((await app.request("/api/sessions?from=2026-07-12&to=2026-07-12")).status).toBe(200);
-    expect((await app.request("/api/sync", { method: "POST" })).status).toBe(200);
+    const syncResponse = await app.request("/api/sync", { method: "POST" });
+    expect(syncResponse.status).toBe(200);
+    expect((await syncResponse.json()) as ImportStatus).toMatchObject({
+      error: null,
+      sourceScan: { lastCompleted: { mode: "inventory" } },
+    });
     expect((await app.request("/api/dashboard?from=bad&to=2026-07-12")).status).toBe(400);
     expect(
       (
@@ -1107,6 +1422,76 @@ describe("session importer", () => {
     expect((await app.request("/api/dashboard?from=2026-02-30&to=2026-03-01")).status).toBe(400);
     expect((await app.request("/api/rates/%20/backfill", { method: "POST" })).status).toBe(400);
     expect((await app.request("/api/rates/gpt-api/backfill", { method: "POST" })).status).toBe(200);
+  });
+
+  it("serves scan telemetry and accepts only one queued deep verification", async () => {
+    let sourcePath = "";
+    let scanAttempts = 0;
+    let releaseDeep: (() => void) | undefined;
+    let markDeepStarted: (() => void) | undefined;
+    const deepGate = new Promise<void>((resolve) => {
+      releaseDeep = resolve;
+    });
+    const deepStarted = new Promise<void>((resolve) => {
+      markDeepStarted = resolve;
+    });
+    const scanner: SourceInventoryScanner = async () => {
+      scanAttempts += 1;
+      if (scanAttempts === 2) {
+        markDeepStarted?.();
+        await deepGate;
+      }
+      const metadata = sourcePath ? await readSourceFileMetadata(sourcePath) : null;
+      return {
+        files: metadata ? [metadata] : [],
+        sourceBytes: metadata?.size ?? 0,
+      };
+    };
+    const harness = await createHarness({
+      createInventory: (directory) => new SourceInventory(directory, () => new Date(), 32, scanner),
+    });
+    sourcePath = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-deep-api"),
+      turnContext("gpt-deep"),
+      tokenCount("2026-07-12T02:00:00.000Z", 20, 5, 2, 1),
+    ]);
+    await harness.importer.syncAll();
+    const app = createApp(harness.database, harness.importer, harness.retention);
+
+    const accepted = await app.request("/api/sync/deep", { method: "POST" });
+    expect(accepted.status).toBe(202);
+    await expect(accepted.json()).resolves.toEqual({ accepted: true });
+    await deepStarted;
+
+    const duplicate = await app.request("/api/sync/deep", { method: "POST" });
+    expect(duplicate.status).toBe(409);
+    await expect(duplicate.json()).resolves.toEqual({
+      error: "Deep verification is already queued or running",
+    });
+
+    const importStatus = (await (await app.request("/api/status")).json()) as ImportStatus;
+    const dataHealth = (await (await app.request("/api/data-health")).json()) as DataHealthResponse;
+    const storage = (await (await app.request("/api/storage/status")).json()) as StorageStatus;
+    expect(importStatus.sourceScan.current).toMatchObject({ mode: "deep", trigger: "manual" });
+    expect(dataHealth.sourceScan.current).toMatchObject({ mode: "deep" });
+    expect(storage).toMatchObject({
+      sourceFileCount: 1,
+      sourceScannedAt: expect.any(String),
+    });
+    expect(JSON.stringify({ dataHealth, importStatus, storage })).not.toContain(sourcePath);
+
+    releaseDeep?.();
+    await vi.waitFor(
+      () =>
+        expect(harness.importer.getStatus().sourceScan.lastCompleted).toMatchObject({
+          filesRead: 1,
+          filesSkipped: 0,
+          mode: "deep",
+        }),
+      { interval: 10, timeout: 2_000 },
+    );
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
+    await harness.importer.stop();
   });
 
   it("compacts raw usage into exact hourly and daily retention tiers", async () => {
@@ -1259,17 +1644,42 @@ describe("session importer", () => {
 
   it("reports storage paths and keeps scheduled compaction single-instance", async () => {
     const harness = await createHarness();
+    const missingInventory = new SourceInventory(join(harness.sessionsDirectory, "missing-source"));
     const missing = new RetentionService(
       harness.database,
       join(harness.sessionsDirectory, "missing.db"),
       join(harness.sessionsDirectory, "missing-source"),
+      () => new Date(),
+      missingInventory,
     );
     const missingStatus = await missing.getStatus();
     expect(missingStatus).toMatchObject({
       databaseBytes: 0,
       oldestRawDate: null,
       sourceBytes: 0,
+      sourceFileCount: 0,
+      sourceScannedAt: null,
       walBytes: 0,
+    });
+    expect(missingInventory.getScanCount()).toBe(0);
+
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-storage-cache"),
+      turnContext("gpt-storage"),
+      tokenCount("2026-07-12T01:00:00.000Z", 10, 0, 2, 0),
+    ]);
+    const notePath = join(harness.sessionsDirectory, "note.txt");
+    await writeFile(notePath, "inventory bytes");
+    await harness.importer.syncAll();
+    const scansBeforeStatus = harness.inventory.getScanCount();
+    const statuses = await Promise.all(
+      Array.from({ length: 10 }, () => harness.retention.getStatus()),
+    );
+    expect(harness.inventory.getScanCount()).toBe(scansBeforeStatus);
+    expect(statuses[0]).toMatchObject({
+      sourceBytes: (await stat(source)).size + (await stat(notePath)).size,
+      sourceFileCount: 1,
+      sourceScannedAt: expect.any(String),
     });
 
     await symlink(harness.sessionsDirectory, join(harness.sessionsDirectory, "ignored-link"));
@@ -1612,7 +2022,7 @@ describe("session importer", () => {
       model: "gpt-reconciled",
       outputRate: 4,
     });
-    await createSessionFile(harness.sessionsDirectory, [
+    const sourcePath = await createSessionFile(harness.sessionsDirectory, [
       sessionMeta("session-reconciled"),
       turnContext("gpt-reconciled", "2026-07-12T03:59:00.000Z", "turn-reconciled"),
       tokenCount("2026-07-12T04:00:00.000Z", 100, 20, 10, 4),
@@ -1630,6 +2040,7 @@ describe("session importer", () => {
       })
       .where(eq(usageEvents.timestamp, "2026-07-12T04:00:00.000Z"))
       .run();
+    await appendFile(sourcePath, "\n");
     const turnKey = createTurnKey("session-reconciled", "turn-reconciled");
     harness.database
       .update(turnModelUsage)
@@ -1690,7 +2101,12 @@ describe("session importer", () => {
   });
 });
 
-async function createHarness() {
+async function createHarness(
+  options: {
+    createInventory?: (sessionsDirectory: string) => SourceInventory;
+    scanIntervalMs?: number;
+  } = {},
+) {
   const directory = await mkdtemp(join(tmpdir(), "codex-usage-test-"));
   temporaryDirectories.push(directory);
   const sessionsDirectory = join(directory, "sessions");
@@ -1698,20 +2114,29 @@ async function createHarness() {
   const databasePath = join(directory, "usage.db");
   const database = createDatabase(databasePath);
   migrateDatabase(database);
+  const inventory =
+    options.createInventory?.(sessionsDirectory) ?? new SourceInventory(sessionsDirectory);
+  const importer = new SessionImporter(database, sessionsDirectory, {
+    inventory,
+    ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
+  });
   const retention = new RetentionService(
     database,
     databasePath,
     sessionsDirectory,
     () => new Date("2026-07-13T00:00:00.000Z"),
+    inventory,
   );
   return {
     database,
-    importer: new SessionImporter(database, sessionsDirectory),
+    importer,
+    inventory,
     retention,
     sessionsDirectory,
   } satisfies {
     database: AppDatabase;
     importer: SessionImporter;
+    inventory: SourceInventory;
     retention: RetentionService;
     sessionsDirectory: string;
   };

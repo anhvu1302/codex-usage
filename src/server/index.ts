@@ -9,15 +9,26 @@ import { createDatabase, migrateDatabase } from "@/server/db/client";
 import { SessionImporter } from "@/server/importer";
 import { backfillProjects } from "@/server/projects";
 import { RetentionService } from "@/server/retention";
+import { SourceInventory } from "@/server/source-inventory";
 
 const config = getConfig();
 const database = createDatabase(config.databasePath);
 migrateDatabase(database);
 backfillProjects(database);
 
-const importer = new SessionImporter(database, config.sessionsDirectory);
+const sourceInventory = new SourceInventory(config.sessionsDirectory);
+const importer = new SessionImporter(database, config.sessionsDirectory, {
+  inventory: sourceInventory,
+  scanIntervalMs: config.scanIntervalMinutes * 60 * 1_000,
+});
 await importer.start();
-const retention = new RetentionService(database, config.databasePath, config.sessionsDirectory);
+const retention = new RetentionService(
+  database,
+  config.databasePath,
+  config.sessionsDirectory,
+  () => new Date(),
+  sourceInventory,
+);
 retention.start();
 
 const app = createApp(database, importer, retention);

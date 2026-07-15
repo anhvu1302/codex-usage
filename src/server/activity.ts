@@ -175,6 +175,7 @@ export async function getDataHealth(
     retentionError: storage.error,
     sourceDeletedAgents: toNumber(deletedAgents?.count),
     sourceDeletedSessions: toNumber(deletedSessions?.count),
+    sourceScan: importStatus.sourceScan,
     turnBackfill: importStatus.turnBackfill,
     turnCostAttributionGaps: toNumber(turnCostGaps?.count),
     turnUnassignedActivity: toNumber(turnUnassignedActivity?.count),

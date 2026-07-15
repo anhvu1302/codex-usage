@@ -43,6 +43,10 @@ export function syncActivitySources() {
   return request<ImportStatus>("/api/sync", { method: "POST" });
 }
 
+export function queueDeepVerification() {
+  return request<{ accepted: true }>("/api/sync/deep", { method: "POST" });
+}
+
 export function compactActivityStorage() {
   return request<StorageStatus>("/api/storage/compact", { method: "POST" });
 }

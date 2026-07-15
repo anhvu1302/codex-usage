@@ -90,6 +90,33 @@ export type ModelRate = {
   updatedAt: string;
 };
 
+export type SourceScanMode = "deep" | "inventory";
+export type SourceScanTrigger = "manual" | "scheduled" | "startup";
+
+export type SourceScanStatus = {
+  current: {
+    discoveredFiles: number;
+    filesRead: number;
+    filesSkipped: number;
+    mode: SourceScanMode;
+    phase: "discovering" | "reading" | "reconciling";
+    startedAt: string;
+    trigger: SourceScanTrigger;
+  } | null;
+  deepQueued: boolean;
+  lastCompleted: {
+    completedAt: string;
+    discoveredFiles: number;
+    durationMs: number;
+    filesRead: number;
+    filesSkipped: number;
+    mode: SourceScanMode;
+    sourceBytes: number;
+    trigger: SourceScanTrigger;
+  } | null;
+  nextScheduledAt: string | null;
+};
+
 export type ImportStatus = {
   error: string | null;
   filesProcessed: number;
@@ -98,6 +125,7 @@ export type ImportStatus = {
   recordsBackfilled: number;
   recordsInserted: number;
   recordsReclassified: number;
+  sourceScan: SourceScanStatus;
   turnBackfill: TurnBackfillStatus;
 };
 
@@ -151,7 +179,9 @@ export type StorageStatus = {
   };
   rawEvents: number;
   sourceBytes: number;
+  sourceFileCount: number;
   sourceManaged: false;
+  sourceScannedAt: string | null;
   walBytes: number;
 };
 
@@ -351,6 +381,7 @@ export type DataHealthResponse = {
   retentionError: string | null;
   sourceDeletedAgents: number;
   sourceDeletedSessions: number;
+  sourceScan: SourceScanStatus;
   turnBackfill: TurnBackfillStatus;
   turnCostAttributionGaps: number;
   turnUnassignedActivity: number;

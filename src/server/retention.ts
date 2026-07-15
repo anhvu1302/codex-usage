@@ -1,10 +1,10 @@
-import { readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { stat } from "node:fs/promises";
 
 import { and, eq, lt, sql } from "drizzle-orm";
 
 import type { AppDatabase } from "@/server/db/client";
 import { reclaimDatabaseSpace } from "@/server/db/client";
+import { SourceInventory } from "@/server/source-inventory";
 import { TURN_ATTRIBUTION_VERSION } from "@/server/turn-constants";
 import {
   activityDailyRollups,
@@ -46,8 +46,9 @@ export class RetentionService {
   constructor(
     private readonly database: AppDatabase,
     private readonly databasePath: string,
-    private readonly sessionsDirectory: string,
+    sessionsDirectory: string,
     private readonly now: () => Date = () => new Date(),
+    private readonly sourceInventory: SourceInventory = new SourceInventory(sessionsDirectory, now),
   ) {}
 
   start() {
@@ -89,11 +90,16 @@ export class RetentionService {
       .from(retentionState)
       .where(eq(retentionState.id, RETENTION_STATE_ID))
       .get();
-    const [databaseBytes, walBytes, sourceBytes] = await Promise.all([
+    const [databaseBytes, walBytes, cachedSourceSnapshot] = await Promise.all([
       fileSize(this.databasePath),
       fileSize(`${this.databasePath}-wal`),
-      directorySize(this.sessionsDirectory),
+      this.sourceInventory.getSummaryOrJoin(),
     ]);
+    const sourceSnapshot = cachedSourceSnapshot ?? {
+      scannedAt: null,
+      sourceBytes: 0,
+      sourceFileCount: 0,
+    };
     const raw = this.database
       .select({
         count: sql<number>`count(*)`,
@@ -133,8 +139,10 @@ export class RetentionService {
       oldestRawDate: raw?.oldest ?? null,
       policy: { dailyRetention: "forever", hourlyDays: 90, rawDays: 30 },
       rawEvents: toNumber(raw?.count),
-      sourceBytes,
+      sourceBytes: sourceSnapshot.sourceBytes,
+      sourceFileCount: sourceSnapshot.sourceFileCount,
       sourceManaged: false,
+      sourceScannedAt: sourceSnapshot.scannedAt,
       walBytes,
     };
   }
@@ -500,26 +508,6 @@ function emptyResult(): CompactionResult {
 async function fileSize(path: string): Promise<number> {
   try {
     return (await stat(path)).size;
-  } catch (error) {
-    if (isMissingFile(error)) return 0;
-    throw error;
-  }
-}
-
-async function directorySize(directory: string): Promise<number> {
-  try {
-    const entries = await readdir(directory, { withFileTypes: true });
-    const sizes = await Promise.all(
-      entries.map((entry) => {
-        const path = join(directory, entry.name);
-        return entry.isDirectory()
-          ? directorySize(path)
-          : entry.isFile()
-            ? fileSize(path)
-            : Promise.resolve(0);
-      }),
-    );
-    return sizes.reduce((total, size) => total + size, 0);
   } catch (error) {
     if (isMissingFile(error)) return 0;
     throw error;
