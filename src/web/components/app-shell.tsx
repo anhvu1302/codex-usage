@@ -5,13 +5,14 @@ import {
   Compass,
   FolderKanban,
   Gauge,
+  ListRestart,
   ListTree,
   Menu,
   MoonStar,
   Settings2,
   SunMedium,
 } from "lucide-react";
-import { useState, type ComponentType, type SVGProps } from "react";
+import { useRef, useState, type ComponentType, type SVGProps } from "react";
 import { NavLink, Outlet, useLocation } from "react-router";
 
 import { Button } from "@/web/components/ui/button";
@@ -34,6 +35,7 @@ import {
   usePreferences,
   type DensityPreference,
   type ThemePreference,
+  type ThemeRevealOrigin,
 } from "@/web/lib/preferences";
 import { cn } from "@/web/lib/utils";
 
@@ -47,6 +49,7 @@ const navigation: NavigationItem[] = [
   { icon: Gauge, label: "Tổng quan", to: "/" },
   { icon: Compass, label: "Khám phá", to: "/explore" },
   { icon: ListTree, label: "Phiên", to: "/sessions" },
+  { icon: ListRestart, label: "Turns", to: "/turns" },
   { icon: FolderKanban, label: "Dự án", to: "/projects" },
   { icon: Bot, label: "Agent", to: "/agents" },
   { icon: Activity, label: "Hoạt động", to: "/activity" },
@@ -70,7 +73,7 @@ export function AppShell() {
           <Brand />
           <NotificationCenter />
         </div>
-        <Navigation className="flex-1 px-3" />
+        <Navigation className="flex-1 overflow-y-auto px-3" />
         <Preferences className="border-t p-4" />
       </aside>
 
@@ -159,13 +162,38 @@ function Navigation({ className, onNavigate }: { className?: string; onNavigate?
 
 function Preferences({ className }: { className?: string }) {
   const { density, setDensity, setTheme, theme } = usePreferences();
+  const [themeOpen, setThemeOpen] = useState(false);
+  const pendingTheme = useRef<ThemePreference | null>(null);
+  const themeOrigin = useRef<ThemeRevealOrigin | undefined>(undefined);
+  const themeTrigger = useRef<HTMLButtonElement>(null);
+
+  function handleThemeOpenChange(open: boolean) {
+    setThemeOpen(open);
+    if (open) {
+      themeOrigin.current = centerOf(themeTrigger.current);
+      return;
+    }
+    if (pendingTheme.current === null) return;
+    const nextTheme = pendingTheme.current;
+    pendingTheme.current = null;
+    const origin = themeOrigin.current ?? centerOf(themeTrigger.current);
+    themeOrigin.current = undefined;
+    window.requestAnimationFrame(() => setTheme(nextTheme, origin));
+  }
 
   return (
     <div className={cn("grid gap-3", className)}>
       <div className="space-y-1.5">
         <p className="text-muted-foreground text-xs font-medium">Giao diện</p>
-        <Select value={theme} onValueChange={(value) => setTheme(value as ThemePreference)}>
-          <SelectTrigger aria-label="Giao diện" className="w-full">
+        <Select
+          open={themeOpen}
+          value={theme}
+          onOpenChange={handleThemeOpenChange}
+          onValueChange={(value) => {
+            pendingTheme.current = value as ThemePreference;
+          }}
+        >
+          <SelectTrigger ref={themeTrigger} aria-label="Giao diện" className="w-full">
             <SunMedium className="size-3.5" />
             <SelectValue />
           </SelectTrigger>
@@ -191,4 +219,11 @@ function Preferences({ className }: { className?: string }) {
       </div>
     </div>
   );
+}
+
+function centerOf(element: HTMLElement | null): ThemeRevealOrigin | undefined {
+  const bounds = element?.getBoundingClientRect();
+  return bounds
+    ? { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 }
+    : undefined;
 }

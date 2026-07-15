@@ -29,6 +29,9 @@ const AgentsPage = lazy(async () => ({
 const ActivityPage = lazy(async () => ({
   default: (await import("@/web/components/activity-page")).ActivityPage,
 }));
+const TurnsPage = lazy(async () => ({
+  default: (await import("@/web/components/turns-page")).TurnsPage,
+}));
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
@@ -51,6 +54,14 @@ export function App() {
               <Route index element={<DashboardRoute mode="overview" />} />
               <Route path="explore" element={<DashboardRoute mode="explore" />} />
               <Route path="sessions" element={<DashboardRoute mode="sessions" />} />
+              <Route
+                path="turns/*"
+                element={
+                  <LazyPage>
+                    <TurnsPage />
+                  </LazyPage>
+                }
+              />
               <Route
                 path="projects"
                 element={

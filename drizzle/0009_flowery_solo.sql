@@ -1,0 +1,2 @@
+CREATE INDEX `activity_events_turn_timestamp_index` ON `activity_events` (`turn_key`,`timestamp`);--> statement-breakpoint
+CREATE INDEX `usage_events_turn_timestamp_index` ON `usage_events` (`turn_key`,`timestamp`);

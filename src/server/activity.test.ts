@@ -195,6 +195,28 @@ describe("activity import and retention", () => {
       .get();
 
     client.exec(await migrationSql(5));
+    client
+      .prepare(
+        `insert into activity_events
+          (id, session_id, agent_id, timestamp, local_date, kind, agent_kind, project_id, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "legacy-activity",
+        "legacy-session",
+        "legacy-session",
+        "2026-07-12T00:01:00.000Z",
+        "2026-07-12",
+        "turn",
+        "main",
+        "legacy-unknown",
+        1,
+      );
+
+    client.exec(await migrationSql(6));
+    client.exec(await migrationSql(7));
+    client.exec(await migrationSql(8));
+    client.exec(await migrationSql(9));
 
     expect(
       client
@@ -208,6 +230,56 @@ describe("activity import and retention", () => {
         )
         .get(),
     ).toEqual({ count: 2 });
+    expect(
+      client
+        .prepare(
+          "select turn_key as turnKey, turn_attribution_version as version from usage_events where id = 'legacy-event'",
+        )
+        .get(),
+    ).toEqual({ turnKey: null, version: 0 });
+    expect(
+      client
+        .prepare(
+          "select turn_key as turnKey, turn_attribution_version as version from activity_events where id = 'legacy-activity'",
+        )
+        .get(),
+    ).toEqual({ turnKey: null, version: 0 });
+    expect(
+      client
+        .prepare(
+          `select name from sqlite_master
+           where type = 'table' and name in (
+             'turns',
+             'turn_model_usage',
+             'turn_activity_rollups',
+             'turn_backfill_state'
+           )
+           order by name`,
+        )
+        .all(),
+    ).toEqual([
+      { name: "turn_activity_rollups" },
+      { name: "turn_backfill_state" },
+      { name: "turn_model_usage" },
+      { name: "turns" },
+    ]);
+    expect(
+      client
+        .prepare(
+          `select name from sqlite_master
+           where type = 'index' and name in (
+             'activity_events_turn_timestamp_index',
+             'usage_events_turn_timestamp_index'
+           )
+           order by name`,
+        )
+        .all(),
+    ).toEqual([
+      { name: "activity_events_turn_timestamp_index" },
+      { name: "usage_events_turn_timestamp_index" },
+    ]);
+    expect(client.pragma("integrity_check", { simple: true })).toBe("ok");
+    expect(client.pragma("foreign_key_check")).toEqual([]);
     client.close();
   });
 

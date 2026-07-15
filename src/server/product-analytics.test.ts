@@ -2,16 +2,20 @@ import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { getDashboard, upsertModelRate } from "@/server/analytics";
 import { createApp } from "@/server/app";
 import { createDatabase, migrateDatabase, type AppDatabase } from "@/server/db/client";
 import {
+  alertEvents,
   modelRates,
   projects,
   sessionAgents,
   sessions,
+  turnModelUsage,
+  turns,
   usageAgentDailyRollups,
   usageDailyRollups,
   usageEvents,
@@ -20,6 +24,8 @@ import {
 import { SessionImporter } from "@/server/importer";
 import {
   exportDataset,
+  exportTurnDataset,
+  getAlertFeed,
   getAgents,
   getBudgets,
   getInsights,
@@ -342,6 +348,111 @@ describe("phase 2 product analytics", () => {
     expect(updateAlert(harness.database, "missing", "seen")).toBeNull();
   });
 
+  it("raises stable context-pressure alerts without downgrading their severity", () => {
+    const turnKey = "a".repeat(64);
+    harness.database
+      .insert(turns)
+      .values({
+        agentId: "session-alpha",
+        createdAt: Date.parse("2026-07-12T01:00:00.000Z"),
+        id: turnKey,
+        lastEventAt: "2026-07-12T01:05:00.000Z",
+        localDate: "2026-07-12",
+        modelContextWindow: 100,
+        peakInputTokens: 69,
+        projectId: "project-alpha",
+        sessionId: "session-alpha",
+        turnId: "context-alert-turn",
+        updatedAt: Date.parse("2026-07-12T01:05:00.000Z"),
+      })
+      .run();
+
+    expect(
+      refreshAlerts(harness.database, fixedNow()).filter(
+        (alert) => alert.type === "context-pressure",
+      ),
+    ).toEqual([]);
+
+    const severities = [
+      { peak: 70, severity: "info" },
+      { peak: 85, severity: "warning" },
+      { peak: 95, severity: "critical" },
+    ] as const;
+    let alertId: string | undefined;
+    for (const expected of severities) {
+      harness.database
+        .update(turns)
+        .set({ peakInputTokens: expected.peak })
+        .where(eq(turns.id, turnKey))
+        .run();
+      const alerts = refreshAlerts(harness.database, fixedNow()).filter(
+        (alert) => alert.type === "context-pressure",
+      );
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]).toMatchObject({ severity: expected.severity, turnKey });
+      alertId ??= alerts[0]?.id;
+      expect(alerts[0]?.id).toBe(alertId);
+    }
+
+    harness.database.update(turns).set({ peakInputTokens: 70 }).where(eq(turns.id, turnKey)).run();
+    expect(
+      refreshAlerts(harness.database, fixedNow()).find(
+        (alert) => alert.type === "context-pressure",
+      ),
+    ).toMatchObject({ id: alertId, severity: "critical", turnKey });
+    expect(
+      harness.database
+        .select()
+        .from(alertEvents)
+        .where(eq(alertEvents.type, "context-pressure"))
+        .all(),
+    ).toHaveLength(1);
+  });
+
+  it("materializes context alerts in bounded batches and caps the notification feed", () => {
+    const timestamp = Date.parse("2026-07-12T01:00:00.000Z");
+    harness.database
+      .insert(turns)
+      .values(
+        Array.from({ length: 205 }, (_, index) => ({
+          agentId: "session-alpha",
+          createdAt: timestamp,
+          id: `pressure-turn-${String(index).padStart(3, "0")}`,
+          lastEventAt: "2026-07-12T01:00:00.000Z",
+          localDate: "2026-07-12",
+          modelContextWindow: 100,
+          peakInputTokens: 95,
+          projectId: "project-alpha",
+          sessionId: "session-alpha",
+          turnId: `pressure-${index}`,
+          updatedAt: timestamp,
+        })),
+      )
+      .run();
+
+    const first = getAlertFeed(harness.database, fixedNow());
+    expect(first.alerts).toHaveLength(100);
+    expect(first.unseenCount).toBe(200);
+    expect(
+      harness.database
+        .select()
+        .from(alertEvents)
+        .where(eq(alertEvents.type, "context-pressure"))
+        .all(),
+    ).toHaveLength(200);
+
+    const second = getAlertFeed(harness.database, fixedNow());
+    expect(second.alerts).toHaveLength(100);
+    expect(second.unseenCount).toBe(205);
+    expect(
+      harness.database
+        .select()
+        .from(alertEvents)
+        .where(eq(alertEvents.type, "context-pressure"))
+        .all(),
+    ).toHaveLength(205);
+  });
+
   it("simulates replacement prices without mutating rate cards or usage snapshots", () => {
     const ratesBefore = harness.database.select().from(modelRates).all();
     const eventsBefore = harness.database
@@ -420,6 +531,104 @@ describe("phase 2 product analytics", () => {
       "json",
     );
     expect(JSON.parse(sessionsJson.body)).toHaveLength(103);
+  });
+
+  it("exports turns with turn-specific filters and CSV-safe metadata", async () => {
+    const completedKey = "b".repeat(64);
+    const abortedKey = "c".repeat(64);
+    const timestamp = Date.parse("2026-07-12T01:00:00.000Z");
+    harness.database
+      .update(sessions)
+      .set({ title: '=WEBSERVICE("private")' })
+      .where(eq(sessions.id, "session-alpha"))
+      .run();
+    harness.database
+      .insert(turns)
+      .values([
+        {
+          agentId: "session-alpha",
+          completedAt: "2026-07-12T01:05:00.000Z",
+          createdAt: timestamp,
+          id: completedKey,
+          lastEventAt: "2026-07-12T01:05:00.000Z",
+          localDate: "2026-07-12",
+          projectId: "project-alpha",
+          sessionId: "session-alpha",
+          startedAt: "2026-07-12T01:00:00.000Z",
+          status: "completed",
+          turnId: "turn-completed",
+          updatedAt: timestamp,
+        },
+        {
+          agentId: "agent-mapper",
+          completedAt: "2026-07-12T01:15:00.000Z",
+          createdAt: timestamp,
+          id: abortedKey,
+          lastEventAt: "2026-07-12T01:15:00.000Z",
+          localDate: "2026-07-12",
+          projectId: "project-alpha",
+          sessionId: "session-alpha",
+          startedAt: "2026-07-12T01:10:00.000Z",
+          status: "aborted",
+          turnId: "turn-aborted",
+          updatedAt: timestamp,
+        },
+      ])
+      .run();
+    harness.database
+      .insert(turnModelUsage)
+      .values([turnUsage(completedKey, "model-a", 100), turnUsage(abortedKey, "model-b", 200)])
+      .run();
+
+    const json = exportTurnDataset(
+      harness.database,
+      {
+        from: "2026-07-12",
+        models: ["model-b"],
+        status: "aborted",
+        to: "2026-07-12",
+      },
+      "json",
+    );
+    expect(JSON.parse(await new Response(json.body).text())).toEqual([
+      expect.objectContaining({ models: ["model-b"], status: "aborted", turnKey: abortedKey }),
+    ]);
+
+    const csv = exportTurnDataset(
+      harness.database,
+      { from: "2026-07-12", status: "completed", to: "2026-07-12" },
+      "csv",
+    );
+    expect(csv.filename).toBe("codex-usage-turns.csv");
+    const csvBody = await new Response(csv.body).text();
+    expect(csvBody).toContain("'=WEBSERVICE");
+    expect(csvBody).not.toContain(abortedKey);
+
+    harness.database
+      .insert(turns)
+      .values(
+        Array.from({ length: 101 }, (_, index) => ({
+          agentId: "session-alpha",
+          completedAt: "2026-07-12T02:00:01.000Z",
+          createdAt: timestamp,
+          id: `stream-turn-${String(index).padStart(3, "0")}`,
+          lastEventAt: "2026-07-12T02:00:01.000Z",
+          localDate: "2026-07-12",
+          projectId: "project-alpha",
+          sessionId: "session-alpha",
+          startedAt: "2026-07-12T02:00:00.000Z",
+          status: "completed",
+          turnId: `stream-${index}`,
+          updatedAt: timestamp,
+        })),
+      )
+      .run();
+    const multipage = exportTurnDataset(
+      harness.database,
+      { from: "2026-07-12", to: "2026-07-12" },
+      "json",
+    );
+    expect(JSON.parse(await new Response(multipage.body).text())).toHaveLength(103);
   });
 });
 
@@ -567,6 +776,12 @@ describe("phase 2 API", () => {
       (value) => value.type === "budget",
     );
     expect(alert).toBeDefined();
+    const alertFeed = await app.request("/api/alerts");
+    expect(alertFeed.status).toBe(200);
+    expect(await alertFeed.json()).toMatchObject({
+      alerts: expect.any(Array),
+      unseenCount: expect.any(Number),
+    });
     const seen = await app.request(`/api/alerts/${alert!.id}`, {
       body: JSON.stringify({ action: "seen" }),
       headers: { "content-type": "application/json" },
@@ -875,6 +1090,29 @@ function usageEvent(value: {
     reasoningOutputTokens: Math.floor(value.outputTokens / 2),
     sourceHash: `hash-${value.id}`,
     totalTokens: value.inputTokens + value.outputTokens,
+  };
+}
+
+function turnUsage(
+  turnKey: string,
+  model: string,
+  inputTokens: number,
+): typeof turnModelUsage.$inferInsert {
+  return {
+    cachedInputTokens: Math.floor(inputTokens / 2),
+    costAttributionMissingCount: 0,
+    costUsd: inputTokens / 1_000,
+    inputTokens,
+    model,
+    outputTokens: 10,
+    reasoningOutputTokens: 2,
+    requestCount: 1,
+    totalTokens: inputTokens + 10,
+    turnKey,
+    unpricedCachedInputTokens: 0,
+    unpricedInputTokens: 0,
+    unpricedOutputTokens: 0,
+    unpricedUsageCount: 0,
   };
 }
 

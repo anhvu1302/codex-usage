@@ -62,6 +62,44 @@ export const sessionAgents = sqliteTable(
   ],
 );
 
+export const turns = sqliteTable(
+  "turns",
+  {
+    id: text("id").primaryKey(),
+    turnId: text("turn_id").notNull(),
+    sessionId: text("session_id")
+      .notNull()
+      .references(() => sessions.id, { onDelete: "restrict" }),
+    agentId: text("agent_id")
+      .notNull()
+      .references(() => sessionAgents.id, { onDelete: "restrict" }),
+    projectId: text("project_id"),
+    localDate: text("local_date").notNull(),
+    startedAt: text("started_at"),
+    completedAt: text("completed_at"),
+    lastEventAt: text("last_event_at").notNull(),
+    status: text("status").notNull().default("unknown"),
+    effort: text("effort"),
+    collaborationMode: text("collaboration_mode"),
+    modelContextWindow: integer("model_context_window"),
+    durationMs: integer("duration_ms"),
+    timeToFirstTokenMs: integer("time_to_first_token_ms"),
+    firstInputTokens: integer("first_input_tokens"),
+    lastInputTokens: integer("last_input_tokens"),
+    peakInputTokens: integer("peak_input_tokens"),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("turns_agent_turn_unique").on(table.agentId, table.turnId),
+    index("turns_date_index").on(table.localDate),
+    index("turns_project_date_index").on(table.projectId, table.localDate),
+    index("turns_session_date_index").on(table.sessionId, table.localDate),
+    index("turns_agent_date_index").on(table.agentId, table.localDate),
+    index("turns_status_date_index").on(table.status, table.localDate),
+  ],
+);
+
 export const importStates = sqliteTable("import_states", {
   sourcePath: text("source_path").primaryKey(),
   lastOffset: integer("last_offset").notNull().default(0),
@@ -69,6 +107,9 @@ export const importStates = sqliteTable("import_states", {
   agentId: text("agent_id"),
   dedupeVersion: integer("dedupe_version").notNull().default(0),
   activeModel: text("active_model"),
+  activeTurnKey: text("active_turn_key"),
+  sessionContextWindow: integer("session_context_window"),
+  turnAttributionVersion: integer("turn_attribution_version").notNull().default(0),
   updatedAt: integer("updated_at").notNull(),
 });
 
@@ -101,6 +142,8 @@ export const usageEvents = sqliteTable(
     cachedInputRate: real("cached_input_rate"),
     outputRate: real("output_rate"),
     costUsd: real("cost_usd"),
+    turnKey: text("turn_key"),
+    turnAttributionVersion: integer("turn_attribution_version").notNull().default(0),
     createdAt: integer("created_at").notNull(),
   },
   (table) => [
@@ -109,6 +152,7 @@ export const usageEvents = sqliteTable(
     index("usage_events_model_index").on(table.model),
     index("usage_events_session_index").on(table.sessionId),
     index("usage_events_agent_index").on(table.agentId),
+    index("usage_events_turn_timestamp_index").on(table.turnKey, table.timestamp),
     index("usage_events_date_model_index").on(table.localDate, table.model),
     index("usage_events_date_session_index").on(table.localDate, table.sessionId),
   ],
@@ -224,10 +268,16 @@ export const usageRollupSessionMemberships = sqliteTable(
   ],
 );
 
-export const archivedUsageEventIds = sqliteTable("archived_usage_event_ids", {
-  id: text("id").primaryKey(),
-  archivedAt: integer("archived_at").notNull(),
-});
+export const archivedUsageEventIds = sqliteTable(
+  "archived_usage_event_ids",
+  {
+    id: text("id").primaryKey(),
+    archivedAt: integer("archived_at").notNull(),
+    turnKey: text("turn_key"),
+    turnAttributionVersion: integer("turn_attribution_version").notNull().default(0),
+  },
+  (table) => [index("archived_usage_turn_index").on(table.turnKey)],
+);
 
 export const retentionState = sqliteTable("retention_state", {
   id: text("id").primaryKey(),
@@ -256,6 +306,7 @@ export const alertEvents = sqliteTable(
     periodStart: text("period_start").notNull(),
     title: text("title").notNull(),
     message: text("message").notNull(),
+    turnKey: text("turn_key"),
     createdAt: integer("created_at").notNull(),
     seenAt: integer("seen_at"),
     dismissedAt: integer("dismissed_at"),
@@ -265,6 +316,46 @@ export const alertEvents = sqliteTable(
     index("alert_events_created_index").on(table.createdAt),
   ],
 );
+
+export const turnModelUsage = sqliteTable(
+  "turn_model_usage",
+  {
+    turnKey: text("turn_key")
+      .notNull()
+      .references(() => turns.id, { onDelete: "cascade" }),
+    model: text("model").notNull(),
+    ...rollupFields(),
+    costAttributionMissingCount: integer("cost_attribution_missing_count").notNull().default(0),
+  },
+  (table) => [
+    primaryKey({ columns: [table.turnKey, table.model] }),
+    index("turn_model_usage_model_index").on(table.model),
+  ],
+);
+
+export const turnActivityRollups = sqliteTable(
+  "turn_activity_rollups",
+  {
+    turnKey: text("turn_key")
+      .notNull()
+      .references(() => turns.id, { onDelete: "cascade" }),
+    kind: text("kind").notNull(),
+    eventCount: integer("event_count").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.turnKey, table.kind] })],
+);
+
+export const turnBackfillState = sqliteTable("turn_backfill_state", {
+  id: text("id").primaryKey(),
+  attributionVersion: integer("attribution_version").notNull().default(0),
+  isRunning: integer("is_running", { mode: "boolean" }).notNull().default(false),
+  filesProcessed: integer("files_processed").notNull().default(0),
+  totalFiles: integer("total_files").notNull().default(0),
+  sourceDeletedGaps: integer("source_deleted_gaps").notNull().default(0),
+  costAttributionMissingCount: integer("cost_attribution_missing_count").notNull().default(0),
+  lastRunAt: integer("last_run_at"),
+  error: text("error"),
+});
 
 export const activityEvents = sqliteTable(
   "activity_events",
@@ -279,6 +370,8 @@ export const activityEvents = sqliteTable(
     kind: text("kind").notNull(),
     agentKind: text("agent_kind").notNull(),
     projectId: text("project_id").notNull().default("legacy-unknown"),
+    turnKey: text("turn_key"),
+    turnAttributionVersion: integer("turn_attribution_version").notNull().default(0),
     createdAt: integer("created_at").notNull(),
   },
   (table) => [
@@ -286,6 +379,7 @@ export const activityEvents = sqliteTable(
     index("activity_events_project_date_index").on(table.projectId, table.localDate),
     index("activity_events_session_timestamp_index").on(table.sessionId, table.timestamp),
     index("activity_events_agent_date_index").on(table.agentId, table.localDate),
+    index("activity_events_turn_timestamp_index").on(table.turnKey, table.timestamp),
   ],
 );
 
@@ -304,10 +398,16 @@ export const activityDailyRollups = sqliteTable(
   ],
 );
 
-export const archivedActivityEventIds = sqliteTable("archived_activity_event_ids", {
-  id: text("id").primaryKey(),
-  archivedAt: integer("archived_at").notNull(),
-});
+export const archivedActivityEventIds = sqliteTable(
+  "archived_activity_event_ids",
+  {
+    id: text("id").primaryKey(),
+    archivedAt: integer("archived_at").notNull(),
+    turnKey: text("turn_key"),
+    turnAttributionVersion: integer("turn_attribution_version").notNull().default(0),
+  },
+  (table) => [index("archived_activity_turn_index").on(table.turnKey)],
+);
 
 export const importDiagnostics = sqliteTable("import_diagnostics", {
   sourcePath: text("source_path").primaryKey(),

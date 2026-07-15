@@ -20,7 +20,7 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import { CartesianGrid, Line, LineChart, Tooltip, XAxis, YAxis } from "recharts";
 
 import { DataHealthCenter } from "@/web/components/data-health-center";
@@ -872,6 +872,15 @@ function AgentTimelineNode({ node }: { node: TimelineAgentNode }) {
             >
               <Icon className="text-muted-foreground size-3.5 shrink-0" aria-hidden="true" />
               <span className="font-medium">{option.label}</span>
+              {event.turnKey ? (
+                <Link
+                  aria-label={`Mở turn của event ${option.label}`}
+                  className="text-primary hover:underline"
+                  to={`/turns/${event.turnKey}`}
+                >
+                  Xem turn
+                </Link>
+              ) : null}
               <time
                 className="text-muted-foreground ml-auto tabular-nums"
                 dateTime={event.timestamp}

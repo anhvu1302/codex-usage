@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Bot, Database, GitBranch, Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
-import { useSearchParams } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import {
   CartesianGrid,
   Cell,
@@ -102,6 +102,12 @@ export function AgentsPage() {
     if (next.depth !== undefined) updated.set("depth", String(next.depth));
     else updated.delete("depth");
     setSearch(updated);
+  }
+
+  function turnTarget(agentId: string) {
+    const next = updateFilterSearch(new URLSearchParams(), filters);
+    next.set("agent", agentId);
+    return { pathname: "/turns", search: next.toString() };
   }
 
   return (
@@ -231,7 +237,12 @@ export function AgentsPage() {
           ) : null}
           <div className="grid gap-3 p-4 md:hidden">
             {sortedAgents.map((agent, index) => (
-              <AgentCard key={agent.agentId} agent={agent} rank={index + 1} />
+              <AgentCard
+                key={agent.agentId}
+                agent={agent}
+                rank={index + 1}
+                turnTarget={turnTarget(agent.agentId)}
+              />
             ))}
           </div>
           <div className="hidden overflow-x-auto md:block">
@@ -257,10 +268,16 @@ export function AgentsPage() {
                       {index + 1}
                     </TableCell>
                     <TableCell className="max-w-72">
-                      <p className="truncate font-medium">{agentLabel(agent)}</p>
-                      <p className="text-muted-foreground truncate font-mono text-xs">
-                        {shortId(agent.agentId)} · depth {agent.depth}
-                      </p>
+                      <Link
+                        aria-label={`Xem turns của ${agentLabel(agent)}`}
+                        className="focus-visible:ring-ring block rounded-sm outline-none focus-visible:ring-2"
+                        to={turnTarget(agent.agentId)}
+                      >
+                        <span className="block truncate font-medium">{agentLabel(agent)}</span>
+                        <span className="text-muted-foreground block truncate font-mono text-xs">
+                          {shortId(agent.agentId)} · depth {agent.depth}
+                        </span>
+                      </Link>
                     </TableCell>
                     <TableCell>
                       <Badge variant={agent.isSubagent ? "secondary" : "outline"}>
@@ -479,19 +496,31 @@ function AgentTrend({
   );
 }
 
-function AgentCard({ agent, rank }: { agent: AgentUsageSummary; rank: number }) {
+function AgentCard({
+  agent,
+  rank,
+  turnTarget,
+}: {
+  agent: AgentUsageSummary;
+  rank: number;
+  turnTarget: { pathname: string; search: string };
+}) {
   return (
     <article className="bg-card rounded-xl border p-4">
       <div className="flex items-start gap-3">
         <span className="bg-muted flex size-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold">
           {rank}
         </span>
-        <div className="min-w-0 flex-1">
-          <p className="truncate font-semibold">{agentLabel(agent)}</p>
-          <p className="text-muted-foreground mt-1 text-xs">
+        <Link
+          aria-label={`Xem turns của ${agentLabel(agent)}`}
+          className="focus-visible:ring-ring min-w-0 flex-1 rounded-sm outline-none focus-visible:ring-2"
+          to={turnTarget}
+        >
+          <span className="block truncate font-semibold">{agentLabel(agent)}</span>
+          <span className="text-muted-foreground mt-1 block text-xs">
             {agent.isSubagent ? "Subagent" : "Main agent"} · depth {agent.depth}
-          </p>
-        </div>
+          </span>
+        </Link>
         <GitBranch className="text-muted-foreground size-4" />
       </div>
       <div className="mt-4 grid grid-cols-2 gap-3 text-sm">

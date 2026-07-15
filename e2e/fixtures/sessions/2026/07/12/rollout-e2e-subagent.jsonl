@@ -1,4 +1,12 @@
 {"type":"session_meta","timestamp":"2026-07-12T04:01:00.000Z","payload":{"session_id":"e2e-session","id":"e2e-mapper","parent_thread_id":"e2e-session","thread_source":"subagent","agent_nickname":"Mapper","agent_role":"explorer","source":{"subagent":{"thread_spawn":{"depth":1}}},"cwd":"/workspace/e2e","timestamp":"2026-07-12T04:01:00.000Z"}}
 {"type":"event_msg","timestamp":"2026-07-12T04:01:00.500Z","payload":{"type":"user_message","message":"Map the dashboard source"}}
-{"type":"turn_context","timestamp":"2026-07-12T04:01:01.000Z","payload":{"model":"gpt-e2e"}}
+{"type":"event_msg","timestamp":"2026-07-12T04:01:00.750Z","payload":{"type":"task_started","turn_id":"e2e-sub-turn-1","started_at":"2026-07-12T04:01:00.750Z"}}
+{"type":"turn_context","timestamp":"2026-07-12T04:01:01.000Z","payload":{"model":"gpt-e2e","turn_id":"e2e-sub-turn-1","model_context_window":100,"effort":"medium"}}
 {"type":"event_msg","timestamp":"2026-07-12T04:01:02.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"cached_input_tokens":5,"output_tokens":4,"reasoning_output_tokens":1,"total_tokens":24}}}}
+{"type":"response_item","timestamp":"2026-07-12T04:01:02.500Z","payload":{"type":"function_call","name":"mcp__files__read","call_id":"mcp-e2e-1"}}
+{"type":"event_msg","timestamp":"2026-07-12T04:01:03.000Z","payload":{"type":"task_complete","turn_id":"e2e-sub-turn-1","completed_at":"2026-07-12T04:01:03.000Z"}}
+{"type":"event_msg","timestamp":"2026-07-12T07:00:00.000Z","payload":{"type":"task_started","turn_id":"e2e-sub-turn-2","started_at":"2026-07-12T07:00:00.000Z"}}
+{"type":"turn_context","timestamp":"2026-07-12T07:00:00.500Z","payload":{"model":"gpt-e2e","turn_id":"e2e-sub-turn-2","model_context_window":100,"effort":"high"}}
+{"type":"event_msg","timestamp":"2026-07-12T07:00:01.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":75,"cached_input_tokens":25,"output_tokens":8,"reasoning_output_tokens":3,"total_tokens":83}}}}
+{"type":"response_item","timestamp":"2026-07-12T07:00:01.500Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-e2e-1"}}
+{"type":"event_msg","timestamp":"2026-07-12T07:00:02.000Z","payload":{"type":"task_complete","turn_id":"e2e-sub-turn-2","completed_at":"2026-07-12T07:00:02.000Z"}}

@@ -32,7 +32,7 @@ import {
   useSyncExternalStore,
   useTransition,
 } from "react";
-import { useSearchParams } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import {
   Bar,
   CartesianGrid,
@@ -1321,6 +1321,11 @@ function SessionSheet({
               label="Nguồn dữ liệu"
               value={session.sourceDeleted ? "Đã bị xoá (lịch sử vẫn lưu)" : "Còn trên ổ đĩa"}
             />
+            <Button asChild className="justify-self-start" variant="outline">
+              <Link to={`/turns?session=${encodeURIComponent(session.sessionId)}`}>
+                Xem turns của session
+              </Link>
+            </Button>
             <AgentBreakdown agents={session.agents} />
           </div>
         ) : null}

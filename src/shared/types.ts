@@ -98,6 +98,7 @@ export type ImportStatus = {
   recordsBackfilled: number;
   recordsInserted: number;
   recordsReclassified: number;
+  turnBackfill: TurnBackfillStatus;
 };
 
 export type RetentionCoverage = {
@@ -270,7 +271,13 @@ export type AlertEvent = {
   seenAt: string | null;
   severity: "critical" | "info" | "warning";
   title: string;
-  type: "anomaly" | "budget" | "data-health";
+  turnKey: string | null;
+  type: "anomaly" | "budget" | "context-pressure" | "data-health";
+};
+
+export type AlertsResponse = {
+  alerts: AlertEvent[];
+  unseenCount: number;
 };
 
 export type PricingSimulationRequest = DashboardFilters & {
@@ -321,6 +328,7 @@ export type ActivityTimelineItem = {
   role: string | null;
   sessionId: string;
   timestamp: string;
+  turnKey: string | null;
 };
 
 export type ActivityResponse = {
@@ -343,6 +351,154 @@ export type DataHealthResponse = {
   retentionError: string | null;
   sourceDeletedAgents: number;
   sourceDeletedSessions: number;
+  turnBackfill: TurnBackfillStatus;
+  turnCostAttributionGaps: number;
+  turnUnassignedActivity: number;
+  turnUnassignedUsage: number;
   unknownUsage: number;
   unpricedUsage: number;
+};
+
+export type TurnStatus = "aborted" | "completed" | "unknown";
+export type TurnCostCoverage = "exact" | "partial" | "unavailable";
+export type TurnPressureFilter =
+  "70" | "70-84" | "85" | "85-94" | "95" | "95+" | "below-70" | "unknown";
+
+export type TurnBackfillStatus = {
+  attributionVersion: number;
+  costAttributionMissingCount: number;
+  error: string | null;
+  filesProcessed: number;
+  isRunning: boolean;
+  lastRunAt: string | null;
+  sourceDeletedGaps: number;
+  totalFiles: number;
+};
+
+export type TurnFilters = DashboardFilters & {
+  agentId?: string;
+  effort?: string;
+  order?: "asc" | "desc";
+  page?: number;
+  pageSize?: number;
+  pressure?: TurnPressureFilter;
+  query?: string;
+  sessionId?: string;
+  sort?: "context" | "cost" | "duration" | "lastActivity" | "tokens" | "ttft";
+  status?: TurnStatus;
+};
+
+export type TurnUsageMetrics = TokenUsage & {
+  costAttributionMissingCount: number;
+  costCoverage: TurnCostCoverage;
+  estimatedCostUsd: number;
+  requestCount: number;
+  unpricedUsageCount: number;
+};
+
+export type TurnSummary = TurnUsageMetrics & {
+  agentId: string;
+  agentKind: "main" | "subagent";
+  agentName: string | null;
+  cacheRate: number;
+  collaborationMode: string | null;
+  completedAt: string | null;
+  contextUtilizationPercent: number | null;
+  contextWindowTokens: number | null;
+  depth: number;
+  durationMs: number | null;
+  effort: string | null;
+  lastEventAt: string;
+  models: string[];
+  ordinal: number;
+  parentAgentId: string | null;
+  peakInputTokens: number | null;
+  projectId: string | null;
+  role: string | null;
+  sessionId: string;
+  sessionTitle: string | null;
+  startedAt: string | null;
+  status: TurnStatus;
+  timeToFirstTokenMs: number | null;
+  turnId: string;
+  turnKey: string;
+};
+
+export type TurnKpis = {
+  averageCostPerTurn: number | null;
+  cacheRate: number;
+  contextPressureTurnCount: number;
+  costCoverage: TurnCostCoverage;
+  estimatedCostUsd: number;
+  p50DurationMs: number | null;
+  p50TimeToFirstTokenMs: number | null;
+  p95DurationMs: number | null;
+  totalTokens: number;
+  turnCount: number;
+};
+
+export type TurnDailyUsage = {
+  costCoverage: TurnCostCoverage;
+  date: string;
+  estimatedCostUsd: number;
+  totalTokens: number;
+  turnCount: number;
+};
+
+export type TurnContextBucket = {
+  count: number;
+  id: "70-84" | "85-94" | "95+" | "below-70" | "unknown";
+  label: string;
+};
+
+export type TurnCoverage = {
+  aggregate: "full" | "partial";
+  backfill: TurnBackfillStatus;
+  timeline: SessionCoverage;
+};
+
+export type TurnsResponse = {
+  contextBuckets: TurnContextBucket[];
+  coverage: TurnCoverage;
+  daily: TurnDailyUsage[];
+  kpis: TurnKpis;
+  liveRefreshSuggested: boolean;
+  page: number;
+  pageSize: number;
+  total: number;
+  turns: TurnSummary[];
+};
+
+export type TurnModelUsage = TurnUsageMetrics & {
+  model: string;
+};
+
+export type TurnActivityCount = {
+  count: number;
+  kind: ActivityKind;
+};
+
+export type TurnRequestUsage = TokenUsage & {
+  contextUtilizationPercent: number | null;
+  costCoverage: "exact" | "unavailable";
+  estimatedCostUsd: number | null;
+  id: string;
+  model: string;
+  timestamp: string;
+};
+
+export type TurnDetailResponse = {
+  activity: TurnActivityCount[];
+  activityTimeline: ActivityTimelineItem[];
+  models: TurnModelUsage[];
+  requests: TurnRequestUsage[];
+  threadAgents: SessionAgentUsage[];
+  timelineCoverage: SessionCoverage;
+  timelineTruncated: boolean;
+  turn: TurnSummary;
+};
+
+export type TurnComparisonResponse = {
+  missingIds: string[];
+  turns: TurnSummary[];
 };

@@ -14,17 +14,19 @@ import type { AppDatabase } from "@/server/db/client";
 import type { SessionImporter } from "@/server/importer";
 import {
   exportDataset,
+  exportTurnDataset,
   getAgents,
+  getAlertFeed,
   getBudgets,
   getInsights,
   getProjects,
-  refreshAlerts,
   saveBudget,
   simulatePricing,
   updateAlert,
 } from "@/server/product-analytics";
 import { renameProject } from "@/server/projects";
 import { currentLocalDate, dateDaysBefore, type RetentionService } from "@/server/retention";
+import { compareTurns, getTurnDetail, getTurns } from "@/server/turns";
 import type {
   ActivityFilters,
   ActivityKind,
@@ -32,6 +34,8 @@ import type {
   DashboardFilters,
   PricingSimulationRequest,
   SessionFilters,
+  TurnFilters,
+  TurnStatus,
 } from "@/shared/types";
 
 const datePattern = /^\d{4}-\d{2}-\d{2}$/;
@@ -128,6 +132,32 @@ export function createApp(
       ? context.json(getSessions(database, filters.data))
       : context.json({ error: filters.error }, 400);
   });
+  app.get("/api/turns", (context) => {
+    const filters = parseTurnFilters(context.req.query());
+    const status = importer.getStatus();
+    return filters.success
+      ? context.json(getTurns(database, filters.data, status.turnBackfill, status.isSyncing))
+      : context.json({ error: filters.error }, 400);
+  });
+  app.get("/api/turns/compare", (context) => {
+    const ids = (context.req.query("ids") ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const unique = [...new Set(ids)];
+    if (unique.length < 2 || unique.length > 4 || unique.some((id) => !/^[a-f0-9]{64}$/.test(id))) {
+      return context.json({ error: "ids must contain 2 to 4 unique turn keys" }, 400);
+    }
+    return context.json(compareTurns(database, unique));
+  });
+  app.get("/api/turns/:turnKey", (context) => {
+    const turnKey = context.req.param("turnKey");
+    if (!/^[a-f0-9]{64}$/.test(turnKey)) {
+      return context.json({ error: "invalid turn key" }, 400);
+    }
+    const detail = getTurnDetail(database, turnKey);
+    return detail ? context.json(detail) : context.json({ error: "Turn not found" }, 404);
+  });
   app.get("/api/insights", (context) => {
     const filters = parseFilters(context.req.query());
     return filters.success
@@ -159,7 +189,7 @@ export function createApp(
       ? context.json({ budget: saveBudget(database, payload.data) })
       : context.json({ error: payload.error.flatten() }, 400);
   });
-  app.get("/api/alerts", (context) => context.json({ alerts: refreshAlerts(database) }));
+  app.get("/api/alerts", (context) => context.json(getAlertFeed(database)));
   app.patch("/api/alerts/:id", async (context) => {
     const payload = alertActionSchema.safeParse(await readJson(context.req.raw));
     if (!payload.success) return context.json({ error: payload.error.flatten() }, 400);
@@ -182,22 +212,25 @@ export function createApp(
   });
   app.get("/api/export", (context) => {
     const query = context.req.query();
-    const filters = parseExportFilters(query);
-    if (!filters.success) return context.json({ error: filters.error }, 400);
     const dataset = query["dataset"];
     const format = query["format"] ?? "csv";
-    if (!dataset || !["agents", "models", "projects", "sessions"].includes(dataset)) {
+    if (!dataset || !["agents", "models", "projects", "sessions", "turns"].includes(dataset)) {
       return context.json({ error: "invalid export dataset" }, 400);
     }
+    const filters = parseExportFilters(query, dataset);
+    if (!filters.success) return context.json({ error: filters.error }, 400);
     if (format !== "csv" && format !== "json") {
       return context.json({ error: "format must be csv or json" }, 400);
     }
-    const exported = exportDataset(
-      database,
-      dataset as "agents" | "models" | "projects" | "sessions",
-      filters.data,
-      format,
-    );
+    const exported =
+      dataset === "turns"
+        ? exportTurnDataset(database, filters.data, format)
+        : exportDataset(
+            database,
+            dataset as "agents" | "models" | "projects" | "sessions",
+            filters.data,
+            format,
+          );
     return context.newResponse(exported.body, 200, {
       "Content-Disposition": `attachment; filename="${exported.filename}"`,
       "Content-Type": exported.contentType,
@@ -235,12 +268,16 @@ export function createApp(
   return app;
 }
 
-function parseExportFilters(query: Record<string, string | undefined>):
+function parseExportFilters(
+  query: Record<string, string | undefined>,
+  dataset: string,
+):
   | {
-      data: AgentFilters & SessionFilters;
+      data: (AgentFilters & SessionFilters) | TurnFilters;
       success: true;
     }
   | { error: string; success: false } {
+  if (dataset === "turns") return parseTurnFilters(query);
   const session = parseSessionFilters(query);
   if (!session.success) return session;
   const agent = parseAgentFilters(query);
@@ -375,6 +412,68 @@ function parseSessionFilters(
     },
     success: true,
   };
+}
+
+function parseTurnFilters(
+  query: Record<string, string | undefined>,
+): { data: TurnFilters; success: true } | { error: string; success: false } {
+  const base = parseFilters(query);
+  if (!base.success) return base;
+  const page = positiveInteger(query["page"] ?? "1");
+  const pageSize = positiveInteger(query["pageSize"] ?? "25");
+  if (!page || !pageSize || pageSize > 100) {
+    return {
+      error: "page must be positive and pageSize must be between 1 and 100",
+      success: false,
+    };
+  }
+  const sortValue = query["sort"] ?? "lastActivity";
+  const orderValue = query["order"] ?? "desc";
+  if (!["context", "cost", "duration", "lastActivity", "tokens", "ttft"].includes(sortValue)) {
+    return { error: "invalid turn sort", success: false };
+  }
+  if (!["asc", "desc"].includes(orderValue)) {
+    return { error: "invalid turn order", success: false };
+  }
+  const status = query["status"]?.trim();
+  if (status && !["aborted", "completed", "unknown"].includes(status)) {
+    return { error: "invalid turn status", success: false };
+  }
+  const pressure = query["pressure"]?.trim();
+  if (
+    pressure &&
+    !["70", "70-84", "85", "85-94", "95", "95+", "below-70", "unknown"].includes(pressure)
+  ) {
+    return { error: "invalid context pressure filter", success: false };
+  }
+  const queryValue = query["q"]?.trim();
+  const effort = query["effort"]?.trim();
+  const sessionId = query["session"]?.trim();
+  const agentId = query["agent"]?.trim();
+  for (const [name, value, limit] of [
+    ["q", queryValue, 200],
+    ["effort", effort, 100],
+    ["session", sessionId, 160],
+    ["agent", agentId, 160],
+  ] as const) {
+    if (value && value.length > limit) {
+      return { error: `${name} must be at most ${limit} characters`, success: false };
+    }
+  }
+  const data: TurnFilters = {
+    ...base.data,
+    order: orderValue as NonNullable<TurnFilters["order"]>,
+    page,
+    pageSize,
+    sort: sortValue as NonNullable<TurnFilters["sort"]>,
+  };
+  if (status) data.status = status as TurnStatus;
+  if (pressure) data.pressure = pressure as NonNullable<TurnFilters["pressure"]>;
+  if (queryValue) data.query = queryValue;
+  if (effort) data.effort = effort;
+  if (sessionId) data.sessionId = sessionId;
+  if (agentId) data.agentId = agentId;
+  return { data, success: true };
 }
 
 function positiveInteger(value: string): number | null {

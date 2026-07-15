@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowRight, FolderKanban, Pencil, Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
-import { useSearchParams } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import { Bar, CartesianGrid, ComposedChart, Line, Tooltip, XAxis, YAxis } from "recharts";
 import { toast } from "sonner";
 
@@ -80,6 +80,13 @@ export function ProjectsPage() {
 
   function applyFilters(next: AgentFilters) {
     setSearch(updateFilterSearch(search, next));
+  }
+
+  function turnTarget(sessionId: string, projectId: string) {
+    const next = updateFilterSearch(new URLSearchParams(), filters);
+    next.set("project", projectId);
+    next.set("session", sessionId);
+    return { pathname: "/turns", search: next.toString() };
   }
 
   const totals = useMemo(
@@ -253,9 +260,11 @@ export function ProjectsPage() {
             </CardHeader>
             <CardContent className="space-y-2">
               {selected.topSessions.map((session, index) => (
-                <div
+                <Link
                   key={session.sessionId}
-                  className="bg-muted/60 flex items-center gap-3 rounded-lg p-3"
+                  aria-label={`Xem turns của ${session.title ?? session.sessionId}`}
+                  className="bg-muted/60 hover:bg-muted focus-visible:ring-ring flex items-center gap-3 rounded-lg p-3 transition-colors outline-none focus-visible:ring-2"
+                  to={turnTarget(session.sessionId, selected.id)}
                 >
                   <span className="text-muted-foreground w-5 text-xs tabular-nums">
                     {index + 1}
@@ -271,7 +280,8 @@ export function ProjectsPage() {
                   <span className="text-sm font-semibold tabular-nums">
                     {formatUsd(session.estimatedCostUsd)}
                   </span>
-                </div>
+                  <ArrowRight className="text-muted-foreground size-4 shrink-0" />
+                </Link>
               ))}
               {selected.topSessions.length === 0 ? (
                 <p className="text-muted-foreground py-10 text-center text-sm">

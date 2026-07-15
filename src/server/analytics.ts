@@ -5,6 +5,7 @@ import {
   modelRates,
   sessionAgents,
   sessions,
+  turnModelUsage,
   usageAgentDailyRollups,
   usageDailyRollups,
   usageEvents,
@@ -12,6 +13,7 @@ import {
   usageRollupSessionMemberships,
 } from "@/server/db/schema";
 import { getRetentionCoverage, getSessionCoverage } from "@/server/retention";
+import { TURN_ATTRIBUTION_VERSION } from "@/server/turn-constants";
 import type {
   DashboardFilters,
   DashboardKpis,
@@ -545,8 +547,22 @@ export function backfillUnpricedUsage(database: AppDatabase, model: string): num
       unpriced_output_tokens = 0
     where model = ${model} and unpriced_usage_count > 0
   `);
+    const turnResult = transaction.run(sql`
+    update ${turnModelUsage}
+    set
+      cost_usd = cost_usd + ((unpriced_input_tokens - unpriced_cached_input_tokens) * ${rate.inputRate} + unpriced_cached_input_tokens * ${rate.cachedInputRate} + unpriced_output_tokens * ${rate.outputRate}) / 1000000.0,
+      unpriced_usage_count = 0,
+      unpriced_input_tokens = 0,
+      unpriced_cached_input_tokens = 0,
+      unpriced_output_tokens = 0
+    where model = ${model} and unpriced_usage_count > 0
+  `);
     return (
-      rawResult.changes + dailyResult.changes + hourlyResult.changes + agentDailyResult.changes
+      rawResult.changes +
+      dailyResult.changes +
+      hourlyResult.changes +
+      agentDailyResult.changes +
+      turnResult.changes
     );
   });
 }
@@ -560,25 +576,149 @@ export function backfillAllUnpricedUsage(database: AppDatabase): number {
 }
 
 export function reconcileUnknownModels(database: AppDatabase): number {
-  const result = database.run(sql`
-    update ${usageEvents} as unknown_event
-    set model = (
-      select known_event.model
-      from ${usageEvents} as known_event
-      where known_event.session_id = unknown_event.session_id
-        and known_event.model != 'unknown'
-      order by abs(julianday(known_event.timestamp) - julianday(unknown_event.timestamp)), known_event.timestamp
-      limit 1
-    )
-    where unknown_event.model = 'unknown'
-      and exists (
-        select 1
+  return database.$client.transaction(() => {
+    const affected = database.$client
+      .prepare(
+        `select
+          unknown_event.id as id,
+          (
+            select known_event.model
+            from usage_events as known_event
+            where known_event.session_id = unknown_event.session_id
+              and known_event.agent_id = unknown_event.agent_id
+              and known_event.model != 'unknown'
+            order by
+              case
+                when unknown_event.turn_key is not null
+                  and known_event.turn_key = unknown_event.turn_key then 0
+                else 1
+              end,
+              abs(julianday(known_event.timestamp) - julianday(unknown_event.timestamp)),
+              known_event.timestamp,
+              known_event.id
+            limit 1
+          ) as targetModel
+        from usage_events as unknown_event
+        where unknown_event.model = 'unknown'
+          and exists (
+            select 1 from usage_events as known_event
+            where known_event.session_id = unknown_event.session_id
+              and known_event.agent_id = unknown_event.agent_id
+              and known_event.model != 'unknown'
+          )`,
+      )
+      .all() as { id: string; targetModel: string }[];
+    if (affected.length === 0) return 0;
+
+    const result = database.run(sql`
+      update ${usageEvents} as unknown_event
+      set model = (
+        select known_event.model
         from ${usageEvents} as known_event
         where known_event.session_id = unknown_event.session_id
+          and known_event.agent_id = unknown_event.agent_id
           and known_event.model != 'unknown'
+        order by
+          case
+            when unknown_event.turn_key is not null
+              and known_event.turn_key = unknown_event.turn_key then 0
+            else 1
+          end,
+          abs(julianday(known_event.timestamp) - julianday(unknown_event.timestamp)),
+          known_event.timestamp,
+          known_event.id
+        limit 1
       )
-  `);
-  return result.changes;
+      where unknown_event.model = 'unknown'
+        and exists (
+          select 1
+          from ${usageEvents} as known_event
+          where known_event.session_id = unknown_event.session_id
+            and known_event.agent_id = unknown_event.agent_id
+            and known_event.model != 'unknown'
+        )
+    `);
+    for (const value of affected) {
+      const event = database.select().from(usageEvents).where(eq(usageEvents.id, value.id)).get();
+      if (event) moveAttributedUsageModel(database, { ...event, targetModel: value.targetModel });
+    }
+    return result.changes;
+  })();
+}
+
+type ReclassifiedUsageRow = typeof usageEvents.$inferSelect & { targetModel: string };
+
+function moveAttributedUsageModel(database: AppDatabase, event: ReclassifiedUsageRow) {
+  if (
+    !event.turnKey ||
+    event.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION ||
+    event.targetModel === "unknown"
+  ) {
+    return;
+  }
+  const unpriced = event.costUsd === null;
+  database
+    .update(turnModelUsage)
+    .set({
+      cachedInputTokens: sql`${turnModelUsage.cachedInputTokens} - ${event.cachedInputTokens}`,
+      costUsd: sql`${turnModelUsage.costUsd} - ${event.costUsd ?? 0}`,
+      inputTokens: sql`${turnModelUsage.inputTokens} - ${event.inputTokens}`,
+      outputTokens: sql`${turnModelUsage.outputTokens} - ${event.outputTokens}`,
+      reasoningOutputTokens: sql`${turnModelUsage.reasoningOutputTokens} - ${event.reasoningOutputTokens}`,
+      requestCount: sql`${turnModelUsage.requestCount} - 1`,
+      totalTokens: sql`${turnModelUsage.totalTokens} - ${event.totalTokens}`,
+      unpricedCachedInputTokens: sql`${turnModelUsage.unpricedCachedInputTokens} - ${unpriced ? event.cachedInputTokens : 0}`,
+      unpricedInputTokens: sql`${turnModelUsage.unpricedInputTokens} - ${unpriced ? event.inputTokens : 0}`,
+      unpricedOutputTokens: sql`${turnModelUsage.unpricedOutputTokens} - ${unpriced ? event.outputTokens : 0}`,
+      unpricedUsageCount: sql`${turnModelUsage.unpricedUsageCount} - ${unpriced ? 1 : 0}`,
+    })
+    .where(and(eq(turnModelUsage.turnKey, event.turnKey), eq(turnModelUsage.model, "unknown")))
+    .run();
+  database
+    .delete(turnModelUsage)
+    .where(
+      and(
+        eq(turnModelUsage.turnKey, event.turnKey),
+        eq(turnModelUsage.model, "unknown"),
+        sql`${turnModelUsage.requestCount} <= 0`,
+      ),
+    )
+    .run();
+  database
+    .insert(turnModelUsage)
+    .values({
+      cachedInputTokens: event.cachedInputTokens,
+      costAttributionMissingCount: 0,
+      costUsd: event.costUsd ?? 0,
+      inputTokens: event.inputTokens,
+      model: event.targetModel,
+      outputTokens: event.outputTokens,
+      reasoningOutputTokens: event.reasoningOutputTokens,
+      requestCount: 1,
+      totalTokens: event.totalTokens,
+      turnKey: event.turnKey,
+      unpricedCachedInputTokens: unpriced ? event.cachedInputTokens : 0,
+      unpricedInputTokens: unpriced ? event.inputTokens : 0,
+      unpricedOutputTokens: unpriced ? event.outputTokens : 0,
+      unpricedUsageCount: unpriced ? 1 : 0,
+    })
+    .onConflictDoUpdate({
+      target: [turnModelUsage.turnKey, turnModelUsage.model],
+      set: {
+        cachedInputTokens: sql`${turnModelUsage.cachedInputTokens} + ${event.cachedInputTokens}`,
+        costUsd: sql`${turnModelUsage.costUsd} + ${event.costUsd ?? 0}`,
+        inputTokens: sql`${turnModelUsage.inputTokens} + ${event.inputTokens}`,
+        outputTokens: sql`${turnModelUsage.outputTokens} + ${event.outputTokens}`,
+        reasoningOutputTokens: sql`${turnModelUsage.reasoningOutputTokens} + ${event.reasoningOutputTokens}`,
+        requestCount: sql`${turnModelUsage.requestCount} + 1`,
+        totalTokens: sql`${turnModelUsage.totalTokens} + ${event.totalTokens}`,
+        unpricedCachedInputTokens: sql`${turnModelUsage.unpricedCachedInputTokens} + ${unpriced ? event.cachedInputTokens : 0}`,
+        unpricedInputTokens: sql`${turnModelUsage.unpricedInputTokens} + ${unpriced ? event.inputTokens : 0}`,
+        unpricedOutputTokens: sql`${turnModelUsage.unpricedOutputTokens} + ${unpriced ? event.outputTokens : 0}`,
+        unpricedUsageCount: sql`${turnModelUsage.unpricedUsageCount} + ${unpriced ? 1 : 0}`,
+      },
+    })
+    .run();
 }
 
 const rawAggregateFields = {

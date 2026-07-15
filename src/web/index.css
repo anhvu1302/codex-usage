@@ -89,6 +89,12 @@ body {
   @apply bg-background text-foreground min-h-screen overflow-x-hidden antialiased;
 }
 
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
 html[data-density="compact"] .metric-card > div {
   padding: 0.85rem;
 }

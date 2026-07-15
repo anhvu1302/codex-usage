@@ -200,6 +200,34 @@ export function DataHealthCenter({ className }: { className?: string }) {
               severity={data.sourceDeletedAgents > 0 ? "info" : "ok"}
               value={data.sourceDeletedAgents}
             />
+            <HealthMetric
+              action={
+                <Button asChild size="sm" variant="ghost">
+                  <Link to="/turns">
+                    <RefreshCw className="size-3.5" /> Turns
+                  </Link>
+                </Button>
+              }
+              description="Usage hoặc activity raw không có explicit/active turn trong đúng JSONL. Không tự suy đoán theo timestamp."
+              icon={FileQuestion}
+              label="Event chưa attribution turn"
+              severity={data.turnUnassignedUsage + data.turnUnassignedActivity > 0 ? "info" : "ok"}
+              value={data.turnUnassignedUsage + data.turnUnassignedActivity}
+            />
+            <HealthMetric
+              description="Usage legacy đã compact không còn price snapshot để gán cost chính xác cho turn."
+              icon={CircleDollarSign}
+              label="Khoảng trống cost của turn"
+              severity={data.turnCostAttributionGaps > 0 ? "info" : "ok"}
+              value={data.turnCostAttributionGaps}
+            />
+            <HealthMetric
+              description="JSONL source không còn trên disk nên historical turn backfill chỉ có coverage một phần."
+              icon={Trash2}
+              label="Source gap của turn"
+              severity={data.turnBackfill.sourceDeletedGaps > 0 ? "info" : "ok"}
+              value={data.turnBackfill.sourceDeletedGaps}
+            />
           </div>
         </TabsContent>
 
@@ -227,6 +255,21 @@ export function DataHealthCenter({ className }: { className?: string }) {
                 <RetentionStat
                   label="Daily activity rollup"
                   value={formatTokens(data.activityDailyRows)}
+                />
+                <RetentionStat
+                  label="Turn backfill"
+                  status={
+                    data.turnBackfill.error
+                      ? "Có lỗi"
+                      : data.turnBackfill.isRunning
+                        ? "Đang chạy"
+                        : "Sẵn sàng"
+                  }
+                  value={`${formatTokens(data.turnBackfill.filesProcessed)} / ${formatTokens(data.turnBackfill.totalFiles)} file · v${data.turnBackfill.attributionVersion}`}
+                />
+                <RetentionStat
+                  label="Turn backfill gần nhất"
+                  value={formatDateTime(data.turnBackfill.lastRunAt)}
                 />
               </CardContent>
             </Card>
@@ -363,6 +406,8 @@ function countIssues(data: DataHealthResponse): number {
     data.unpricedUsage +
     data.malformedLines +
     data.incompleteFiles +
+    data.turnCostAttributionGaps +
+    Number(Boolean(data.turnBackfill.error)) +
     Number(Boolean(data.importerError)) +
     Number(Boolean(data.retentionError))
   );

@@ -13,6 +13,7 @@ import {
   projectMonthlyCost,
 } from "@/server/insights";
 import { currentLocalDate, dateDaysBefore, getSessionCoverage } from "@/server/retention";
+import { getTurnPage } from "@/server/turns";
 import type {
   AgentFilters,
   AgentUsageSummary,
@@ -30,9 +31,12 @@ import type {
   ProjectsResponse,
   SessionFilters,
   SessionUsage,
+  TurnFilters,
 } from "@/shared/types";
 
-type ExportFilters = AgentFilters & SessionFilters;
+type ExportFilters = (AgentFilters & SessionFilters) | TurnFilters;
+const ALERT_FEED_LIMIT = 100;
+const ALERT_MATERIALIZATION_BATCH = 200;
 
 type AgentUsageRow = {
   agentId: string;
@@ -349,6 +353,55 @@ export function refreshAlerts(database: AppDatabase, now = new Date()): AlertEve
       type: "anomaly",
     });
   }
+  const pressuredTurns = database.$client
+    .prepare(
+      `select
+        t.model_context_window as contextWindow,
+        t.local_date as localDate,
+        t.peak_input_tokens as peakInput,
+        t.turn_id as turnId,
+        t.id as turnKey
+      from turns t
+      left join alert_events a
+        on a.type = 'context-pressure'
+        and a.scope_key = t.id
+        and a.period_start = t.local_date
+      where t.model_context_window > 0
+        and t.peak_input_tokens is not null
+        and t.peak_input_tokens * 100.0 / t.model_context_window >= 70
+        and (
+          a.id is null
+          or (case a.severity when 'critical' then 3 when 'warning' then 2 else 1 end) <
+             (case
+                when t.peak_input_tokens * 100.0 / t.model_context_window >= 95 then 3
+                when t.peak_input_tokens * 100.0 / t.model_context_window >= 85 then 2
+                else 1
+              end)
+        )
+      order by t.local_date desc, t.id asc
+      limit ?`,
+    )
+    .all(ALERT_MATERIALIZATION_BATCH) as {
+    contextWindow: number;
+    localDate: string;
+    peakInput: number;
+    turnId: string;
+    turnKey: string;
+  }[];
+  for (const turn of pressuredTurns) {
+    if (!turn.contextWindow || turn.peakInput === null) continue;
+    const percent = (turn.peakInput / turn.contextWindow) * 100;
+    const threshold = percent >= 95 ? 95 : percent >= 85 ? 85 : 70;
+    upsertAlert(database, {
+      message: `Peak input đạt ${percent.toFixed(1)}% context window. Đây là chỉ số gần đúng theo request lớn nhất.`,
+      periodStart: turn.localDate,
+      scopeKey: turn.turnKey,
+      severity: threshold >= 95 ? "critical" : threshold >= 85 ? "warning" : "info",
+      title: `Turn ${shortId(turn.turnId)} đã vượt ${threshold}% context`,
+      turnKey: turn.turnKey,
+      type: "context-pressure",
+    });
+  }
   return listAlerts(database);
 }
 
@@ -358,8 +411,19 @@ function listAlerts(database: AppDatabase): AlertEvent[] {
     .from(alertEvents)
     .where(isNull(alertEvents.dismissedAt))
     .orderBy(desc(alertEvents.createdAt))
+    .limit(ALERT_FEED_LIMIT)
     .all()
     .map(toAlertEvent);
+}
+
+export function getAlertFeed(database: AppDatabase, now = new Date()) {
+  const alerts = refreshAlerts(database, now);
+  const row = database.$client
+    .prepare(
+      "select count(*) as count from alert_events where dismissed_at is null and seen_at is null",
+    )
+    .get() as { count: number } | undefined;
+  return { alerts, unseenCount: Number(row?.count ?? 0) };
 }
 
 export function updateAlert(
@@ -422,15 +486,115 @@ export function exportDataset(
   };
 }
 
-function getAllSessions(database: AppDatabase, filters: SessionFilters): SessionUsage[] {
+export function exportTurnDataset(
+  database: AppDatabase,
+  filters: TurnFilters,
+  format: "csv" | "json",
+): { body: ReadableStream<Uint8Array>; contentType: string; filename: string } {
+  const encoder = new TextEncoder();
+  const base = toTurnExportFilters(filters);
+  let emitted = 0;
+  let page = 1;
+  let started = false;
+  let headers: string[] | null = null;
+
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      try {
+        const response = getTurnPage(database, { ...base, page, pageSize: 100 });
+        const rows: object[] = response.turns;
+        const done = rows.length === 0 || emitted + rows.length >= response.total;
+        let chunk = "";
+
+        if (format === "json") {
+          chunk = started ? "" : "[";
+          for (const row of rows) {
+            if (emitted > 0) chunk += ",";
+            chunk += JSON.stringify(row);
+            emitted += 1;
+          }
+          if (done) chunk += "]";
+        } else if (rows.length > 0) {
+          const currentHeaders = headers ?? [...new Set(rows.flatMap((row) => Object.keys(row)))];
+          headers = currentHeaders;
+          const lines = rows.map((row) =>
+            currentHeaders.map((header) => csvCell(Reflect.get(row, header))).join(","),
+          );
+          chunk = `${started ? "\n" : `${currentHeaders.map(csvCell).join(",")}\n`}${lines.join("\n")}`;
+          emitted += rows.length;
+        }
+
+        started = true;
+        if (chunk) controller.enqueue(encoder.encode(chunk));
+        if (done) controller.close();
+        else page += 1;
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+  });
+
+  return {
+    body,
+    contentType: format === "json" ? "application/json" : "text/csv; charset=utf-8",
+    filename: `codex-usage-turns.${format}`,
+  };
+}
+
+function getAllSessions(database: AppDatabase, filters: ExportFilters): SessionUsage[] {
   const values: SessionUsage[] = [];
   let page = 1;
+  const base = toSessionExportFilters(filters);
   while (true) {
-    const response = getSessions(database, { ...filters, page, pageSize: 100 });
+    const response = getSessions(database, { ...base, page, pageSize: 100 });
     values.push(...response.sessions);
     if (values.length >= response.total || response.sessions.length === 0) return values;
     page += 1;
   }
+}
+
+function toTurnExportFilters(filters: ExportFilters): TurnFilters {
+  const value: TurnFilters = {
+    from: filters.from,
+    order: filters.order ?? "desc",
+    sort:
+      filters.sort === "context" || filters.sort === "duration" || filters.sort === "ttft"
+        ? filters.sort
+        : (filters.sort ?? "lastActivity"),
+    to: filters.to,
+  };
+  copyDashboardFilters(filters, value);
+  if ("agentId" in filters && filters.agentId) value.agentId = filters.agentId;
+  if ("effort" in filters && filters.effort) value.effort = filters.effort;
+  if ("pressure" in filters && filters.pressure) value.pressure = filters.pressure;
+  if (filters.query) value.query = filters.query;
+  if ("sessionId" in filters && filters.sessionId) value.sessionId = filters.sessionId;
+  if ("status" in filters && filters.status) value.status = filters.status;
+  return value;
+}
+
+function toSessionExportFilters(filters: ExportFilters): SessionFilters {
+  const value: SessionFilters = {
+    from: filters.from,
+    order: filters.order ?? "desc",
+    page: 1,
+    pageSize: 100,
+    sort: filters.sort === "cost" || filters.sort === "tokens" ? filters.sort : "lastActivity",
+    to: filters.to,
+  };
+  copyDashboardFilters(filters, value);
+  if ("hasSubagents" in filters && filters.hasSubagents !== undefined) {
+    value.hasSubagents = filters.hasSubagents;
+  }
+  if (filters.query) value.query = filters.query;
+  return value;
+}
+
+function copyDashboardFilters(source: DashboardFilters, target: DashboardFilters) {
+  if (source.agentKind) target.agentKind = source.agentKind;
+  if (source.model) target.model = source.model;
+  if (source.models) target.models = source.models;
+  if (source.projectId) target.projectId = source.projectId;
 }
 
 function readAgentUsageRows(database: AppDatabase, filters: DashboardFilters): AgentUsageRow[] {
@@ -643,7 +807,7 @@ function upsertAlert(
   value: Pick<
     typeof alertEvents.$inferInsert,
     "message" | "periodStart" | "scopeKey" | "severity" | "title" | "type"
-  >,
+  > & { turnKey?: string | null },
 ) {
   const id = createHash("sha256")
     .update(`${value.type}\u0000${value.scopeKey}\u0000${value.periodStart}`)
@@ -657,6 +821,7 @@ function upsertAlert(
         message: value.message,
         severity: value.severity,
         title: value.title,
+        turnKey: value.turnKey ?? null,
       },
     })
     .run();
@@ -672,8 +837,13 @@ function toAlertEvent(value: typeof alertEvents.$inferSelect): AlertEvent {
     seenAt: value.seenAt ? new Date(value.seenAt).toISOString() : null,
     severity: value.severity as AlertEvent["severity"],
     title: value.title,
+    turnKey: value.turnKey,
     type: value.type as AlertEvent["type"],
   };
+}
+
+function shortId(value: string): string {
+  return value.length <= 10 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`;
 }
 
 function toCsv(rows: Record<string, unknown>[]): string {

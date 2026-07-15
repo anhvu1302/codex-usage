@@ -7,6 +7,7 @@ import {
   importDiagnostics,
   sessionAgents,
   sessions,
+  turnModelUsage,
   usageDailyRollups,
   usageEvents,
 } from "@/server/db/schema";
@@ -72,6 +73,7 @@ export function getActivity(database: AppDatabase, filters: ActivityFilters): Ac
       role: sessionAgents.role,
       sessionId: activityEvents.sessionId,
       timestamp: activityEvents.timestamp,
+      turnKey: activityEvents.turnKey,
     })
     .from(activityEvents)
     .leftJoin(sessionAgents, eq(sessionAgents.id, activityEvents.agentId))
@@ -145,6 +147,20 @@ export async function getDataHealth(
     .from(activityDailyRollups)
     .get();
   const retentionCoverage = getRetentionCoverage({ from: "0000-01-01", to: "9999-12-31" });
+  const turnCostGaps = database
+    .select({ count: sql<number>`coalesce(sum(${turnModelUsage.costAttributionMissingCount}), 0)` })
+    .from(turnModelUsage)
+    .get();
+  const turnUnassignedUsage = database
+    .select({ count: sql<number>`count(*)` })
+    .from(usageEvents)
+    .where(isNull(usageEvents.turnKey))
+    .get();
+  const turnUnassignedActivity = database
+    .select({ count: sql<number>`count(*)` })
+    .from(activityEvents)
+    .where(isNull(activityEvents.turnKey))
+    .get();
 
   return {
     activityDailyRows: toNumber(activityDaily?.count),
@@ -159,6 +175,10 @@ export async function getDataHealth(
     retentionError: storage.error,
     sourceDeletedAgents: toNumber(deletedAgents?.count),
     sourceDeletedSessions: toNumber(deletedSessions?.count),
+    turnBackfill: importStatus.turnBackfill,
+    turnCostAttributionGaps: toNumber(turnCostGaps?.count),
+    turnUnassignedActivity: toNumber(turnUnassignedActivity?.count),
+    turnUnassignedUsage: toNumber(turnUnassignedUsage?.count),
     unknownUsage: toNumber(unknownRaw?.count) + toNumber(unknownArchived?.count),
     unpricedUsage: toNumber(unpricedRaw?.count) + toNumber(unpricedArchived?.count),
   };
@@ -224,6 +244,7 @@ function toTimelineItem(row: {
   role: string | null;
   sessionId: string;
   timestamp: string;
+  turnKey: string | null;
 }): ActivityTimelineItem {
   return {
     agentId: row.agentId,
@@ -237,6 +258,7 @@ function toTimelineItem(row: {
     role: row.role,
     sessionId: row.sessionId,
     timestamp: row.timestamp,
+    turnKey: row.turnKey,
   };
 }
 

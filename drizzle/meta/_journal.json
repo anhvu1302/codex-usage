@@ -57,6 +57,20 @@
       "when": 1784107983820,
       "tag": "0007_repair_project_memberships",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1784118561093,
+      "tag": "0008_secret_wrecker",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1784120614611,
+      "tag": "0009_flowery_solo",
+      "breakpoints": true
     }
   ]
 }

@@ -3,7 +3,7 @@ import { appendFile, mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -12,6 +12,7 @@ import {
   getKnownModels,
   getModelRates,
   getSessions,
+  reconcileUnknownModels,
   upsertModelRate,
 } from "@/server/analytics";
 import { createApp } from "@/server/app";
@@ -25,6 +26,10 @@ import {
   importStates,
   sessionAgents,
   sessions,
+  turnActivityRollups,
+  turnBackfillState,
+  turnModelUsage,
+  turns,
   usageAgentDailyRollups,
   usageDailyRollups,
   usageEvents,
@@ -34,6 +39,7 @@ import {
 import { parseActivityRecord } from "@/server/activity-parser";
 import {
   calculateCost,
+  createTurnKey,
   normalizeTokenUsage,
   SessionImporter,
   toLocalDate,
@@ -97,6 +103,169 @@ describe("token usage parsing", () => {
 });
 
 describe("session importer", () => {
+  it("attributes explicit turns per canonical agent and derives cross-day lifecycle metrics", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-turns"),
+      tokenCount("2026-07-12T16:58:00.000Z", 10, 2, 1, 1),
+      taskStarted("shared-turn", "2026-07-12T16:59:00.000Z", 750),
+      turnContext("gpt-turn", "2026-07-12T16:59:01.000Z", "shared-turn"),
+      tokenCount("2026-07-12T17:01:00.000Z", 100, 80, 10, 4, undefined, "shared-turn"),
+      taskCompleted("shared-turn", "2026-07-12T17:02:00.000Z"),
+      taskCompleted("missing-turn", "2026-07-12T17:03:00.000Z"),
+    ]);
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-turns", {
+        agentId: "agent-turns",
+        depth: 1,
+        name: "Mapper",
+        parentThreadId: "session-turns",
+        threadSource: "subagent",
+      }),
+      taskStarted("shared-turn", "2026-07-12T17:04:00.000Z"),
+      turnContext("gpt-turn", "2026-07-12T17:04:01.000Z", "shared-turn"),
+      tokenCount("2026-07-12T17:04:02.000Z", 20, 10, 2, 1, undefined, "shared-turn"),
+      taskAborted("shared-turn", "2026-07-12T17:04:03.000Z"),
+    ]);
+
+    expect((await harness.importer.syncAll()).error).toBeNull();
+    const importedTurns = harness.database.select().from(turns).orderBy(turns.startedAt).all();
+    expect(importedTurns).toHaveLength(2);
+    expect(importedTurns.map((turn) => turn.id)).toEqual([
+      createTurnKey("session-turns", "shared-turn"),
+      createTurnKey("agent-turns", "shared-turn"),
+    ]);
+    expect(importedTurns[0]).toMatchObject({
+      durationMs: 180_000,
+      localDate: "2026-07-12",
+      status: "completed",
+      timeToFirstTokenMs: 750,
+    });
+    expect(importedTurns[1]).toMatchObject({
+      durationMs: 3_000,
+      status: "aborted",
+      timeToFirstTokenMs: null,
+    });
+    expect(
+      harness.database.select().from(turns).where(eq(turns.turnId, "missing-turn")).get(),
+    ).toBeUndefined();
+
+    const events = harness.database.select().from(usageEvents).orderBy(usageEvents.timestamp).all();
+    expect(events[0]?.turnKey).toBeNull();
+    expect(events.slice(1).map((event) => event.turnKey)).toEqual([
+      createTurnKey("session-turns", "shared-turn"),
+      createTurnKey("agent-turns", "shared-turn"),
+    ]);
+    expect(harness.database.select().from(turnModelUsage).all()).toHaveLength(2);
+    expect(
+      harness.database
+        .select()
+        .from(turnActivityRollups)
+        .where(eq(turnActivityRollups.kind, "task_completed"))
+        .all(),
+    ).toHaveLength(1);
+  });
+
+  it("rolls back attribution markers with aggregates and repairs safely on rescan", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-atomic-turn"),
+      taskStarted("turn-atomic", "2026-07-12T01:00:00.000Z"),
+      turnContext("gpt-atomic", "2026-07-12T01:00:00.100Z", "turn-atomic"),
+      tokenCount("2026-07-12T01:00:01.000Z", 100, 20, 10, 2),
+    ]);
+    harness.database.$client.exec(`
+      create trigger fail_turn_usage before insert on turn_model_usage
+      begin select raise(abort, 'forced turn aggregate failure'); end;
+    `);
+
+    expect((await harness.importer.syncAll()).error).toContain("forced turn aggregate failure");
+    expect(harness.database.select().from(usageEvents).get()).toMatchObject({
+      turnAttributionVersion: 0,
+      turnKey: null,
+    });
+    expect(harness.database.select().from(turnModelUsage).all()).toHaveLength(0);
+
+    harness.database.$client.exec("drop trigger fail_turn_usage");
+    expect((await harness.importer.syncAll()).error).toBeNull();
+    expect(harness.database.select().from(usageEvents).get()).toMatchObject({
+      turnAttributionVersion: 1,
+      turnKey: createTurnKey("session-atomic-turn", "turn-atomic"),
+    });
+    expect(harness.database.select().from(turnModelUsage).get()).toMatchObject({
+      requestCount: 1,
+      totalTokens: 110,
+    });
+    expect((await harness.importer.syncAll()).recordsInserted).toBe(0);
+    expect(harness.database.select().from(turnModelUsage).get()?.requestCount).toBe(1);
+  });
+
+  it("finishes a stale turn backfill marker after restart", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-stale-backfill"),
+      taskStarted("turn-stale-backfill", "2026-07-12T01:00:00.000Z"),
+      turnContext("gpt-stale", "2026-07-12T01:00:01.000Z", "turn-stale-backfill"),
+      tokenCount("2026-07-12T01:00:02.000Z", 10, 2, 1, 0),
+    ]);
+    await harness.importer.syncAll();
+    harness.database.update(turnBackfillState).set({ error: null, isRunning: true }).run();
+
+    const restarted = new SessionImporter(harness.database, harness.sessionsDirectory);
+    const status = await restarted.syncAll();
+
+    expect(status.error).toBeNull();
+    expect(status.turnBackfill).toMatchObject({
+      attributionVersion: 1,
+      isRunning: false,
+      sourceDeletedGaps: 0,
+    });
+
+    harness.database
+      .update(turnBackfillState)
+      .set({ error: "crash after final import state", isRunning: false })
+      .run();
+    const recovered = await new SessionImporter(
+      harness.database,
+      harness.sessionsDirectory,
+    ).syncAll();
+    expect(recovered.turnBackfill).toMatchObject({ error: null, isRunning: false });
+  });
+
+  it("records deleted-source gaps without blocking compaction and rescans restored files", async () => {
+    const harness = await createHarness();
+    const lines = [
+      sessionMeta("session-deleted-turn-source"),
+      tokenCount("2026-07-01T01:00:00.000Z", 30, 10, 5, 2),
+    ];
+    const source = await createSessionFile(harness.sessionsDirectory, lines);
+    await harness.importer.syncAll();
+    harness.database
+      .update(importStates)
+      .set({ turnAttributionVersion: 0 })
+      .where(eq(importStates.sourcePath, source))
+      .run();
+    await rm(source);
+
+    const deleted = await harness.importer.syncAll();
+    expect(deleted.turnBackfill.sourceDeletedGaps).toBe(1);
+    expect(harness.database.select().from(importStates).get()?.turnAttributionVersion).toBe(0);
+    expect(harness.database.select().from(usageEvents).get()?.turnAttributionVersion).toBe(1);
+    expect(() =>
+      compactUsage(harness.database, new Date("2026-09-01T00:00:00.000Z")),
+    ).not.toThrow();
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(0);
+    expect(harness.database.select().from(archivedUsageEventIds).all()).toHaveLength(1);
+
+    await writeFile(source, `${lines.join("\n")}\n`);
+    await harness.importer.syncFile(source);
+    const restored = harness.importer.getStatus();
+    expect(restored.error).toBeNull();
+    expect(restored.turnBackfill.sourceDeletedGaps).toBe(0);
+    expect(harness.database.select().from(importStates).get()?.turnAttributionVersion).toBe(1);
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(0);
+  });
+
   it("is idempotent, resumes a partial tail, and preserves history after source deletion", async () => {
     const harness = await createHarness();
     const source = await createSessionFile(harness.sessionsDirectory, [
@@ -700,6 +869,61 @@ describe("session importer", () => {
     );
   });
 
+  it("restores the last activity timestamp when attributing archived activity", async () => {
+    const harness = await createHarness();
+    const shellCall = activityCall("call-archived-late", "2026-05-01T01:00:05.000Z");
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-archived-activity"),
+      taskStarted("turn-archived-activity", "2026-05-01T01:00:00.000Z"),
+      turnContext("gpt-archived", "2026-05-01T01:00:01.000Z", "turn-archived-activity"),
+      tokenCount("2026-05-01T01:00:02.000Z", 10, 2, 1, 0),
+      shellCall,
+    ]);
+    await harness.importer.syncAll();
+    const turnKey = createTurnKey("session-archived-activity", "turn-archived-activity");
+    const parsedCall = parseActivityRecord(
+      JSON.parse(shellCall) as unknown,
+      "session-archived-activity",
+    );
+    if (!parsedCall) throw new Error("Expected archived shell activity metadata");
+    const activityId = createHash("sha256")
+      .update(`session-archived-activity\u0000${parsedCall.eventHash}`)
+      .digest("hex");
+
+    compactUsage(harness.database, new Date("2026-07-13T00:00:00.000Z"));
+    harness.database
+      .update(archivedActivityEventIds)
+      .set({ turnAttributionVersion: 0, turnKey: null })
+      .where(eq(archivedActivityEventIds.id, activityId))
+      .run();
+    harness.database
+      .delete(turnActivityRollups)
+      .where(and(eq(turnActivityRollups.turnKey, turnKey), eq(turnActivityRollups.kind, "shell")))
+      .run();
+    harness.database
+      .update(turns)
+      .set({ lastEventAt: "2026-05-01T01:00:02.000Z" })
+      .where(eq(turns.id, turnKey))
+      .run();
+    harness.database
+      .update(importStates)
+      .set({ lastOffset: 0, turnAttributionVersion: 0 })
+      .where(eq(importStates.sourcePath, source))
+      .run();
+
+    expect((await harness.importer.syncAll()).error).toBeNull();
+    expect(harness.database.select().from(turns).where(eq(turns.id, turnKey)).get()).toMatchObject({
+      lastEventAt: "2026-05-01T01:00:05.000Z",
+    });
+    expect(
+      harness.database
+        .select()
+        .from(turnActivityRollups)
+        .where(and(eq(turnActivityRollups.turnKey, turnKey), eq(turnActivityRollups.kind, "shell")))
+        .get(),
+    ).toMatchObject({ eventCount: 1 });
+  });
+
   it("uses the newest Codex session-index title instead of a prompt-derived fallback", async () => {
     const harness = await createHarness();
     await createSessionFile(harness.sessionsDirectory, [
@@ -1209,6 +1433,17 @@ describe("session importer", () => {
         .get(),
     ).toMatchObject({ cachedInputTokens: 6, model: "gpt-large", totalTokens: 33 });
 
+    await appendFile(
+      source,
+      `${[
+        taskStarted("turn-large-patch", "2026-07-12T03:00:05.100Z"),
+        turnContext("gpt-large", "2026-07-12T03:00:05.200Z", "turn-large-patch"),
+        taskStarted("turn-active-after-patch", "2026-07-12T03:00:05.300Z"),
+        turnContext("gpt-large", "2026-07-12T03:00:05.400Z", "turn-active-after-patch"),
+      ].join("\n")}\n`,
+    );
+    await harness.importer.syncAll();
+
     const largePatch = JSON.stringify({
       timestamp: "2026-07-12T03:00:06.000Z",
       type: "event_msg",
@@ -1235,7 +1470,11 @@ describe("session importer", () => {
         .from(activityEvents)
         .where(eq(activityEvents.id, projectedPatchId))
         .get(),
-    ).toMatchObject({ kind: "patch", timestamp: "2026-07-12T03:00:06.000Z" });
+    ).toMatchObject({
+      kind: "patch",
+      timestamp: "2026-07-12T03:00:06.000Z",
+      turnKey: createTurnKey("session-large-compaction", "turn-large-patch"),
+    });
     expect(
       harness.database.select().from(importStates).where(eq(importStates.sourcePath, source)).get()
         ?.lastOffset,
@@ -1330,6 +1569,41 @@ describe("session importer", () => {
     expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
   });
 
+  it("reconciles unknown models within the same canonical agent", async () => {
+    const harness = await createHarness();
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-agent-model"),
+      turnContext("gpt-main", "2026-07-12T02:59:00.000Z"),
+      tokenCount("2026-07-12T03:00:00.000Z", 100, 20, 10, 4),
+      tokenCount("2026-07-12T04:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-agent-model", {
+        agentId: "agent-model-child",
+        depth: 1,
+        parentThreadId: "session-agent-model",
+        threadSource: "subagent",
+      }),
+      turnContext("gpt-subagent", "2026-07-12T04:00:00.500Z"),
+      tokenCount("2026-07-12T04:00:01.000Z", 100, 20, 10, 4),
+    ]);
+    await harness.importer.syncAll();
+    harness.database
+      .update(usageEvents)
+      .set({ model: "unknown" })
+      .where(eq(usageEvents.timestamp, "2026-07-12T04:00:00.000Z"))
+      .run();
+
+    expect(reconcileUnknownModels(harness.database)).toBe(1);
+    expect(
+      harness.database
+        .select({ agentId: usageEvents.agentId, model: usageEvents.model })
+        .from(usageEvents)
+        .where(eq(usageEvents.timestamp, "2026-07-12T04:00:00.000Z"))
+        .get(),
+    ).toEqual({ agentId: "session-agent-model", model: "gpt-main" });
+  });
+
   it("reclassifies an inferred model and backfills its existing rate during sync", async () => {
     const harness = await createHarness();
     upsertModelRate(harness.database, {
@@ -1340,7 +1614,7 @@ describe("session importer", () => {
     });
     await createSessionFile(harness.sessionsDirectory, [
       sessionMeta("session-reconciled"),
-      turnContext("gpt-reconciled"),
+      turnContext("gpt-reconciled", "2026-07-12T03:59:00.000Z", "turn-reconciled"),
       tokenCount("2026-07-12T04:00:00.000Z", 100, 20, 10, 4),
       tokenCount("2026-07-12T04:01:00.000Z", 100, 20, 10, 4),
     ]);
@@ -1356,6 +1630,39 @@ describe("session importer", () => {
       })
       .where(eq(usageEvents.timestamp, "2026-07-12T04:00:00.000Z"))
       .run();
+    const turnKey = createTurnKey("session-reconciled", "turn-reconciled");
+    harness.database
+      .update(turnModelUsage)
+      .set({
+        cachedInputTokens: 20,
+        costUsd: 0.00021,
+        inputTokens: 100,
+        outputTokens: 10,
+        reasoningOutputTokens: 4,
+        requestCount: 1,
+        totalTokens: 110,
+      })
+      .where(eq(turnModelUsage.turnKey, turnKey))
+      .run();
+    harness.database
+      .insert(turnModelUsage)
+      .values({
+        cachedInputTokens: 20,
+        costAttributionMissingCount: 0,
+        costUsd: 0,
+        inputTokens: 100,
+        model: "unknown",
+        outputTokens: 10,
+        reasoningOutputTokens: 4,
+        requestCount: 1,
+        totalTokens: 110,
+        turnKey,
+        unpricedCachedInputTokens: 20,
+        unpricedInputTokens: 100,
+        unpricedOutputTokens: 10,
+        unpricedUsageCount: 1,
+      })
+      .run();
 
     const status = await harness.importer.syncAll();
     const event = harness.database
@@ -1363,8 +1670,23 @@ describe("session importer", () => {
       .from(usageEvents)
       .where(eq(usageEvents.sessionId, "session-reconciled"))
       .get();
-    expect(status).toMatchObject({ recordsBackfilled: 1, recordsReclassified: 1 });
+    expect(status).toMatchObject({ recordsBackfilled: 2, recordsReclassified: 1 });
     expect(event).toMatchObject({ costUsd: 0.00021, model: "gpt-reconciled" });
+    expect(
+      harness.database
+        .select()
+        .from(turnModelUsage)
+        .where(eq(turnModelUsage.turnKey, turnKey))
+        .all(),
+    ).toEqual([
+      expect.objectContaining({
+        costUsd: 0.00042,
+        model: "gpt-reconciled",
+        requestCount: 2,
+        totalTokens: 220,
+        unpricedUsageCount: 0,
+      }),
+    ]);
   });
 });
 
@@ -1454,9 +1776,30 @@ function turnContext(
   });
 }
 
-function taskStarted(turnId: string, timestamp: string): string {
+function taskStarted(turnId: string, timestamp: string, timeToFirstTokenMs?: number): string {
   return JSON.stringify({
-    payload: { started_at: timestamp, turn_id: turnId, type: "task_started" },
+    payload: {
+      started_at: timestamp,
+      ...(timeToFirstTokenMs === undefined ? {} : { time_to_first_token_ms: timeToFirstTokenMs }),
+      turn_id: turnId,
+      type: "task_started",
+    },
+    timestamp,
+    type: "event_msg",
+  });
+}
+
+function taskCompleted(turnId: string, timestamp: string): string {
+  return JSON.stringify({
+    payload: { completed_at: timestamp, turn_id: turnId, type: "task_complete" },
+    timestamp,
+    type: "event_msg",
+  });
+}
+
+function taskAborted(turnId: string, timestamp: string): string {
+  return JSON.stringify({
+    payload: { completed_at: timestamp, turn_id: turnId, type: "turn_aborted" },
     timestamp,
     type: "event_msg",
   });
@@ -1485,9 +1828,11 @@ function tokenCount(
   output: number,
   reasoning: number,
   cumulativeUsage?: { cached: number; input: number; output: number; reasoning: number },
+  turnId?: string,
 ): string {
   return JSON.stringify({
     payload: {
+      ...(turnId ? { turn_id: turnId } : {}),
       info: {
         ...(cumulativeUsage
           ? {

@@ -21,6 +21,7 @@ import { toast } from "sonner";
 import type {
   AgentFilters,
   AlertEvent,
+  AlertsResponse,
   BudgetPeriod,
   BudgetSetting,
   DashboardFilters,
@@ -28,6 +29,7 @@ import type {
   PricingSimulationRequest,
   PricingSimulationResponse,
   SessionFilters,
+  TurnFilters,
 } from "@/shared/types";
 import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
@@ -57,7 +59,7 @@ import {
 } from "@/web/components/ui/sheet";
 import { Skeleton } from "@/web/components/ui/skeleton";
 
-type ExportDataset = "agents" | "models" | "projects" | "sessions";
+type ExportDataset = "agents" | "models" | "projects" | "sessions" | "turns";
 type ExportFormat = "csv" | "json";
 
 type RateDraft = {
@@ -72,7 +74,9 @@ const exportLabels: Record<ExportDataset, string> = {
   models: "Model",
   projects: "Dự án",
   sessions: "Phiên",
+  turns: "Turns",
 };
+const allExportDatasets = Object.keys(exportLabels) as ExportDataset[];
 
 export function NotificationCenter() {
   const [open, setOpen] = useState(false);
@@ -90,7 +94,7 @@ export function NotificationCenter() {
       if (variables.action === "dismiss") toast.success("Đã ẩn thông báo.");
     },
   });
-  const unseen = (alerts.data?.alerts ?? []).filter((alert) => alert.seenAt === null).length;
+  const unseen = alerts.data?.unseenCount ?? 0;
 
   return (
     <Sheet open={open} onOpenChange={setOpen}>
@@ -100,7 +104,7 @@ export function NotificationCenter() {
           variant="ghost"
           size="icon"
           className="relative"
-          aria-label={unseen > 0 ? `${unseen} thông báo chưa đọc` : "Thông báo"}
+          aria-label={unseen > 0 ? `Thông báo: ${unseen} chưa đọc` : "Thông báo"}
         >
           {unseen > 0 ? (
             <BellRing className="size-4" aria-hidden="true" />
@@ -121,7 +125,8 @@ export function NotificationCenter() {
             Trung tâm thông báo
           </SheetTitle>
           <SheetDescription>
-            Cảnh báo budget, usage bất thường và sức khoẻ dữ liệu chỉ hiển thị trong app.
+            Cảnh báo budget, usage bất thường, context pressure và sức khoẻ dữ liệu chỉ hiển thị
+            trong app.
           </SheetDescription>
         </SheetHeader>
 
@@ -156,6 +161,13 @@ export function NotificationCenter() {
                 ) : null}
               </div>
               <div className="mt-3 flex flex-wrap justify-end gap-2">
+                {alert.turnKey ? (
+                  <Button asChild size="sm" variant="outline">
+                    <Link to={`/turns/${alert.turnKey}`} onClick={() => setOpen(false)}>
+                      Xem turn
+                    </Link>
+                  </Button>
+                ) : null}
                 {alert.seenAt === null ? (
                   <Button
                     type="button"
@@ -577,10 +589,16 @@ function ResultMetric({
   );
 }
 
-type ExportFilters = AgentFilters & SessionFilters;
+type ExportFilters = (AgentFilters & SessionFilters) | TurnFilters;
 
-export function ExportActions({ filters }: { filters: ExportFilters }) {
-  const [dataset, setDataset] = useState<ExportDataset>("models");
+export function ExportActions({
+  datasets = allExportDatasets,
+  filters,
+}: {
+  datasets?: ExportDataset[];
+  filters: ExportFilters;
+}) {
+  const [dataset, setDataset] = useState<ExportDataset>(datasets.at(0) ?? "models");
   const [format, setFormat] = useState<ExportFormat>("csv");
   const [isExporting, setIsExporting] = useState(false);
 
@@ -616,13 +634,11 @@ export function ExportActions({ filters }: { filters: ExportFilters }) {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {(Object.entries(exportLabels) as [ExportDataset, string][]).map(
-                  ([value, label]) => (
-                    <SelectItem key={value} value={value}>
-                      {label}
-                    </SelectItem>
-                  ),
-                )}
+                {datasets.map((value) => (
+                  <SelectItem key={value} value={value}>
+                    {exportDatasetLabel(value)}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>
@@ -728,6 +744,8 @@ function exportDatasetLabel(dataset: ExportDataset) {
       return exportLabels.projects;
     case "sessions":
       return exportLabels.sessions;
+    case "turns":
+      return exportLabels.turns;
   }
 }
 
@@ -818,7 +836,7 @@ function formatUsd(value: number) {
   }).format(value);
 }
 
-function dashboardQuery(filters: ExportFilters) {
+function dashboardQuery(dataset: ExportDataset, filters: ExportFilters) {
   const query = new URLSearchParams({ from: filters.from, to: filters.to });
   const models = filters.models?.length ? filters.models : filters.model ? [filters.model] : [];
   if (models.length > 0) query.set("models", models.join(","));
@@ -826,19 +844,30 @@ function dashboardQuery(filters: ExportFilters) {
   if (filters.agentKind && filters.agentKind !== "all") {
     query.set("agentKind", filters.agentKind);
   }
-  if (filters.depth !== undefined) query.set("depth", String(filters.depth));
-  if (filters.role) query.set("role", filters.role);
-  if (filters.hasSubagents !== undefined) {
+  if ("depth" in filters && filters.depth !== undefined) query.set("depth", String(filters.depth));
+  if ("role" in filters && filters.role) query.set("role", filters.role);
+  if ("hasSubagents" in filters && filters.hasSubagents !== undefined) {
     query.set("hasSubagents", String(filters.hasSubagents));
   }
   if (filters.query) query.set("q", filters.query);
   if (filters.order) query.set("order", filters.order);
-  if (filters.sort) query.set("sort", filters.sort);
+  if (dataset === "turns" && filters.sort) query.set("sort", filters.sort);
+  if (
+    dataset === "sessions" &&
+    (filters.sort === "cost" || filters.sort === "lastActivity" || filters.sort === "tokens")
+  ) {
+    query.set("sort", filters.sort);
+  }
+  if ("agentId" in filters && filters.agentId) query.set("agent", filters.agentId);
+  if ("effort" in filters && filters.effort) query.set("effort", filters.effort);
+  if ("pressure" in filters && filters.pressure) query.set("pressure", filters.pressure);
+  if ("sessionId" in filters && filters.sessionId) query.set("session", filters.sessionId);
+  if ("status" in filters && filters.status) query.set("status", filters.status);
   return query;
 }
 
 async function fetchAlerts() {
-  return request<{ alerts: AlertEvent[] }>("/api/alerts");
+  return request<AlertsResponse>("/api/alerts");
 }
 
 async function updateAlert({ action, id }: { action: "dismiss" | "seen"; id: string }) {
@@ -879,7 +908,7 @@ async function downloadExport(
   format: ExportFormat,
   filters: ExportFilters,
 ) {
-  const query = dashboardQuery(filters);
+  const query = dashboardQuery(dataset, filters);
   query.set("dataset", dataset);
   query.set("format", format);
   const response = await fetch(`/api/export?${query.toString()}`);

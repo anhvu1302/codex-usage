@@ -5,6 +5,7 @@ import { and, eq, lt, sql } from "drizzle-orm";
 
 import type { AppDatabase } from "@/server/db/client";
 import { reclaimDatabaseSpace } from "@/server/db/client";
+import { TURN_ATTRIBUTION_VERSION } from "@/server/turn-constants";
 import {
   activityDailyRollups,
   activityEvents,
@@ -185,6 +186,29 @@ export class RetentionService {
 export function compactUsage(database: AppDatabase, now: Date): CompactionResult {
   const { hourlyFrom, rawFrom } = getRetentionCutoffs(now);
   const archivedAt = now.getTime();
+  const unattributedUsage = database
+    .select({ count: sql<number>`count(*)` })
+    .from(usageEvents)
+    .where(
+      and(
+        lt(usageEvents.localDate, rawFrom),
+        sql`${usageEvents.turnAttributionVersion} != ${TURN_ATTRIBUTION_VERSION}`,
+      ),
+    )
+    .get();
+  const unattributedActivity = database
+    .select({ count: sql<number>`count(*)` })
+    .from(activityEvents)
+    .where(
+      and(
+        lt(activityEvents.localDate, rawFrom),
+        sql`${activityEvents.turnAttributionVersion} != ${TURN_ATTRIBUTION_VERSION}`,
+      ),
+    )
+    .get();
+  if (toNumber(unattributedUsage?.count) + toNumber(unattributedActivity?.count) > 0) {
+    throw new Error("Turn attribution backfill must finish before retention compaction");
+  }
 
   return database.transaction((transaction) => {
     const hourlyWrite = transaction.run(sql`
@@ -371,14 +395,20 @@ export function compactUsage(database: AppDatabase, now: Date): CompactionResult
       where ${usageEvents.localDate} < ${rawFrom}
     `);
     transaction.run(sql`
-      insert or ignore into ${archivedUsageEventIds} (id, archived_at)
-      select ${usageEvents.id}, ${archivedAt}
+      insert or ignore into ${archivedUsageEventIds}
+        (id, archived_at, turn_key, turn_attribution_version)
+      select
+        ${usageEvents.id}, ${archivedAt}, ${usageEvents.turnKey},
+        ${usageEvents.turnAttributionVersion}
       from ${usageEvents}
       where ${usageEvents.localDate} < ${rawFrom}
     `);
     transaction.run(sql`
-      insert or ignore into ${archivedActivityEventIds} (id, archived_at)
-      select ${activityEvents.id}, ${archivedAt}
+      insert or ignore into ${archivedActivityEventIds}
+        (id, archived_at, turn_key, turn_attribution_version)
+      select
+        ${activityEvents.id}, ${archivedAt}, ${activityEvents.turnKey},
+        ${activityEvents.turnAttributionVersion}
       from ${activityEvents}
       where ${activityEvents.localDate} < ${rawFrom}
     `);
