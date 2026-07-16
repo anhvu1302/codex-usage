@@ -116,6 +116,18 @@ html[data-density="compact"] td {
   display: none;
 }
 
+.deferred-section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 480px;
+}
+
+@media print {
+  .deferred-section {
+    content-visibility: visible;
+    contain-intrinsic-size: none;
+  }
+}
+
 @keyframes reveal-rise {
   from {
     opacity: 0;

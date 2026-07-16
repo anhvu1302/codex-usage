@@ -95,16 +95,24 @@ export function medianAbsoluteDeviation(values: readonly number[]): number | nul
 }
 
 export function isUsageAnomaly(currentValue: number, baselineValues: readonly number[]): boolean {
-  if (!Number.isFinite(currentValue) || currentValue < 0) return false;
+  return createUsageAnomalyDetector(baselineValues)(currentValue);
+}
 
+export function createUsageAnomalyDetector(
+  baselineValues: readonly number[],
+): (currentValue: number) => boolean {
   const baseline = baselineValues.filter((value) => Number.isFinite(value) && value >= 0);
-  if (baseline.length < 3) return false;
+  if (baseline.length < 3) return () => false;
 
   const center = median(baseline);
   const deviation = medianAbsoluteDeviation(baseline);
-  if (center === null || deviation === null) return false;
+  if (center === null || deviation === null) return () => false;
 
-  return currentValue > center * 2 && currentValue > center + deviation * 3;
+  return (currentValue) =>
+    Number.isFinite(currentValue) &&
+    currentValue >= 0 &&
+    currentValue > center * 2 &&
+    currentValue > center + deviation * 3;
 }
 
 export function normalizeProjectPath(

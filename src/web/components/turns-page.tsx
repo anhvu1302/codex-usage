@@ -14,13 +14,12 @@ import {
   Timer,
   Workflow,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router";
-import { Bar, BarChart, CartesianGrid, Line, LineChart, Tooltip, XAxis, YAxis } from "recharts";
 
 import { MetricCard } from "@/web/components/metric-card";
 import { ProductFilterBar } from "@/web/components/product-filter-bar";
-import { ExportActions } from "@/web/components/product-tools";
+import { ExportActions } from "@/web/components/export-actions";
 import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
 import {
@@ -30,7 +29,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/web/components/ui/card";
-import { ChartContainer, type ChartConfig } from "@/web/components/ui/chart";
 import { Input } from "@/web/components/ui/input";
 import {
   Select,
@@ -57,13 +55,7 @@ import {
 } from "@/web/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/web/components/ui/tabs";
 import { fetchModels } from "@/web/lib/api";
-import {
-  compactTokens,
-  fetchProjects,
-  formatPercent,
-  formatTokens,
-  formatUsd,
-} from "@/web/lib/product-api";
+import { fetchProjectOptions, formatPercent, formatTokens, formatUsd } from "@/web/lib/product-api";
 import {
   fetchTurnComparison,
   fetchTurnDetail,
@@ -71,6 +63,8 @@ import {
   turnFiltersFromSearch,
   updateTurnSearch,
 } from "@/web/lib/turns-api";
+import { useLiveEventsFallbackActive } from "@/web/lib/live-events";
+import { useMediaQuery } from "@/web/lib/use-media-query";
 import { cn } from "@/web/lib/utils";
 import type {
   AgentFilters,
@@ -83,13 +77,16 @@ import type {
 type TrendMetric = "cost" | "tokens" | "turns";
 type VisibleColumn = "cache" | "context" | "cost" | "duration" | "model" | "status";
 
-const trendConfig = {
-  value: { color: "var(--chart-1)", label: "Giá trị" },
-} satisfies ChartConfig;
-
-const contextConfig = {
-  count: { color: "var(--chart-4)", label: "Turns" },
-} satisfies ChartConfig;
+const TurnTrendChart = lazy(async () => ({
+  default: (await import("@/web/components/turn-charts")).TurnTrendChart,
+}));
+const ContextBucketsChart = lazy(async () => ({
+  default: (await import("@/web/components/turn-charts")).ContextBucketsChart,
+}));
+const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("vi-VN", {
+  dateStyle: "short",
+  timeStyle: "short",
+});
 
 const defaultColumns = new Set<VisibleColumn>([
   "cache",
@@ -101,6 +98,8 @@ const defaultColumns = new Set<VisibleColumn>([
 ]);
 
 export function TurnsPage() {
+  const liveEventsFallbackActive = useLiveEventsFallbackActive();
+  const desktopTurns = useMediaQuery("(min-width: 1024px)");
   const [search, setSearch] = useSearchParams();
   const navigate = useNavigate();
   const { "*": turnPath } = useParams<{ "*": string }>();
@@ -117,31 +116,40 @@ export function TurnsPage() {
   const [selected, setSelected] = useState<string[]>(compareIds);
   const [trendMetric, setTrendMetric] = useState<TrendMetric>("tokens");
   const [columns, setColumns] = useState<Set<VisibleColumn>>(() => new Set(defaultColumns));
-  const models = useQuery({ queryKey: ["models"], queryFn: fetchModels });
+  const models = useQuery({
+    queryKey: ["models"],
+    queryFn: ({ signal }) => fetchModels(signal),
+    staleTime: 5 * 60_000,
+  });
   const projectFilters = useMemo(() => {
     const next = { from: filters.from, to: filters.to };
     return next;
   }, [filters.from, filters.to]);
   const projects = useQuery({
-    queryKey: ["projects", "turn-options", projectFilters],
-    queryFn: () => fetchProjects(projectFilters),
+    queryKey: ["projects", "options", projectFilters],
+    queryFn: ({ signal }) => fetchProjectOptions(projectFilters, signal),
+    staleTime: 5 * 60_000,
   });
   const turns = useQuery({
     queryKey: ["turns", filters],
-    queryFn: () => fetchTurns(filters),
+    queryFn: ({ signal }) => fetchTurns(filters, signal),
+    staleTime: 30_000,
     refetchInterval: (query) =>
-      visible && query.state.data?.liveRefreshSuggested === true ? 5_000 : false,
+      liveEventsFallbackActive && visible && query.state.data?.liveRefreshSuggested === true
+        ? 5_000
+        : false,
   });
   const detail = useQuery({
     enabled: Boolean(turnKey),
     queryKey: ["turn", turnKey],
-    queryFn: () => fetchTurnDetail(turnKey ?? ""),
-    refetchInterval: visible && turns.data?.liveRefreshSuggested ? 5_000 : false,
+    queryFn: ({ signal }) => fetchTurnDetail(turnKey ?? "", signal),
+    refetchInterval:
+      liveEventsFallbackActive && visible && turns.data?.liveRefreshSuggested ? 5_000 : false,
   });
   const comparison = useQuery({
     enabled: isCompareRoute && compareIds.length >= 2,
     queryKey: ["turns", "compare", compareIds],
-    queryFn: () => fetchTurnComparison(compareIds),
+    queryFn: ({ signal }) => fetchTurnComparison(compareIds, signal),
   });
 
   function applyFilters(next: TurnFilters) {
@@ -263,11 +271,13 @@ export function TurnsPage() {
             {turns.isLoading ? (
               <Skeleton className="h-72" />
             ) : (
-              <TurnTrend
-                costCoverage={turns.data?.kpis.costCoverage ?? "unavailable"}
-                data={turns.data?.daily ?? []}
-                metric={trendMetric}
-              />
+              <Suspense fallback={<Skeleton className="h-72" />}>
+                <TurnTrendChart
+                  costCoverage={turns.data?.kpis.costCoverage ?? "unavailable"}
+                  data={turns.data?.daily ?? []}
+                  metric={trendMetric}
+                />
+              </Suspense>
             )}
           </CardContent>
         </Card>
@@ -280,7 +290,9 @@ export function TurnsPage() {
             {turns.isLoading ? (
               <Skeleton className="h-72" />
             ) : (
-              <ContextBuckets data={turns.data?.contextBuckets ?? []} />
+              <Suspense fallback={<Skeleton className="h-72" />}>
+                <ContextBucketsChart data={turns.data?.contextBuckets ?? []} />
+              </Suspense>
             )}
           </CardContent>
         </Card>
@@ -288,6 +300,7 @@ export function TurnsPage() {
 
       <TurnList
         columns={columns}
+        desktop={desktopTurns}
         filters={filters}
         loading={turns.isLoading}
         onColumnsChange={setColumns}
@@ -334,17 +347,15 @@ function AdvancedFilters({
   return (
     <Card>
       <CardContent className="flex flex-wrap items-center gap-2 p-3">
-        <div className="relative min-w-56 flex-1">
-          <Search className="text-muted-foreground pointer-events-none absolute top-2.5 left-3 size-4" />
-          <Input
-            aria-label="Tìm turn"
-            className="pl-9"
-            maxLength={200}
-            placeholder="Task, session, turn ID hoặc agent"
-            value={filters.query ?? ""}
-            onChange={(event) => onChange(setFilter(filters, "query", event.target.value))}
-          />
-        </div>
+        <DebouncedTurnTextFilters
+          key={`${filters.query ?? ""}\u0000${filters.effort ?? ""}`}
+          initialEffort={filters.effort ?? ""}
+          initialQuery={filters.query ?? ""}
+          onCommit={(query, effort) => {
+            const withQuery = setFilter(filters, "query", query);
+            onChange(setFilter(withQuery, "effort", effort));
+          }}
+        />
         <Select
           value={filters.status ?? "all"}
           onValueChange={(value) => onChange(setFilter(filters, "status", value))}
@@ -359,14 +370,6 @@ function AdvancedFilters({
             <SelectItem value="unknown">Không rõ</SelectItem>
           </SelectContent>
         </Select>
-        <Input
-          aria-label="Reasoning effort"
-          className="w-40"
-          maxLength={60}
-          placeholder="Effort"
-          value={filters.effort ?? ""}
-          onChange={(event) => onChange(setFilter(filters, "effort", event.target.value))}
-        />
         <Select
           value={filters.pressure ?? "all"}
           onValueChange={(value) => onChange(setFilter(filters, "pressure", value))}
@@ -421,6 +424,51 @@ function AdvancedFilters({
   );
 }
 
+function DebouncedTurnTextFilters({
+  initialEffort,
+  initialQuery,
+  onCommit,
+}: {
+  initialEffort: string;
+  initialQuery: string;
+  onCommit: (query: string, effort: string) => void;
+}) {
+  const [queryDraft, setQueryDraft] = useState(initialQuery);
+  const [effortDraft, setEffortDraft] = useState(initialEffort);
+  const commit = useEffectEvent(onCommit);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const query = queryDraft.trim();
+      const effort = effortDraft.trim();
+      if (query !== initialQuery || effort !== initialEffort) commit(query, effort);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [effortDraft, initialEffort, initialQuery, queryDraft]);
+  return (
+    <>
+      <div className="relative min-w-56 flex-1">
+        <Search className="text-muted-foreground pointer-events-none absolute top-2.5 left-3 size-4" />
+        <Input
+          aria-label="Tìm turn"
+          className="pl-9"
+          maxLength={200}
+          placeholder="Task, session, turn ID hoặc agent"
+          value={queryDraft}
+          onChange={(event) => setQueryDraft(event.target.value)}
+        />
+      </div>
+      <Input
+        aria-label="Reasoning effort"
+        className="w-40"
+        maxLength={60}
+        placeholder="Effort"
+        value={effortDraft}
+        onChange={(event) => setEffortDraft(event.target.value)}
+      />
+    </>
+  );
+}
+
 function TurnKpiGrid({
   loading,
   response,
@@ -430,7 +478,7 @@ function TurnKpiGrid({
 }) {
   if (loading && !response) {
     return (
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+      <div className="grid gap-3 min-[360px]:grid-cols-2 sm:gap-4 xl:grid-cols-6">
         {Array.from({ length: 6 }, (_, index) => (
           <Skeleton key={index} className="h-28" />
         ))}
@@ -439,7 +487,10 @@ function TurnKpiGrid({
   }
   const kpis = response?.kpis;
   return (
-    <section aria-label="KPI turns" className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+    <section
+      aria-label="KPI turns"
+      className="grid gap-3 min-[360px]:grid-cols-2 sm:gap-4 xl:grid-cols-6"
+    >
       <h2 className="sr-only">Chỉ số turns</h2>
       <MetricCard
         icon={<ListChecks className="size-4" />}
@@ -504,139 +555,9 @@ function MetricToggle({
   );
 }
 
-function TurnTrend({
-  costCoverage,
-  data,
-  metric,
-}: {
-  costCoverage: TurnCostCoverage;
-  data: Awaited<ReturnType<typeof fetchTurns>>["daily"];
-  metric: TrendMetric;
-}) {
-  const values = data.map((item) => ({
-    date: item.date.slice(5),
-    value:
-      metric === "tokens"
-        ? item.totalTokens
-        : metric === "cost"
-          ? item.estimatedCostUsd
-          : item.turnCount,
-  }));
-  if (values.length === 0) return <EmptyState message="Chưa có turn trong khoảng đã chọn." />;
-  return (
-    <div className="space-y-3">
-      {metric === "cost" && costCoverage !== "exact" ? (
-        <CoverageNotice
-          message={
-            costCoverage === "partial"
-              ? "Cost trend chỉ gồm phần có price snapshot; đây không phải tổng cost đầy đủ."
-              : "Cost của range này chưa có price snapshot nên không được xem là $0 chính xác."
-          }
-        />
-      ) : null}
-      <ChartContainer
-        aria-label={`Biểu đồ ${metric} theo ngày bắt đầu`}
-        config={trendConfig}
-        role="img"
-      >
-        <LineChart accessibilityLayer data={values}>
-          <CartesianGrid strokeDasharray="3 3" vertical={false} />
-          <XAxis dataKey="date" tickLine={false} />
-          <YAxis
-            tickFormatter={(value: number) =>
-              metric === "cost" ? `$${value}` : compactTokens(value)
-            }
-            tickLine={false}
-            width={64}
-          />
-          <Tooltip
-            formatter={(value) =>
-              metric === "cost" ? formatUsd(Number(value)) : formatTokens(Number(value))
-            }
-          />
-          <Line
-            dataKey="value"
-            dot={values.length < 16}
-            stroke="var(--color-value)"
-            strokeWidth={2.5}
-            type="monotone"
-          />
-        </LineChart>
-      </ChartContainer>
-      <table className="sr-only">
-        <caption>Dữ liệu {metric} theo ngày bắt đầu của turn</caption>
-        <thead>
-          <tr>
-            <th>Ngày</th>
-            <th>Giá trị</th>
-            <th>Cost coverage</th>
-          </tr>
-        </thead>
-        <tbody>
-          {data.map((item) => (
-            <tr key={item.date}>
-              <td>{item.date}</td>
-              <td>
-                {metric === "tokens"
-                  ? item.totalTokens
-                  : metric === "cost"
-                    ? item.estimatedCostUsd
-                    : item.turnCount}
-              </td>
-              <td>{coverageLabel(item.costCoverage)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function ContextBuckets({
-  data,
-}: {
-  data: Awaited<ReturnType<typeof fetchTurns>>["contextBuckets"];
-}) {
-  if (data.every((item) => item.count === 0))
-    return <EmptyState message="Chưa có metadata context." />;
-  return (
-    <>
-      <ChartContainer
-        aria-label="Phân bố context pressure của turn"
-        config={contextConfig}
-        role="img"
-      >
-        <BarChart accessibilityLayer data={data} layout="vertical" margin={{ left: 18 }}>
-          <CartesianGrid horizontal={false} strokeDasharray="3 3" />
-          <XAxis allowDecimals={false} type="number" />
-          <YAxis dataKey="label" tickLine={false} type="category" width={112} />
-          <Tooltip formatter={(value) => [`${formatTokens(Number(value))} turn`, "Số lượng"]} />
-          <Bar dataKey="count" fill="var(--color-count)" radius={[0, 5, 5, 0]} />
-        </BarChart>
-      </ChartContainer>
-      <table className="sr-only">
-        <caption>Dữ liệu phân bố context pressure của turn</caption>
-        <thead>
-          <tr>
-            <th>Nhóm context</th>
-            <th>Số turn</th>
-          </tr>
-        </thead>
-        <tbody>
-          {data.map((item) => (
-            <tr key={item.id}>
-              <td>{item.label}</td>
-              <td>{item.count}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </>
-  );
-}
-
 function TurnList({
   columns,
+  desktop,
   filters,
   loading,
   onColumnsChange,
@@ -648,6 +569,7 @@ function TurnList({
   turns,
 }: {
   columns: Set<VisibleColumn>;
+  desktop: boolean;
   filters: TurnFilters;
   loading: boolean;
   onColumnsChange: (columns: Set<VisibleColumn>) => void;
@@ -659,7 +581,7 @@ function TurnList({
   turns: TurnSummary[];
 }) {
   return (
-    <Card className="overflow-hidden">
+    <Card className="deferred-section overflow-hidden">
       <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 space-y-0">
         <div>
           <CardTitle>Danh sách turns</CardTitle>
@@ -700,132 +622,135 @@ function TurnList({
         ) : null}
         {turns.length > 0 ? (
           <>
-            <div className="hidden lg:block">
-              <Table scrollLabel="Danh sách turns">
-                <TableHeader className="bg-card sticky top-0 z-10">
-                  <TableRow>
-                    <TableHead className="w-12">
-                      <span className="sr-only">Chọn</span>
-                    </TableHead>
-                    <TableHead>Turn</TableHead>
-                    {columns.has("model") ? <TableHead>Model</TableHead> : null}
-                    <TableHead className="text-right">Token</TableHead>
-                    {columns.has("cache") ? (
-                      <TableHead className="text-right">Cache</TableHead>
-                    ) : null}
-                    {columns.has("context") ? (
-                      <TableHead className="text-right">Context</TableHead>
-                    ) : null}
-                    {columns.has("duration") ? (
-                      <TableHead className="text-right">Duration</TableHead>
-                    ) : null}
-                    {columns.has("cost") ? (
-                      <TableHead className="text-right">Cost</TableHead>
-                    ) : null}
-                    {columns.has("status") ? <TableHead>Trạng thái</TableHead> : null}
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {turns.map((turn) => (
-                    <TableRow key={turn.turnKey}>
-                      <TableCell>
-                        <CompareButton
-                          disabled={!selected.includes(turn.turnKey) && selected.length >= 4}
-                          selected={selected.includes(turn.turnKey)}
-                          turn={turn}
-                          onToggle={onToggle}
-                        />
-                      </TableCell>
-                      <TableCell className="max-w-80">
-                        <button
-                          className="focus-visible:ring-ring w-full rounded text-left outline-none focus-visible:ring-2"
-                          type="button"
-                          onClick={() => onOpen(turn.turnKey)}
-                        >
-                          <span className="block truncate font-medium">{turnLabel(turn)}</span>
-                          <span className="text-muted-foreground block truncate font-mono text-xs">
-                            {shortId(turn.turnKey)} ·{" "}
-                            {formatDateTime(turn.startedAt ?? turn.lastEventAt)}
-                          </span>
-                        </button>
-                      </TableCell>
-                      {columns.has("model") ? (
-                        <TableCell>
-                          <ModelBadges models={turn.models} />
-                        </TableCell>
-                      ) : null}
-                      <TableCell className="text-right tabular-nums">
-                        {formatTokens(turn.totalTokens)}
-                      </TableCell>
+            {desktop ? (
+              <div data-testid="turn-table">
+                <Table scrollLabel="Danh sách turns">
+                  <TableHeader className="bg-card sticky top-0 z-10">
+                    <TableRow>
+                      <TableHead className="w-12">
+                        <span className="sr-only">Chọn</span>
+                      </TableHead>
+                      <TableHead>Turn</TableHead>
+                      {columns.has("model") ? <TableHead>Model</TableHead> : null}
+                      <TableHead className="text-right">Token</TableHead>
                       {columns.has("cache") ? (
-                        <TableCell className="text-right tabular-nums">
-                          {formatPercent(turn.cacheRate)}
-                        </TableCell>
+                        <TableHead className="text-right">Cache</TableHead>
                       ) : null}
                       {columns.has("context") ? (
-                        <TableCell className="text-right">
-                          <ContextBadge value={turn.contextUtilizationPercent} />
-                        </TableCell>
+                        <TableHead className="text-right">Context</TableHead>
                       ) : null}
                       {columns.has("duration") ? (
-                        <TableCell className="text-right tabular-nums">
-                          {formatDuration(turn.durationMs)}
-                        </TableCell>
+                        <TableHead className="text-right">Duration</TableHead>
                       ) : null}
                       {columns.has("cost") ? (
-                        <TableCell className="text-right">
-                          <CostValue coverage={turn.costCoverage} value={turn.estimatedCostUsd} />
-                        </TableCell>
+                        <TableHead className="text-right">Cost</TableHead>
                       ) : null}
-                      {columns.has("status") ? (
-                        <TableCell>
-                          <StatusBadge status={turn.status} />
-                        </TableCell>
-                      ) : null}
+                      {columns.has("status") ? <TableHead>Trạng thái</TableHead> : null}
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-            <div className="grid gap-3 p-4 lg:hidden">
-              {turns.map((turn) => (
-                <article key={turn.turnKey} className="rounded-xl border p-4">
-                  <div className="flex items-start gap-3">
-                    <CompareButton
-                      disabled={!selected.includes(turn.turnKey) && selected.length >= 4}
-                      selected={selected.includes(turn.turnKey)}
-                      turn={turn}
-                      onToggle={onToggle}
-                    />
-                    <button
-                      className="min-w-0 flex-1 text-left"
-                      type="button"
-                      onClick={() => onOpen(turn.turnKey)}
-                    >
-                      <span className="block font-medium">{turnLabel(turn)}</span>
-                      <span className="text-muted-foreground mt-1 block text-xs">
-                        {formatDateTime(turn.startedAt ?? turn.lastEventAt)}
-                      </span>
-                    </button>
-                    <StatusBadge status={turn.status} />
-                  </div>
-                  <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
-                    <Metric label="Token" value={formatTokens(turn.totalTokens)} />
-                    <Metric
-                      label="Cost"
-                      value={
-                        <CostValue coverage={turn.costCoverage} value={turn.estimatedCostUsd} />
-                      }
-                    />
-                    <Metric label="Cache" value={formatPercent(turn.cacheRate)} />
-                    <Metric
-                      label="Context"
-                      value={<ContextBadge value={turn.contextUtilizationPercent} />}
-                    />
-                  </dl>
-                </article>
-              ))}
-            </div>
+                  </TableHeader>
+                  <TableBody>
+                    {turns.map((turn) => (
+                      <TableRow key={turn.turnKey}>
+                        <TableCell>
+                          <CompareButton
+                            disabled={!selected.includes(turn.turnKey) && selected.length >= 4}
+                            selected={selected.includes(turn.turnKey)}
+                            turn={turn}
+                            onToggle={onToggle}
+                          />
+                        </TableCell>
+                        <TableCell className="max-w-80">
+                          <button
+                            className="focus-visible:ring-ring w-full rounded text-left outline-none focus-visible:ring-2"
+                            type="button"
+                            onClick={() => onOpen(turn.turnKey)}
+                          >
+                            <span className="block truncate font-medium">{turnLabel(turn)}</span>
+                            <span className="text-muted-foreground block truncate font-mono text-xs">
+                              {shortId(turn.turnKey)} ·{" "}
+                              {formatDateTime(turn.startedAt ?? turn.lastEventAt)}
+                            </span>
+                          </button>
+                        </TableCell>
+                        {columns.has("model") ? (
+                          <TableCell>
+                            <ModelBadges models={turn.models} />
+                          </TableCell>
+                        ) : null}
+                        <TableCell className="text-right tabular-nums">
+                          {formatTokens(turn.totalTokens)}
+                        </TableCell>
+                        {columns.has("cache") ? (
+                          <TableCell className="text-right tabular-nums">
+                            {formatPercent(turn.cacheRate)}
+                          </TableCell>
+                        ) : null}
+                        {columns.has("context") ? (
+                          <TableCell className="text-right">
+                            <ContextBadge value={turn.contextUtilizationPercent} />
+                          </TableCell>
+                        ) : null}
+                        {columns.has("duration") ? (
+                          <TableCell className="text-right tabular-nums">
+                            {formatDuration(turn.durationMs)}
+                          </TableCell>
+                        ) : null}
+                        {columns.has("cost") ? (
+                          <TableCell className="text-right">
+                            <CostValue coverage={turn.costCoverage} value={turn.estimatedCostUsd} />
+                          </TableCell>
+                        ) : null}
+                        {columns.has("status") ? (
+                          <TableCell>
+                            <StatusBadge status={turn.status} />
+                          </TableCell>
+                        ) : null}
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            ) : (
+              <div className="grid gap-3 p-4" data-testid="turn-cards">
+                {turns.map((turn) => (
+                  <article key={turn.turnKey} className="rounded-xl border p-4">
+                    <div className="flex items-start gap-3">
+                      <CompareButton
+                        disabled={!selected.includes(turn.turnKey) && selected.length >= 4}
+                        selected={selected.includes(turn.turnKey)}
+                        turn={turn}
+                        onToggle={onToggle}
+                      />
+                      <button
+                        className="min-w-0 flex-1 text-left"
+                        type="button"
+                        onClick={() => onOpen(turn.turnKey)}
+                      >
+                        <span className="block font-medium">{turnLabel(turn)}</span>
+                        <span className="text-muted-foreground mt-1 block text-xs">
+                          {formatDateTime(turn.startedAt ?? turn.lastEventAt)}
+                        </span>
+                      </button>
+                      <StatusBadge status={turn.status} />
+                    </div>
+                    <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
+                      <Metric label="Token" value={formatTokens(turn.totalTokens)} />
+                      <Metric
+                        label="Cost"
+                        value={
+                          <CostValue coverage={turn.costCoverage} value={turn.estimatedCostUsd} />
+                        }
+                      />
+                      <Metric label="Cache" value={formatPercent(turn.cacheRate)} />
+                      <Metric
+                        label="Context"
+                        value={<ContextBadge value={turn.contextUtilizationPercent} />}
+                      />
+                    </dl>
+                  </article>
+                ))}
+              </div>
+            )}
           </>
         ) : null}
         <div className="flex items-center justify-between border-t px-4 py-3 text-sm">
@@ -1275,9 +1200,7 @@ function formatDuration(value: number | null | undefined): string {
 
 function formatDateTime(value: string): string {
   const date = new Date(value);
-  return Number.isNaN(date.getTime())
-    ? value
-    : new Intl.DateTimeFormat("vi-VN", { dateStyle: "short", timeStyle: "short" }).format(date);
+  return Number.isNaN(date.getTime()) ? value : DATE_TIME_FORMATTER.format(date);
 }
 
 function shortId(value: string): string {

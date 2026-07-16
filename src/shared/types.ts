@@ -20,6 +20,15 @@ export type DashboardFilters = DateRange & {
 
 type AgentKind = "all" | "main" | "subagent";
 
+export type DashboardQuery = {
+  agentKind?: AgentKind;
+  from?: string;
+  model?: string;
+  models?: string;
+  project?: string;
+  to?: string;
+};
+
 export type DashboardKpis = TokenUsage & {
   estimatedCostUsd: number;
   requestCount: number;
@@ -129,6 +138,30 @@ export type ImportStatus = {
   turnBackfill: TurnBackfillStatus;
 };
 
+export type AppRevisionReason = "budget" | "import" | "project" | "rate" | "retention";
+
+export type AppRevisionScope =
+  | "activity"
+  | "agents"
+  | "alerts"
+  | "budgets"
+  | "catalog"
+  | "dashboard"
+  | "data-health"
+  | "projects"
+  | "rates"
+  | "sessions"
+  | "storage"
+  | "turns";
+
+export type AppRevisionEvent = {
+  reason: AppRevisionReason;
+  revision: number;
+  scopes?: AppRevisionScope[];
+};
+
+export type AppScanEvent = ImportStatus;
+
 export type RetentionCoverage = {
   hourlyAvailable: boolean;
   hourlyFrom: string;
@@ -150,6 +183,16 @@ export type SessionsResponse = {
   total: number;
 };
 
+export type SessionSummary = Omit<SessionUsage, "agents"> & {
+  agentCount: number;
+  subagentCount: number;
+  subagentNames: string[];
+};
+
+export type SessionSummariesResponse = Omit<SessionsResponse, "sessions"> & {
+  sessions: SessionSummary[];
+};
+
 export type SessionFilters = DashboardFilters & {
   hasSubagents?: boolean;
   order?: "asc" | "desc";
@@ -157,6 +200,15 @@ export type SessionFilters = DashboardFilters & {
   pageSize?: number;
   query?: string;
   sort?: "cost" | "lastActivity" | "tokens";
+};
+
+export type SessionQuery = DashboardQuery & {
+  hasSubagents?: "false" | "true";
+  order?: NonNullable<SessionFilters["order"]>;
+  page?: string;
+  pageSize?: string;
+  q?: string;
+  sort?: NonNullable<SessionFilters["sort"]>;
 };
 
 export type StorageStatus = {
@@ -242,6 +294,11 @@ export type InsightsResponse = {
   } | null;
 };
 
+export type OverviewResponse = {
+  dashboard: DashboardResponse;
+  insights: InsightsResponse;
+};
+
 export type ProjectSummary = DashboardKpis & {
   daily: DailyUsage[];
   displayName: string;
@@ -256,6 +313,47 @@ export type ProjectSummary = DashboardKpis & {
 
 export type ProjectsResponse = {
   projects: ProjectSummary[];
+};
+
+export type ProjectOptionsResponse = {
+  projects: { displayName: string; id: string }[];
+};
+
+export type ProjectListItem = DashboardKpis & {
+  displayName: string;
+  displayPath: string;
+  id: string;
+  modelCount: number;
+  subagentCostUsd: number;
+  subagentShare: number;
+  subagentTokens: number;
+  topModels: { model: string; totalTokens: number }[];
+};
+
+export type ProjectPageFilters = DashboardFilters & {
+  page?: number;
+  pageSize?: number;
+};
+
+export type ProjectPageQuery = DashboardQuery & {
+  page?: string;
+  pageSize?: string;
+};
+
+export type ProjectsPageResponse = {
+  page: number;
+  pageSize: number;
+  projects: ProjectListItem[];
+  total: number;
+};
+
+export type ProjectsSummaryResponse = {
+  kpis: DashboardKpis;
+  projectCount: number;
+};
+
+export type ProjectAnalyticsResponse = {
+  project: ProjectSummary;
 };
 
 export type AgentUsageSummary = Omit<SessionAgentUsage, "firstEventAt" | "lastEventAt"> & {
@@ -277,8 +375,59 @@ export type AgentsResponse = {
   subagent: DashboardKpis;
 };
 
+export type AgentLeaderboardMetric = "cache" | "cost" | "output" | "requests" | "tokens";
+
+export type AgentLeaderboardItem = {
+  agentId: string;
+  cachedInputTokens: number;
+  depth: number;
+  estimatedCostUsd: number;
+  inputTokens: number;
+  isSubagent: boolean;
+  modelCount: number;
+  name: string | null;
+  outputTokens: number;
+  requestCount: number;
+  role: string | null;
+  sessionCount: number;
+  topModels: string[];
+  totalTokens: number;
+};
+
+export type AgentPageFilters = AgentFilters & {
+  order?: "asc" | "desc";
+  page?: number;
+  pageSize?: number;
+  sort?: AgentLeaderboardMetric;
+};
+
+export type AgentPageQuery = AgentQuery & {
+  order?: NonNullable<AgentPageFilters["order"]>;
+  page?: string;
+  pageSize?: string;
+  sort?: NonNullable<AgentPageFilters["sort"]>;
+};
+
+export type AgentsPageResponse = {
+  agents: AgentLeaderboardItem[];
+  order: "asc" | "desc";
+  page: number;
+  pageSize: number;
+  sort: AgentLeaderboardMetric;
+  total: number;
+};
+
+export type AgentsSummaryResponse = Omit<AgentsResponse, "agents"> & {
+  totalAgents: number;
+};
+
 export type AgentFilters = DashboardFilters & {
   depth?: number;
+  role?: string;
+};
+
+export type AgentQuery = DashboardQuery & {
+  depth?: string;
   role?: string;
 };
 
@@ -346,6 +495,16 @@ export type ActivityFilters = DashboardFilters & {
   sessionId?: string;
 };
 
+export type ActivityQuery = DashboardQuery & {
+  kinds?: string;
+  session?: string;
+};
+
+export type ActivityTimelineQuery = ActivityQuery & {
+  cursor?: string;
+  limit?: string;
+};
+
 export type ActivityTimelineItem = {
   agentId: string;
   agentKind: Exclude<AgentKind, "all">;
@@ -366,6 +525,18 @@ export type ActivityResponse = {
   timeline: ActivityTimelineItem[];
   timelineCoverage: SessionCoverage;
   timelineTruncated: boolean;
+};
+
+export type ActivitySummaryResponse = {
+  daily: ActivitySummary[];
+  timelineCoverage: SessionCoverage;
+  timelineTotal: number;
+};
+
+export type ActivityTimelineResponse = {
+  hasMore: boolean;
+  items: ActivityTimelineItem[];
+  nextCursor: string | null;
 };
 
 export type DataHealthResponse = {
@@ -417,6 +588,23 @@ export type TurnFilters = DashboardFilters & {
   sessionId?: string;
   sort?: "context" | "cost" | "duration" | "lastActivity" | "tokens" | "ttft";
   status?: TurnStatus;
+};
+
+export type TurnQuery = DashboardQuery & {
+  agent?: string;
+  effort?: string;
+  order?: NonNullable<TurnFilters["order"]>;
+  page?: string;
+  pageSize?: string;
+  pressure?: TurnPressureFilter;
+  q?: string;
+  session?: string;
+  sort?: NonNullable<TurnFilters["sort"]>;
+  status?: TurnStatus;
+};
+
+export type TurnComparisonQuery = {
+  ids: string;
 };
 
 export type TurnUsageMetrics = TokenUsage & {

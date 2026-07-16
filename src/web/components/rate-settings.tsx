@@ -14,6 +14,7 @@ import {
   fetchStorageStatus,
   saveRate,
 } from "@/web/lib/api";
+import { queueLiveMutationScopes, useLiveEventsFallbackActive } from "@/web/lib/live-events";
 import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
 import {
@@ -55,21 +56,47 @@ const rateSchema = z.object({
   inputRate: z.number().finite().nonnegative(),
   outputRate: z.number().finite().nonnegative(),
 });
+const USD_RATE_FORMATTER = new Intl.NumberFormat("en-US", {
+  currency: "USD",
+  maximumFractionDigits: 4,
+  style: "currency",
+});
+const DATE_FORMATTER = new Intl.DateTimeFormat("vi-VN", {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
+const INTEGER_FORMATTER = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 
 type RateValues = z.infer<typeof rateSchema>;
 
 export function RateSettings() {
   const [editing, setEditing] = useState<{ model: string; rate: ModelRate | null } | null>(null);
   const queryClient = useQueryClient();
-  const models = useQuery({ queryKey: ["models"], queryFn: fetchModels });
-  const rates = useQuery({ queryKey: ["rates"], queryFn: fetchRates });
+  const models = useQuery({
+    queryKey: ["models"],
+    queryFn: ({ signal }) => fetchModels(signal),
+    staleTime: 5 * 60_000,
+  });
+  const rates = useQuery({
+    queryKey: ["rates"],
+    queryFn: ({ signal }) => fetchRates(signal),
+    staleTime: 5 * 60_000,
+  });
   const backfill = useMutation({
     mutationFn: backfillRate,
     onError: (error) => toast.error(error.message),
     onSuccess: (result) => {
       toast.success(`Đã áp giá cho ${result.updated} usage chưa định giá.`);
-      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
-      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      if (result.updated > 0) {
+        queueLiveMutationScopes(queryClient, [
+          "agents",
+          "dashboard",
+          "data-health",
+          "projects",
+          "sessions",
+          "turns",
+        ]);
+      }
     },
   });
 
@@ -164,11 +191,12 @@ export function RateSettings() {
 }
 
 function StorageSettings() {
+  const liveEventsFallbackActive = useLiveEventsFallbackActive();
   const queryClient = useQueryClient();
   const storage = useQuery({
     queryKey: ["storage"],
-    queryFn: fetchStorageStatus,
-    refetchInterval: 30_000,
+    queryFn: ({ signal }) => fetchStorageStatus(signal),
+    refetchInterval: liveEventsFallbackActive ? 30_000 : false,
   });
   const compact = useMutation({
     mutationFn: compactStorage,
@@ -177,9 +205,26 @@ function StorageSettings() {
       toast.success(
         `Đã compact ${result.lastRawEventsDeleted} raw event và dọn ${result.lastHourlyRowsDeleted} hourly row.`,
       );
-      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
-      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["storage"] });
+      queryClient.setQueryData(["storage"], result);
+      const changed =
+        result.lastHourlyRowsDeleted > 0 ||
+        result.lastRawEventsDeleted > 0 ||
+        result.lastRollupRowsWritten > 0;
+      queueLiveMutationScopes(
+        queryClient,
+        changed
+          ? [
+              "activity",
+              "agents",
+              "dashboard",
+              "data-health",
+              "projects",
+              "sessions",
+              "storage",
+              "turns",
+            ]
+          : ["data-health", "storage"],
+      );
     },
   });
   const data = storage.data;
@@ -271,9 +316,27 @@ function RateDialog({
           : "Đã lưu rate card. Usage mới sẽ dùng giá này.",
       );
       onOpenChange(false);
-      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
-      void queryClient.invalidateQueries({ queryKey: ["rates"] });
-      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      queryClient.setQueryData<{ rates: ModelRate[] }>(["rates"], (current) => ({
+        rates: [
+          ...(current?.rates.filter((rate) => rate.model !== result.rate.model) ?? []),
+          result.rate,
+        ].sort((left, right) => left.model.localeCompare(right.model)),
+      }));
+      queueLiveMutationScopes(
+        queryClient,
+        result.backfilled > 0
+          ? [
+              "agents",
+              "catalog",
+              "dashboard",
+              "data-health",
+              "projects",
+              "rates",
+              "sessions",
+              "turns",
+            ]
+          : ["catalog", "rates"],
+      );
     },
   });
 
@@ -358,16 +421,10 @@ function defaults(rate: ModelRate | null | undefined): RateValues {
 }
 
 function usdRate(value: number) {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 4,
-  }).format(value);
+  return USD_RATE_FORMATTER.format(value);
 }
 function formatDate(value: string) {
-  return new Intl.DateTimeFormat("vi-VN", { dateStyle: "medium", timeStyle: "short" }).format(
-    new Date(value),
-  );
+  return DATE_FORMATTER.format(new Date(value));
 }
 
 function formatOptionalDate(value: string | null | undefined) {
@@ -388,5 +445,5 @@ function formatBytes(value: number) {
 }
 
 function formatInteger(value: number) {
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value);
+  return INTEGER_FORMATTER.format(value);
 }

@@ -2,11 +2,18 @@ import { createHash } from "node:crypto";
 
 import { desc, eq, isNull } from "drizzle-orm";
 
-import { getDashboard, getSessions } from "@/server/analytics";
+import {
+  getDashboard,
+  getSessionAnomalyRows,
+  getSessions,
+  getTopSessionsByProject,
+  type SessionAnomalyRow,
+} from "@/server/analytics";
 import type { AppDatabase } from "@/server/db/client";
 import { alertEvents, budgetSettings, projects, sessionAgents } from "@/server/db/schema";
 import {
   calculateEfficiencyMetrics,
+  createUsageAnomalyDetector,
   getInclusiveDayCount,
   getPreviousDateRange,
   isUsageAnomaly,
@@ -16,19 +23,31 @@ import { currentLocalDate, dateDaysBefore, getSessionCoverage } from "@/server/r
 import { getTurnPage } from "@/server/turns";
 import type {
   AgentFilters,
+  AgentLeaderboardItem,
+  AgentPageFilters,
   AgentUsageSummary,
+  AgentsPageResponse,
   AgentsResponse,
+  AgentsSummaryResponse,
   AlertEvent,
+  AlertsResponse,
   BudgetSetting,
   DashboardFilters,
   DashboardKpis,
   InsightAlert,
   InsightsResponse,
   MetricDelta,
+  OverviewResponse,
   PricingSimulationRequest,
   PricingSimulationResponse,
+  ProjectAnalyticsResponse,
+  ProjectListItem,
+  ProjectPageFilters,
   ProjectSummary,
+  ProjectOptionsResponse,
+  ProjectsPageResponse,
   ProjectsResponse,
+  ProjectsSummaryResponse,
   SessionFilters,
   SessionUsage,
   TurnFilters,
@@ -57,6 +76,47 @@ type AgentUsageRow = {
   unpricedUsageCount: number;
 };
 
+type AgentAggregateSqlRow = DashboardKpis & {
+  agentKind: "main" | "subagent";
+  localDate: string;
+  scope: "daily" | "total";
+};
+
+type AgentPageSqlRow = {
+  agentId: string;
+  cachedInputTokens: number;
+  depth: number;
+  estimatedCostUsd: number;
+  inputTokens: number;
+  isSubagent: number;
+  model: string | null;
+  modelCount: number | null;
+  name: string | null;
+  outputTokens: number;
+  requestCount: number;
+  role: string | null;
+  sessionCount: number;
+  totalCount: number;
+  totalTokens: number;
+};
+
+type ProjectPageSqlRow = DashboardKpis & {
+  displayName: string;
+  displayPath: string;
+  id: string;
+  model: string | null;
+  modelCount: number | null;
+  modelTokens: number | null;
+  subagentCostUsd: number;
+  subagentTokens: number;
+  totalCount: number;
+};
+
+type SetBasedUsage = {
+  cte: string;
+  parameters: (number | string)[];
+};
+
 export function getInsights(
   database: AppDatabase,
   filters: DashboardFilters,
@@ -65,6 +125,31 @@ export function getInsights(
   const current = getDashboard(database, filters, now);
   const previousRange = getPreviousDateRange(filters);
   const previous = getDashboard(database, { ...filters, ...previousRange }, now);
+  return buildInsights(database, filters, now, current, previous, previousRange);
+}
+
+export function getOverview(
+  database: AppDatabase,
+  filters: DashboardFilters,
+  now = new Date(),
+): OverviewResponse {
+  const dashboard = getDashboard(database, filters, now);
+  const previousRange = getPreviousDateRange(filters);
+  const previous = getDashboard(database, { ...filters, ...previousRange }, now);
+  return {
+    dashboard,
+    insights: buildInsights(database, filters, now, dashboard, previous, previousRange),
+  };
+}
+
+function buildInsights(
+  database: AppDatabase,
+  filters: DashboardFilters,
+  now: Date,
+  current: ReturnType<typeof getDashboard>,
+  previous: ReturnType<typeof getDashboard>,
+  previousRange: ReturnType<typeof getPreviousDateRange>,
+): InsightsResponse {
   const baselineFrom = dateDaysBefore(filters.from, 14);
   const history = getDashboard(database, { ...filters, from: baselineFrom, to: filters.to }, now);
   const anomalies = detectDailyAnomalies(
@@ -76,12 +161,19 @@ export function getInsights(
     filters.from,
     filters.to,
   );
-  const baselineSessions = getAllSessions(database, {
-    ...filters,
-    from: baselineFrom,
-    to: dateDaysBefore(filters.from, 1),
-  });
-  const unusualSession = detectUnusualSession(getAllSessions(database, filters), baselineSessions);
+  const baselineSessions = getSessionAnomalyRows(
+    database,
+    {
+      ...filters,
+      from: baselineFrom,
+      to: dateDaysBefore(filters.from, 1),
+    },
+    now,
+  );
+  const unusualSession = detectUnusualSession(
+    getSessionAnomalyRows(database, filters, now),
+    baselineSessions,
+  );
 
   const today = currentLocalDate(now);
   const monthRange = { from: `${today.slice(0, 7)}-01`, to: today };
@@ -123,42 +215,237 @@ export function getProjects(
   filters: DashboardFilters,
   now = new Date(),
 ): ProjectsResponse {
+  const projectRows = new Map(
+    database
+      .select()
+      .from(projects)
+      .all()
+      .filter((project) => !filters.projectId || project.id === filters.projectId)
+      .map((project) => [project.id, project]),
+  );
+  const rowsByProject = new Map<string, AgentUsageRow[]>();
+  for (const row of readAgentUsageRows(database, filters)) {
+    if (!projectRows.has(row.projectId)) continue;
+    const rows = rowsByProject.get(row.projectId) ?? [];
+    rows.push(row);
+    rowsByProject.set(row.projectId, rows);
+  }
+  const topSessions = getTopSessionsByProject(database, filters, 5, now);
   const values: ProjectSummary[] = [];
-  const projectRows = database.select().from(projects).orderBy(projects.displayName).all();
-  for (const project of projectRows) {
-    if (filters.projectId && project.id !== filters.projectId) continue;
-    const projectFilters = { ...filters, projectId: project.id };
-    const dashboard = getDashboard(database, projectFilters, now);
-    if (dashboard.kpis.totalTokens === 0 && dashboard.kpis.requestCount === 0) continue;
-    const subagent = getDashboard(database, { ...projectFilters, agentKind: "subagent" }, now);
-    const topSessions = getSessions(database, {
-      ...projectFilters,
-      order: "desc",
-      page: 1,
-      pageSize: 5,
-      sort: "cost",
-    }).sessions;
+  for (const [projectId, rows] of rowsByProject) {
+    const project = projectRows.get(projectId);
+    if (!project) continue;
+    const kpis = summarizeUsageRows(rows);
+    const subagent = summarizeUsageRows(rows.filter((row) => row.agentKind === "subagent"));
+    const dailyRows = groupRows(rows, (row) => row.localDate);
+    const modelRows = groupRows(rows, (row) => row.model);
     values.push({
-      ...dashboard.kpis,
-      daily: dashboard.daily,
+      ...kpis,
+      daily: [...dailyRows]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([date, dateRows]) => ({ date, ...summarizeUsageRows(dateRows) })),
       displayName: project.displayName,
       displayPath: project.displayPath,
       id: project.id,
-      modelMix: dashboard.models.map((model) => ({
-        model: model.model,
-        totalTokens: model.totalTokens,
-      })),
-      subagentCostUsd: subagent.kpis.estimatedCostUsd,
-      subagentShare:
-        dashboard.kpis.totalTokens === 0
-          ? 0
-          : subagent.kpis.totalTokens / dashboard.kpis.totalTokens,
-      subagentTokens: subagent.kpis.totalTokens,
-      topSessions,
+      modelMix: [...modelRows]
+        .map(([model, modelUsage]) => ({
+          model,
+          totalTokens: summarizeUsageRows(modelUsage).totalTokens,
+        }))
+        .sort((left, right) => right.totalTokens - left.totalTokens),
+      subagentCostUsd: subagent.estimatedCostUsd,
+      subagentShare: kpis.totalTokens === 0 ? 0 : subagent.totalTokens / kpis.totalTokens,
+      subagentTokens: subagent.totalTokens,
+      topSessions: topSessions.get(project.id) ?? [],
     });
   }
   values.sort((left, right) => right.totalTokens - left.totalTokens);
   return { projects: values };
+}
+
+export function getProjectsSummary(
+  database: AppDatabase,
+  filters: DashboardFilters,
+): ProjectsSummaryResponse {
+  const usage = buildSetBasedUsage(filters);
+  const row = database.$client
+    .prepare(
+      `${usage.cte}
+      select
+        count(distinct u.projectId) as projectCount,
+        coalesce(sum(u.inputTokens), 0) as inputTokens,
+        coalesce(sum(u.cachedInputTokens), 0) as cachedInputTokens,
+        coalesce(sum(u.outputTokens), 0) as outputTokens,
+        coalesce(sum(u.reasoningOutputTokens), 0) as reasoningOutputTokens,
+        coalesce(sum(u.totalTokens), 0) as totalTokens,
+        coalesce(sum(u.requestCount), 0) as requestCount,
+        count(distinct u.sessionId) as sessionCount,
+        coalesce(sum(u.costUsd), 0) as estimatedCostUsd,
+        coalesce(sum(u.unpricedUsageCount), 0) as unpricedUsageCount
+      from usage_rows u
+      join projects p on p.id = u.projectId`,
+    )
+    .get(...usage.parameters) as (DashboardKpis & { projectCount: number }) | undefined;
+  return {
+    kpis: toDashboardKpis(row),
+    projectCount: toNumber(row?.projectCount),
+  };
+}
+
+export function getProjectsPage(
+  database: AppDatabase,
+  filters: ProjectPageFilters,
+): ProjectsPageResponse {
+  const page = filters.page ?? 1;
+  const pageSize = filters.pageSize ?? 50;
+  const offset = (page - 1) * pageSize;
+  const usage = buildSetBasedUsage(filters);
+  const rows = database.$client
+    .prepare(
+      `${usage.cte}, project_totals as (
+        select
+          u.projectId as id,
+          p.display_name as displayName,
+          p.display_path as displayPath,
+          coalesce(sum(u.inputTokens), 0) as inputTokens,
+          coalesce(sum(u.cachedInputTokens), 0) as cachedInputTokens,
+          coalesce(sum(u.outputTokens), 0) as outputTokens,
+          coalesce(sum(u.reasoningOutputTokens), 0) as reasoningOutputTokens,
+          coalesce(sum(u.totalTokens), 0) as totalTokens,
+          coalesce(sum(u.requestCount), 0) as requestCount,
+          count(distinct u.sessionId) as sessionCount,
+          coalesce(sum(u.costUsd), 0) as estimatedCostUsd,
+          coalesce(sum(u.unpricedUsageCount), 0) as unpricedUsageCount,
+          coalesce(sum(case when u.agentKind = 'subagent' then u.totalTokens else 0 end), 0) as subagentTokens,
+          coalesce(sum(case when u.agentKind = 'subagent' then u.costUsd else 0 end), 0) as subagentCostUsd
+        from usage_rows u
+        join projects p on p.id = u.projectId
+        group by u.projectId, p.display_name, p.display_path
+      ), ranked_projects as (
+        select *,
+          count(*) over() as totalCount,
+          row_number() over (order by totalTokens desc, id asc) as rankPosition
+        from project_totals
+      ), paged_projects as (
+        select * from ranked_projects
+        where rankPosition > ? and rankPosition <= ?
+      ), model_totals as (
+        select u.projectId as id, u.model as model, coalesce(sum(u.totalTokens), 0) as totalTokens
+        from usage_rows u
+        join paged_projects p on p.id = u.projectId
+        group by u.projectId, u.model
+      ), ranked_models as (
+        select *,
+          count(*) over (partition by id) as modelCount,
+          row_number() over (partition by id order by totalTokens desc, model asc) as modelRank
+        from model_totals
+      )
+      select p.*, m.model, m.totalTokens as modelTokens, m.modelCount, m.modelRank
+      from paged_projects p
+      left join ranked_models m on m.id = p.id and m.modelRank <= 2
+      order by p.rankPosition, m.modelRank`,
+    )
+    .all(...usage.parameters, offset, offset + pageSize) as ProjectPageSqlRow[];
+  let total = toNumber(rows[0]?.totalCount);
+  if (rows.length === 0 && page > 1) {
+    const totalRow = database.$client
+      .prepare(
+        `${usage.cte}
+        select count(distinct u.projectId) as count
+        from usage_rows u
+        join projects p on p.id = u.projectId`,
+      )
+      .get(...usage.parameters) as { count: number } | undefined;
+    total = toNumber(totalRow?.count);
+  }
+  const projectsById = new Map<string, ProjectListItem>();
+  for (const row of rows) {
+    const project = projectsById.get(row.id) ?? {
+      ...toDashboardKpis(row),
+      displayName: row.displayName,
+      displayPath: row.displayPath,
+      id: row.id,
+      modelCount: toNumber(row.modelCount),
+      subagentCostUsd: toNumber(row.subagentCostUsd),
+      subagentShare: safeRatio(toNumber(row.subagentTokens), toNumber(row.totalTokens)),
+      subagentTokens: toNumber(row.subagentTokens),
+      topModels: [],
+    };
+    if (row.model) {
+      project.topModels.push({ model: row.model, totalTokens: toNumber(row.modelTokens) });
+    }
+    projectsById.set(row.id, project);
+  }
+  return { page, pageSize, projects: [...projectsById.values()], total };
+}
+
+export function getProjectAnalytics(
+  database: AppDatabase,
+  id: string,
+  filters: DashboardFilters,
+  now = new Date(),
+): ProjectAnalyticsResponse | null {
+  const project = getProjects(database, { ...filters, projectId: id }, now).projects.find(
+    (value) => value.id === id,
+  );
+  return project ? { project } : null;
+}
+
+export function getProjectOptions(
+  database: AppDatabase,
+  filters: DashboardFilters,
+): ProjectOptionsResponse {
+  const models = [
+    ...new Set(filters.models?.length ? filters.models : filters.model ? [filters.model] : []),
+  ];
+  const rawConditions = ["e.local_date >= ?", "e.local_date <= ?", "s.project_id is not null"];
+  const rawParameters: (number | string)[] = [filters.from, filters.to];
+  const archivedConditions = ["d.local_date >= ?", "d.local_date <= ?"];
+  const archivedParameters: (number | string)[] = [filters.from, filters.to];
+  if (models.length > 0) {
+    const placeholders = models.map(() => "?").join(", ");
+    rawConditions.push(`e.model in (${placeholders})`);
+    archivedConditions.push(`d.model in (${placeholders})`);
+    rawParameters.push(...models);
+    archivedParameters.push(...models);
+  }
+  if (filters.agentKind && filters.agentKind !== "all") {
+    rawConditions.push(
+      `exists (
+        select 1 from session_agents sa
+        where sa.id = e.agent_id
+          and sa.thread_source ${filters.agentKind === "subagent" ? "=" : "!="} 'subagent'
+      )`,
+    );
+    archivedConditions.push("d.agent_kind = ?");
+    archivedParameters.push(filters.agentKind);
+  }
+  if (filters.projectId) {
+    rawConditions.push("s.project_id = ?");
+    archivedConditions.push("d.project_id = ?");
+    rawParameters.push(filters.projectId);
+    archivedParameters.push(filters.projectId);
+  }
+
+  const rows = database.$client
+    .prepare(
+      `with used_projects(project_id) as (
+        select distinct s.project_id
+        from usage_events e
+        join sessions s on s.id = e.session_id
+        where ${rawConditions.join(" and ")}
+        union
+        select distinct d.project_id
+        from usage_daily_rollups d
+        where ${archivedConditions.join(" and ")}
+      )
+      select p.id as id, p.display_name as displayName
+      from projects p
+      join used_projects u on u.project_id = p.id
+      order by p.display_name collate nocase, p.id`,
+    )
+    .all(...rawParameters, ...archivedParameters) as { displayName: string; id: string }[];
+  return { projects: rows };
 }
 
 export function getAgents(
@@ -273,6 +560,198 @@ export function getAgents(
     }));
   }
   return { agents, coverage: getSessionCoverage(filters, now), daily, main, subagent };
+}
+
+export function getAgentsSummary(
+  database: AppDatabase,
+  filters: AgentFilters,
+  now = new Date(),
+): AgentsSummaryResponse {
+  const usage = buildSetBasedUsage(filters);
+  const totalRow = database.$client
+    .prepare(`${usage.cte} select count(distinct agentId) as count from usage_rows`)
+    .get(...usage.parameters) as { count: number } | undefined;
+  const metadataFiltered = Boolean(filters.role) || filters.depth !== undefined;
+  if (!metadataFiltered) {
+    const mainDashboard =
+      filters.agentKind === "subagent"
+        ? null
+        : getDashboard(database, { ...filters, agentKind: "main" }, now);
+    const subagentDashboard =
+      filters.agentKind === "main"
+        ? null
+        : getDashboard(database, { ...filters, agentKind: "subagent" }, now);
+    const mainByDate = new Map(mainDashboard?.daily.map((row) => [row.date, row]) ?? []);
+    const subagentByDate = new Map(subagentDashboard?.daily.map((row) => [row.date, row]) ?? []);
+    const dates = [...new Set([...mainByDate.keys(), ...subagentByDate.keys()])].sort();
+    return {
+      coverage: getSessionCoverage(filters, now),
+      daily: dates.map((date) => ({
+        date,
+        main: mainByDate.get(date) ?? emptyDashboardKpis(),
+        subagent: subagentByDate.get(date) ?? emptyDashboardKpis(),
+      })),
+      main: mainDashboard?.kpis ?? emptyDashboardKpis(),
+      subagent: subagentDashboard?.kpis ?? emptyDashboardKpis(),
+      totalAgents: toNumber(totalRow?.count),
+    };
+  }
+
+  const rows = database.$client
+    .prepare(
+      `${usage.cte}
+      select
+        'daily' as scope,
+        localDate,
+        agentKind,
+        coalesce(sum(inputTokens), 0) as inputTokens,
+        coalesce(sum(cachedInputTokens), 0) as cachedInputTokens,
+        coalesce(sum(outputTokens), 0) as outputTokens,
+        coalesce(sum(reasoningOutputTokens), 0) as reasoningOutputTokens,
+        coalesce(sum(totalTokens), 0) as totalTokens,
+        coalesce(sum(requestCount), 0) as requestCount,
+        count(distinct sessionId) as sessionCount,
+        coalesce(sum(costUsd), 0) as estimatedCostUsd,
+        coalesce(sum(unpricedUsageCount), 0) as unpricedUsageCount
+      from usage_rows
+      group by localDate, agentKind
+      union all
+      select
+        'total' as scope,
+        '' as localDate,
+        agentKind,
+        coalesce(sum(inputTokens), 0) as inputTokens,
+        coalesce(sum(cachedInputTokens), 0) as cachedInputTokens,
+        coalesce(sum(outputTokens), 0) as outputTokens,
+        coalesce(sum(reasoningOutputTokens), 0) as reasoningOutputTokens,
+        coalesce(sum(totalTokens), 0) as totalTokens,
+        coalesce(sum(requestCount), 0) as requestCount,
+        count(distinct sessionId) as sessionCount,
+        coalesce(sum(costUsd), 0) as estimatedCostUsd,
+        coalesce(sum(unpricedUsageCount), 0) as unpricedUsageCount
+      from usage_rows
+      group by agentKind
+      order by scope, localDate, agentKind`,
+    )
+    .all(...usage.parameters) as AgentAggregateSqlRow[];
+  const dailyRows = rows.filter((row) => row.scope === "daily");
+  const dates = [...new Set(dailyRows.map((row) => row.localDate))];
+  return {
+    coverage: getSessionCoverage(filters, now),
+    daily: dates.map((date) => ({
+      date,
+      main: toDashboardKpis(
+        dailyRows.find((row) => row.localDate === date && row.agentKind === "main"),
+      ),
+      subagent: toDashboardKpis(
+        dailyRows.find((row) => row.localDate === date && row.agentKind === "subagent"),
+      ),
+    })),
+    main: toDashboardKpis(rows.find((row) => row.scope === "total" && row.agentKind === "main")),
+    subagent: toDashboardKpis(
+      rows.find((row) => row.scope === "total" && row.agentKind === "subagent"),
+    ),
+    totalAgents: toNumber(totalRow?.count),
+  };
+}
+
+export function getAgentsPage(
+  database: AppDatabase,
+  filters: AgentPageFilters,
+): AgentsPageResponse {
+  const page = filters.page ?? 1;
+  const pageSize = filters.pageSize ?? 50;
+  const sort = filters.sort ?? "tokens";
+  const order = filters.order ?? "desc";
+  const direction = order === "asc" ? "asc" : "desc";
+  const sortExpression =
+    sort === "cache"
+      ? "cacheRate"
+      : sort === "cost"
+        ? "estimatedCostUsd"
+        : sort === "output"
+          ? "outputTokens"
+          : sort === "requests"
+            ? "requestCount"
+            : "totalTokens";
+  const offset = (page - 1) * pageSize;
+  const usage = buildSetBasedUsage(filters);
+  const rows = database.$client
+    .prepare(
+      `${usage.cte}, agent_totals as (
+        select
+          u.agentId as agentId,
+          coalesce(a.name, null) as name,
+          coalesce(a.role, null) as role,
+          coalesce(a.depth, case when max(u.agentKind) = 'subagent' then 1 else 0 end) as depth,
+          max(case when u.agentKind = 'subagent' then 1 else 0 end) as isSubagent,
+          coalesce(sum(u.inputTokens), 0) as inputTokens,
+          coalesce(sum(u.cachedInputTokens), 0) as cachedInputTokens,
+          coalesce(sum(u.outputTokens), 0) as outputTokens,
+          coalesce(sum(u.totalTokens), 0) as totalTokens,
+          coalesce(sum(u.requestCount), 0) as requestCount,
+          count(distinct u.sessionId) as sessionCount,
+          coalesce(sum(u.costUsd), 0) as estimatedCostUsd,
+          case when coalesce(sum(u.inputTokens), 0) > 0
+            then coalesce(sum(u.cachedInputTokens), 0) * 1.0 / sum(u.inputTokens)
+            else 0 end as cacheRate
+        from usage_rows u
+        left join session_agents a on a.id = u.agentId
+        group by u.agentId, a.name, a.role, a.depth
+      ), ranked_agents as (
+        select *,
+          count(*) over() as totalCount,
+          row_number() over (order by ${sortExpression} ${direction}, agentId asc) as rankPosition
+        from agent_totals
+      ), paged_agents as (
+        select * from ranked_agents
+        where rankPosition > ? and rankPosition <= ?
+      ), model_totals as (
+        select u.agentId as agentId, u.model as model, coalesce(sum(u.totalTokens), 0) as totalTokens
+        from usage_rows u
+        join paged_agents p on p.agentId = u.agentId
+        group by u.agentId, u.model
+      ), ranked_models as (
+        select *,
+          count(*) over (partition by agentId) as modelCount,
+          row_number() over (partition by agentId order by totalTokens desc, model asc) as modelRank
+        from model_totals
+      )
+      select p.*, m.model, m.modelCount, m.modelRank
+      from paged_agents p
+      left join ranked_models m on m.agentId = p.agentId and m.modelRank <= 2
+      order by p.rankPosition, m.modelRank`,
+    )
+    .all(...usage.parameters, offset, offset + pageSize) as AgentPageSqlRow[];
+  let total = toNumber(rows[0]?.totalCount);
+  if (rows.length === 0 && page > 1) {
+    const totalRow = database.$client
+      .prepare(`${usage.cte} select count(distinct agentId) as count from usage_rows`)
+      .get(...usage.parameters) as { count: number } | undefined;
+    total = toNumber(totalRow?.count);
+  }
+  const agentsById = new Map<string, AgentLeaderboardItem>();
+  for (const row of rows) {
+    const agent = agentsById.get(row.agentId) ?? {
+      agentId: row.agentId,
+      cachedInputTokens: toNumber(row.cachedInputTokens),
+      depth: toNumber(row.depth),
+      estimatedCostUsd: toNumber(row.estimatedCostUsd),
+      inputTokens: toNumber(row.inputTokens),
+      isSubagent: Boolean(row.isSubagent),
+      modelCount: toNumber(row.modelCount),
+      name: row.name,
+      outputTokens: toNumber(row.outputTokens),
+      requestCount: toNumber(row.requestCount),
+      role: row.role,
+      sessionCount: toNumber(row.sessionCount),
+      topModels: [],
+      totalTokens: toNumber(row.totalTokens),
+    };
+    if (row.model) agent.topModels.push(row.model);
+    agentsById.set(row.agentId, agent);
+  }
+  return { agents: [...agentsById.values()], order, page, pageSize, sort, total };
 }
 
 export function getBudgets(database: AppDatabase): BudgetSetting[] {
@@ -416,8 +895,9 @@ function listAlerts(database: AppDatabase): AlertEvent[] {
     .map(toAlertEvent);
 }
 
-export function getAlertFeed(database: AppDatabase, now = new Date()) {
-  const alerts = refreshAlerts(database, now);
+export function getAlertFeed(database: AppDatabase, now = new Date()): AlertsResponse {
+  void now;
+  const alerts = listAlerts(database);
   const row = database.$client
     .prepare(
       "select count(*) as count from alert_events where dismissed_at is null and seen_at is null",
@@ -597,6 +1077,98 @@ function copyDashboardFilters(source: DashboardFilters, target: DashboardFilters
   if (source.projectId) target.projectId = source.projectId;
 }
 
+function buildSetBasedUsage(filters: AgentFilters): SetBasedUsage {
+  const models = [
+    ...new Set(filters.models?.length ? filters.models : filters.model ? [filters.model] : []),
+  ];
+  const rawConditions = ["e.local_date >= ?", "e.local_date <= ?"];
+  const rawParameters: (number | string)[] = [filters.from, filters.to];
+  const archivedConditions = ["r.local_date >= ?", "r.local_date <= ?"];
+  const archivedParameters: (number | string)[] = [filters.from, filters.to];
+  if (models.length > 0) {
+    const placeholders = models.map(() => "?").join(", ");
+    rawConditions.push(`e.model in (${placeholders})`);
+    archivedConditions.push(`r.model in (${placeholders})`);
+    rawParameters.push(...models);
+    archivedParameters.push(...models);
+  }
+  if (filters.agentKind && filters.agentKind !== "all") {
+    rawConditions.push(
+      `case when a.thread_source = 'subagent' then 'subagent' else 'main' end = ?`,
+    );
+    archivedConditions.push("r.agent_kind = ?");
+    rawParameters.push(filters.agentKind);
+    archivedParameters.push(filters.agentKind);
+  }
+  if (filters.projectId) {
+    rawConditions.push("coalesce(s.project_id, 'legacy-unknown') = ?");
+    archivedConditions.push("r.project_id = ?");
+    rawParameters.push(filters.projectId);
+    archivedParameters.push(filters.projectId);
+  }
+  if (filters.role) {
+    rawConditions.push("a.role = ?");
+    archivedConditions.push("a.role = ?");
+    rawParameters.push(filters.role);
+    archivedParameters.push(filters.role);
+  }
+  if (filters.depth !== undefined) {
+    rawConditions.push("a.depth = ?");
+    archivedConditions.push("a.depth = ?");
+    rawParameters.push(filters.depth);
+    archivedParameters.push(filters.depth);
+  }
+
+  return {
+    cte: `with raw_usage as (
+      select
+        e.local_date as localDate,
+        e.agent_id as agentId,
+        case when a.thread_source = 'subagent' then 'subagent' else 'main' end as agentKind,
+        e.session_id as sessionId,
+        e.model as model,
+        coalesce(s.project_id, 'legacy-unknown') as projectId,
+        coalesce(sum(e.input_tokens), 0) as inputTokens,
+        coalesce(sum(e.cached_input_tokens), 0) as cachedInputTokens,
+        coalesce(sum(e.output_tokens), 0) as outputTokens,
+        coalesce(sum(e.reasoning_output_tokens), 0) as reasoningOutputTokens,
+        coalesce(sum(e.total_tokens), 0) as totalTokens,
+        count(e.id) as requestCount,
+        coalesce(sum(e.cost_usd), 0) as costUsd,
+        coalesce(sum(case when e.cost_usd is null then 1 else 0 end), 0) as unpricedUsageCount
+      from usage_events e
+      left join session_agents a on a.id = e.agent_id
+      left join sessions s on s.id = e.session_id
+      where ${rawConditions.join(" and ")}
+      group by e.local_date, e.agent_id, a.thread_source, e.session_id, e.model, s.project_id
+    ), archived_usage as (
+      select
+        r.local_date as localDate,
+        r.agent_id as agentId,
+        r.agent_kind as agentKind,
+        r.session_id as sessionId,
+        r.model as model,
+        r.project_id as projectId,
+        r.input_tokens as inputTokens,
+        r.cached_input_tokens as cachedInputTokens,
+        r.output_tokens as outputTokens,
+        r.reasoning_output_tokens as reasoningOutputTokens,
+        r.total_tokens as totalTokens,
+        r.request_count as requestCount,
+        r.cost_usd as costUsd,
+        r.unpriced_usage_count as unpricedUsageCount
+      from usage_agent_daily_rollups r
+      left join session_agents a on a.id = r.agent_id
+      where ${archivedConditions.join(" and ")}
+    ), usage_rows as (
+      select * from raw_usage
+      union all
+      select * from archived_usage
+    )`,
+    parameters: [...rawParameters, ...archivedParameters],
+  };
+}
+
 function readAgentUsageRows(database: AppDatabase, filters: DashboardFilters): AgentUsageRow[] {
   const models = filters.models?.length ? filters.models : filters.model ? [filters.model] : [];
   const rawConditions = ["e.local_date >= ?", "e.local_date <= ?"];
@@ -615,17 +1187,25 @@ function readAgentUsageRows(database: AppDatabase, filters: DashboardFilters): A
     .prepare(
       `select e.agent_id agentId,
         case when a.thread_source = 'subagent' then 'subagent' else 'main' end agentKind,
-        e.cached_input_tokens cachedInputTokens, coalesce(e.cost_usd, 0) costUsd,
-        e.timestamp firstEventAt, e.input_tokens inputTokens, e.timestamp lastEventAt,
+        coalesce(sum(e.cached_input_tokens), 0) cachedInputTokens,
+        coalesce(sum(e.cost_usd), 0) costUsd,
+        min(e.timestamp) firstEventAt,
+        coalesce(sum(e.input_tokens), 0) inputTokens,
+        max(e.timestamp) lastEventAt,
         e.local_date localDate,
-        e.model model, e.output_tokens outputTokens, coalesce(s.project_id, 'legacy-unknown') projectId,
-        e.reasoning_output_tokens reasoningOutputTokens, 1 requestCount,
-        e.session_id sessionId, e.total_tokens totalTokens,
-        case when e.cost_usd is null then 1 else 0 end unpricedUsageCount
+        e.model model,
+        coalesce(sum(e.output_tokens), 0) outputTokens,
+        coalesce(s.project_id, 'legacy-unknown') projectId,
+        coalesce(sum(e.reasoning_output_tokens), 0) reasoningOutputTokens,
+        count(e.id) requestCount,
+        e.session_id sessionId,
+        coalesce(sum(e.total_tokens), 0) totalTokens,
+        coalesce(sum(case when e.cost_usd is null then 1 else 0 end), 0) unpricedUsageCount
       from usage_events e
       left join session_agents a on a.id = e.agent_id
       left join sessions s on s.id = e.session_id
-      where ${rawConditions.join(" and ")}`,
+      where ${rawConditions.join(" and ")}
+      group by e.agent_id, a.thread_source, e.local_date, e.model, s.project_id, e.session_id`,
     )
     .all(...rawParameters) as AgentUsageRow[];
   const archived = database.$client
@@ -649,6 +1229,10 @@ function summarizeAgentRows(
   rows: AgentUsageRow[],
   agentKind: AgentUsageRow["agentKind"],
 ): DashboardKpis {
+  return summarizeUsageRows(rows.filter((row) => row.agentKind === agentKind));
+}
+
+function summarizeUsageRows(rows: AgentUsageRow[]): DashboardKpis {
   const sessions = new Set<string>();
   const summary: DashboardKpis = {
     cachedInputTokens: 0,
@@ -662,7 +1246,6 @@ function summarizeAgentRows(
     unpricedUsageCount: 0,
   };
   for (const row of rows) {
-    if (row.agentKind !== agentKind) continue;
     summary.cachedInputTokens += row.cachedInputTokens;
     summary.estimatedCostUsd += row.costUsd;
     summary.inputTokens += row.inputTokens;
@@ -675,6 +1258,17 @@ function summarizeAgentRows(
   }
   summary.sessionCount = sessions.size;
   return summary;
+}
+
+function groupRows<T>(rows: T[], key: (row: T) => string): Map<string, T[]> {
+  const grouped = new Map<string, T[]>();
+  for (const row of rows) {
+    const value = key(row);
+    const values = grouped.get(value) ?? [];
+    values.push(row);
+    grouped.set(value, values);
+  }
+  return grouped;
 }
 
 function addSqlFilters(
@@ -752,17 +1346,19 @@ function detectDailyAnomalies(
 }
 
 function detectUnusualSession(
-  current: SessionUsage[],
-  baseline: SessionUsage[],
+  current: SessionAnomalyRow[],
+  baseline: SessionAnomalyRow[],
 ): InsightsResponse["unusualSession"] {
   if (baseline.length < 3) return null;
-  const baselineCosts = baseline.map((session) => session.estimatedCostUsd);
-  const baselineTokens = baseline.map((session) => session.totalTokens);
+  const isCostAnomaly = createUsageAnomalyDetector(
+    baseline.map((session) => session.estimatedCostUsd),
+  );
+  const isTokenAnomaly = createUsageAnomalyDetector(baseline.map((session) => session.totalTokens));
   const candidates = current
     .map((session) => {
       const reasons: ("cost" | "tokens")[] = [];
-      if (isUsageAnomaly(session.estimatedCostUsd, baselineCosts)) reasons.push("cost");
-      if (isUsageAnomaly(session.totalTokens, baselineTokens)) reasons.push("tokens");
+      if (isCostAnomaly(session.estimatedCostUsd)) reasons.push("cost");
+      if (isTokenAnomaly(session.totalTokens)) reasons.push("tokens");
       return { reasons, session };
     })
     .filter((candidate) => candidate.reasons.length > 0)
@@ -872,6 +1468,43 @@ function csvCell(value: unknown): string {
   // Prefix every formula-like cell so exported local metadata cannot trigger CSV injection.
   if (/^[\t\r\n ]*[=+@-]/u.test(text)) text = `'${text}`;
   return `"${text.replaceAll('"', '""')}"`;
+}
+
+function emptyDashboardKpis(): DashboardKpis {
+  return {
+    cachedInputTokens: 0,
+    estimatedCostUsd: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    requestCount: 0,
+    sessionCount: 0,
+    totalTokens: 0,
+    unpricedUsageCount: 0,
+  };
+}
+
+function toDashboardKpis(value: Partial<DashboardKpis> | null | undefined): DashboardKpis {
+  return {
+    cachedInputTokens: toNumber(value?.cachedInputTokens),
+    estimatedCostUsd: toNumber(value?.estimatedCostUsd),
+    inputTokens: toNumber(value?.inputTokens),
+    outputTokens: toNumber(value?.outputTokens),
+    reasoningOutputTokens: toNumber(value?.reasoningOutputTokens),
+    requestCount: toNumber(value?.requestCount),
+    sessionCount: toNumber(value?.sessionCount),
+    totalTokens: toNumber(value?.totalTokens),
+    unpricedUsageCount: toNumber(value?.unpricedUsageCount),
+  };
+}
+
+function safeRatio(value: number, total: number): number {
+  return total > 0 ? value / total : 0;
+}
+
+function toNumber(value: unknown): number {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number : 0;
 }
 
 function formatUsd(value: number): string {

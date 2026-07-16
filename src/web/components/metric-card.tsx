@@ -13,12 +13,15 @@ type MetricCardProps = {
 export function MetricCard({ detail, icon, label, trend, value }: MetricCardProps) {
   return (
     <Card className="metric-card group">
-      <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
+      <CardHeader className="flex-row items-center justify-between space-y-0 p-4 pb-2 sm:p-6 sm:pb-2">
         <CardTitle className="text-muted-foreground text-sm font-medium">{label}</CardTitle>
         <span className="metric-card-icon text-muted-foreground rounded-lg p-1.5">{icon}</span>
       </CardHeader>
-      <CardContent>
-        <p key={value} className="metric-value text-2xl font-bold tracking-tight tabular-nums">
+      <CardContent className="px-4 pb-4 sm:px-6 sm:pb-6">
+        <p
+          key={value}
+          className="metric-value text-xl font-bold tracking-tight tabular-nums sm:text-2xl"
+        >
           {value}
         </p>
         {detail || trend ? (

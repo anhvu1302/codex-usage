@@ -1,4 +1,5 @@
 import { Check, Filter, X } from "lucide-react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 
 import { DateRangePicker } from "@/web/components/date-range-picker";
 import { Badge } from "@/web/components/ui/badge";
@@ -33,6 +34,7 @@ export function ProductFilterBar({
   showAgentDetails?: boolean;
   showProject?: boolean;
 }) {
+  const activePresetRef = useRef<HTMLElement | null>(null);
   const presets = datePresets();
   const activePreset =
     presets.find((preset) => preset.range.from === filters.from && preset.range.to === filters.to)
@@ -44,6 +46,10 @@ export function ProductFilterBar({
     (filters.agentKind !== undefined && filters.agentKind !== "all") ||
     Boolean(filters.role) ||
     filters.depth !== undefined;
+
+  useEffect(() => {
+    activePresetRef.current?.scrollIntoView({ block: "nearest", inline: "center" });
+  }, [activePreset]);
 
   function toggleModel(model: string) {
     const models = selectedModels.includes(model)
@@ -59,11 +65,22 @@ export function ProductFilterBar({
       className="bg-background/92 sticky top-16 z-30 -mx-2 space-y-2 rounded-xl border p-2 shadow-sm backdrop-blur-xl lg:top-0"
     >
       <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
-        <div className="flex scrollbar-none gap-1 overflow-x-auto" aria-label="Khoảng thời gian">
+        <div
+          className="flex snap-x snap-proximity scrollbar-none gap-1 overflow-x-auto [mask-image:linear-gradient(to_right,transparent,black_0.75rem,black_calc(100%-0.75rem),transparent)] px-2"
+          aria-label="Khoảng thời gian"
+        >
           {presets.map((preset) => (
             <Button
               key={preset.id}
+              ref={
+                activePreset === preset.id
+                  ? (node) => {
+                      activePresetRef.current = node;
+                    }
+                  : undefined
+              }
               aria-pressed={activePreset === preset.id}
+              className="shrink-0 snap-start"
               size="sm"
               variant={activePreset === preset.id ? "secondary" : "ghost"}
               onClick={() => onChange({ ...filters, ...preset.range })}
@@ -71,7 +88,19 @@ export function ProductFilterBar({
               {preset.label}
             </Button>
           ))}
-          <span className={cn(activePreset === "custom" && "ring-ring rounded-md ring-2")}>
+          <span
+            ref={
+              activePreset === "custom"
+                ? (node) => {
+                    activePresetRef.current = node;
+                  }
+                : undefined
+            }
+            className={cn(
+              "shrink-0 snap-start",
+              activePreset === "custom" && "ring-ring rounded-md ring-2",
+            )}
+          >
             <DateRangePicker
               value={filters}
               onChange={(range) => onChange({ ...filters, ...range })}
@@ -181,17 +210,12 @@ export function ProductFilterBar({
 
       {showAgentDetails ? (
         <div className="flex flex-wrap items-center gap-2 border-t pt-2">
-          <Input
-            aria-label="Lọc role agent"
-            className="h-8 w-44"
-            maxLength={100}
-            placeholder="Role, ví dụ Explorer"
-            value={filters.role ?? ""}
-            onChange={(event) => {
-              const role = event.target.value.trim();
-              if (role) onChange({ ...filters, role });
-              else onChange(withoutFilters(filters, "role"));
-            }}
+          <DebouncedRoleInput
+            key={filters.role ?? ""}
+            initialRole={filters.role ?? ""}
+            onCommit={(role) =>
+              onChange(role ? { ...filters, role } : withoutFilters(filters, "role"))
+            }
           />
           <Input
             aria-label="Lọc depth agent"
@@ -227,6 +251,34 @@ export function ProductFilterBar({
         </div>
       ) : null}
     </section>
+  );
+}
+
+function DebouncedRoleInput({
+  initialRole,
+  onCommit,
+}: {
+  initialRole: string;
+  onCommit: (role: string) => void;
+}) {
+  const [draft, setDraft] = useState(initialRole);
+  const commit = useEffectEvent(onCommit);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const role = draft.trim();
+      if (role !== initialRole) commit(role);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [draft, initialRole]);
+  return (
+    <Input
+      aria-label="Lọc role agent"
+      className="h-8 w-44"
+      maxLength={100}
+      placeholder="Role, ví dụ Explorer"
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+    />
   );
 }
 

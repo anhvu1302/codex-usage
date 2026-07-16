@@ -1,9 +1,8 @@
 import { CalendarDays } from "lucide-react";
-import { useMemo } from "react";
+import { lazy, Suspense, useMemo, useState } from "react";
 import type { DateRange as DayPickerRange } from "react-day-picker";
 
 import { Button } from "@/web/components/ui/button";
-import { Calendar } from "@/web/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/web/components/ui/popover";
 import { cn } from "@/web/lib/utils";
 import type { DateRange } from "@/shared/types";
@@ -12,8 +11,18 @@ type DateRangePickerProps = {
   onChange: (range: DateRange) => void;
   value: DateRange;
 };
+const LOCAL_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  day: "2-digit",
+  month: "2-digit",
+  timeZone: "Asia/Ho_Chi_Minh",
+  year: "numeric",
+});
+const Calendar = lazy(async () => ({
+  default: (await import("@/web/components/ui/calendar")).Calendar,
+}));
 
 export function DateRangePicker({ onChange, value }: DateRangePickerProps) {
+  const [open, setOpen] = useState(false);
   const selected = useMemo<DayPickerRange>(
     () => ({ from: parseDate(value.from), to: parseDate(value.to) }),
     [value.from, value.to],
@@ -25,7 +34,7 @@ export function DateRangePicker({ onChange, value }: DateRangePickerProps) {
   }
 
   return (
-    <Popover>
+    <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button
           aria-label={`Tuỳ chọn ngày, từ ${value.from} đến ${value.to}`}
@@ -37,7 +46,11 @@ export function DateRangePicker({ onChange, value }: DateRangePickerProps) {
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-auto p-0">
-        <Calendar mode="range" numberOfMonths={1} onSelect={handleSelect} selected={selected} />
+        {open ? (
+          <Suspense fallback={<div className="bg-muted h-80 w-72 animate-pulse rounded-md" />}>
+            <Calendar mode="range" numberOfMonths={1} onSelect={handleSelect} selected={selected} />
+          </Suspense>
+        ) : null}
       </PopoverContent>
     </Popover>
   );
@@ -49,13 +62,7 @@ function parseDate(value: string): Date {
 
 function formatDate(value: Date): string {
   const values = Object.fromEntries(
-    new Intl.DateTimeFormat("en-CA", {
-      day: "2-digit",
-      month: "2-digit",
-      timeZone: "Asia/Ho_Chi_Minh",
-      year: "numeric",
-    })
-      .formatToParts(value)
+    LOCAL_DATE_FORMATTER.formatToParts(value)
       .filter((part) => part.type !== "literal")
       .map((part) => [part.type, part.value]),
   );

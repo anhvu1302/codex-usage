@@ -1,54 +1,53 @@
-import type {
-  ActivityFilters,
-  ActivityKind,
-  ActivityResponse,
-  DataHealthResponse,
-  ImportStatus,
-  StorageStatus,
-} from "@/shared/types";
+import type { ActivityFilters, ActivityKind, ActivityQuery } from "@/shared/types";
+import { apiClient, rpcJson, rpcOptions, toDashboardQuery } from "@/web/lib/rpc-client";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
-  if (!response.ok) {
-    const body: unknown = await response.json().catch(() => null);
-    const message = isErrorPayload(body) ? body.error : null;
-    throw new Error(typeof message === "string" ? message : `Request failed (${response.status})`);
-  }
-  return response.json() as Promise<T>;
+function activityQuery(filters: ActivityFilters): ActivityQuery {
+  return {
+    ...toDashboardQuery(filters),
+    ...(filters.kinds?.length ? { kinds: filters.kinds.join(",") } : {}),
+    ...(filters.sessionId ? { session: filters.sessionId } : {}),
+  };
 }
 
-function activityQuery(filters: ActivityFilters): string {
-  const values = new URLSearchParams({ from: filters.from, to: filters.to });
-  if (filters.agentKind && filters.agentKind !== "all") {
-    values.set("agentKind", filters.agentKind);
-  }
-  if (filters.kinds?.length) values.set("kinds", filters.kinds.join(","));
-  if (filters.projectId) values.set("project", filters.projectId);
-  if (filters.sessionId) values.set("session", filters.sessionId);
-  return values.toString();
+export function fetchActivitySummary(filters: ActivityFilters, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.activity.summary.$get({ query: activityQuery(filters) }, rpcOptions(signal)),
+  );
 }
 
-export function fetchActivity(filters: ActivityFilters) {
-  return request<ActivityResponse>(`/api/activity?${activityQuery(filters)}`);
+export function fetchActivityTimeline(
+  filters: ActivityFilters,
+  options: { cursor?: string | undefined; limit?: number | undefined } = {},
+  signal?: AbortSignal,
+) {
+  return rpcJson(
+    apiClient.api.activity.timeline.$get(
+      {
+        query: {
+          ...activityQuery(filters),
+          ...(options.cursor ? { cursor: options.cursor } : {}),
+          limit: String(options.limit ?? 200),
+        },
+      },
+      rpcOptions(signal),
+    ),
+  );
 }
 
-export function fetchDataHealth() {
-  return request<DataHealthResponse>("/api/data-health");
+export function fetchDataHealth(signal?: AbortSignal) {
+  return rpcJson(apiClient.api["data-health"].$get(undefined, rpcOptions(signal)));
 }
 
 export function syncActivitySources() {
-  return request<ImportStatus>("/api/sync", { method: "POST" });
+  return rpcJson(apiClient.api.sync.$post());
 }
 
 export function queueDeepVerification() {
-  return request<{ accepted: true }>("/api/sync/deep", { method: "POST" });
+  return rpcJson(apiClient.api.sync.deep.$post());
 }
 
 export function compactActivityStorage() {
-  return request<StorageStatus>("/api/storage/compact", { method: "POST" });
+  return rpcJson(apiClient.api.storage.compact.$post());
 }
 
 export function activityFiltersFromSearch(
@@ -115,8 +114,4 @@ function setOptional(values: URLSearchParams, name: string, value: string | unde
 
 function validDate(value: string | null): string | null {
   return value && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
-}
-
-function isErrorPayload(value: unknown): value is { error: unknown } {
-  return typeof value === "object" && value !== null && "error" in value;
 }

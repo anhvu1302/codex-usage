@@ -11,6 +11,8 @@ test("projects, agents và insights dùng đúng filter", async ({ page }) => {
   await expect(page.getByText("/workspace/e2e").last()).toBeVisible();
   await expect(page.getByRole("heading", { name: /Xu hướng/ })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Task tốn nhiều nhất" })).toBeVisible();
+  await expect(page.getByTestId("project-table")).toHaveCount(1);
+  await expect(page.getByTestId("project-cards")).toHaveCount(0);
 
   await page
     .getByRole("button", { name: /Đổi alias/ })
@@ -25,11 +27,20 @@ test("projects, agents và insights dùng đúng filter", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Agent", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Main vs subagent" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Agent leaderboard" })).toBeVisible();
+  await expect(page.getByTestId("agent-table")).toHaveCount(1);
+  await expect(page.getByTestId("agent-cards")).toHaveCount(0);
   await page.getByRole("textbox", { name: "Lọc role agent" }).fill("explorer");
   await page.getByRole("spinbutton", { name: "Lọc depth agent" }).fill("1");
   await expect(page).toHaveURL(/role=explorer/);
   await expect(page).toHaveURL(/depth=1/);
   await expect(page.getByText("Mapper").last()).toBeVisible();
+
+  await page.setViewportSize({ height: 844, width: 390 });
+  await expect(page.getByTestId("agent-table")).toHaveCount(0);
+  await expect(page.getByTestId("agent-cards")).toHaveCount(1);
+  await page.goto("/projects?from=2026-07-12&to=2026-07-12");
+  await expect(page.getByTestId("project-table")).toHaveCount(0);
+  await expect(page.getByTestId("project-cards")).toHaveCount(1);
 
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);
@@ -60,4 +71,37 @@ test("budget, notification, pricing simulator và export", async ({ page }) => {
 
   await page.getByRole("button", { name: /Thông báo/ }).click();
   await expect(page.getByRole("heading", { name: "Trung tâm thông báo" })).toBeVisible();
+});
+
+test("role và turn text filters debounce thành một request cuối", async ({ page }) => {
+  await page.route("**/api/events", (route) => route.abort());
+  const requests: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith("/api/")) requests.push(`${url.pathname}${url.search}`);
+  });
+
+  await page.goto("/agents?from=2026-07-12&to=2026-07-12");
+  await expect(page.getByRole("heading", { name: "Agent", exact: true })).toBeVisible();
+  requests.length = 0;
+  await page
+    .getByRole("textbox", { name: "Lọc role agent" })
+    .pressSequentially("multi role", { delay: 15 });
+  await expect(page).toHaveURL(/role=multi(?:\+|%20)role/);
+  await page.waitForTimeout(350);
+  expect(requests.filter((url) => url.startsWith("/api/agents/summary?"))).toHaveLength(1);
+  expect(requests.filter((url) => url.startsWith("/api/agents/page?"))).toHaveLength(1);
+  expect(requests.filter((url) => url.startsWith("/api/projects/options?"))).toHaveLength(0);
+
+  await page.goto(`/turns?from=2026-07-12&to=2026-07-12`);
+  await expect(page.getByRole("heading", { level: 1, name: "Turns", exact: true })).toBeVisible();
+  requests.length = 0;
+  await page.getByRole("textbox", { name: "Tìm turn" }).pressSequentially("dashboard", {
+    delay: 15,
+  });
+  await page.getByRole("textbox", { name: "Reasoning effort" }).fill("high");
+  await expect(page).toHaveURL(/q=dashboard/);
+  await expect(page).toHaveURL(/effort=high/);
+  await page.waitForTimeout(350);
+  expect(requests.filter((url) => url.startsWith("/api/turns?"))).toHaveLength(1);
 });

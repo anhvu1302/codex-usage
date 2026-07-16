@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   calculateEfficiencyMetrics,
+  createUsageAnomalyDetector,
   getInclusiveDayCount,
   getPreviousDateRange,
   getProjectName,
@@ -126,6 +127,16 @@ describe("median anomaly detection", () => {
     expect(isUsageAnomaly(21, [0, 10, 20])).toBe(false);
     expect(isUsageAnomaly(40, [0, 10, 20])).toBe(false);
     expect(isUsageAnomaly(41, [0, 10, 20])).toBe(true);
+  });
+
+  it("reuses a precomputed baseline detector without changing anomaly semantics", () => {
+    const baseline = [0, 10, 20, Number.NaN, -1];
+    const detector = createUsageAnomalyDetector(baseline);
+
+    for (const value of [0, 20, 40, 41, Number.POSITIVE_INFINITY]) {
+      expect(detector(value)).toBe(isUsageAnomaly(value, baseline));
+    }
+    expect(baseline).toEqual([0, 10, 20, Number.NaN, -1]);
   });
 });
 

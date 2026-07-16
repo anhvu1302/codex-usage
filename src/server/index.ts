@@ -1,9 +1,15 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { basename, normalize } from "node:path";
 
 import { getRequestListener, serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import type { Context } from "hono";
 
 import { createApp } from "@/server/app";
+import { AppEventBus } from "@/server/app-events";
+import { AlertMaterializer } from "@/server/alert-materializer";
 import { getConfig } from "@/server/config";
 import { createDatabase, migrateDatabase } from "@/server/db/client";
 import { SessionImporter } from "@/server/importer";
@@ -17,8 +23,15 @@ migrateDatabase(database);
 backfillProjects(database);
 
 const sourceInventory = new SourceInventory(config.sessionsDirectory);
+const appEvents = new AppEventBus();
+const alertMaterializer = new AlertMaterializer(database, {
+  onChanged: (reason) => appEvents.publish(reason, ["alerts"]),
+});
+alertMaterializer.start();
 const importer = new SessionImporter(database, config.sessionsDirectory, {
   inventory: sourceInventory,
+  onDataChanged: () => alertMaterializer.invalidate("import"),
+  onRevision: (scopes) => appEvents.publish("import", scopes),
   scanIntervalMs: config.scanIntervalMinutes * 60 * 1_000,
 });
 await importer.start();
@@ -28,15 +41,37 @@ const retention = new RetentionService(
   config.sessionsDirectory,
   () => new Date(),
   sourceInventory,
+  (scopes) => appEvents.publish("retention", scopes),
+  () => alertMaterializer.invalidate("retention"),
 );
 retention.start();
 
-const app = createApp(database, importer, retention);
+const app = createApp(database, importer, retention, appEvents, alertMaterializer);
 const isProduction = process.env["NODE_ENV"] === "production";
 let closeVite: (() => Promise<void>) | undefined;
 if (isProduction) {
-  app.use("/*", serveStatic({ root: "./dist" }));
-  app.get("/*", serveStatic({ rewriteRequestPath: () => "/index.html", root: "./dist" }));
+  const indexEtag = createIndexEtag("./dist/index.html");
+  app.use("/*", async (context, next) => {
+    if (
+      (context.req.method === "GET" || context.req.method === "HEAD") &&
+      isSpaDocumentPath(context.req.path) &&
+      context.req.header("if-none-match") === indexEtag
+    ) {
+      context.header("Cache-Control", "no-cache");
+      context.header("ETag", indexEtag);
+      return context.body(null, 304);
+    }
+    return next();
+  });
+  app.use("/*", serveStatic({ onFound: staticHeaders(indexEtag), root: "./dist" }));
+  app.get(
+    "/*",
+    serveStatic({
+      onFound: staticHeaders(indexEtag),
+      rewriteRequestPath: () => "/index.html",
+      root: "./dist",
+    }),
+  );
 }
 
 const server = isProduction
@@ -59,6 +94,7 @@ function shutdown(): Promise<void> {
 }
 
 async function shutdownServices() {
+  alertMaterializer.stop();
   retention.stop();
   await importer.stop();
   await closeVite?.();
@@ -83,9 +119,26 @@ function exitAfterShutdown() {
 process.once("SIGINT", exitAfterShutdown);
 process.once("SIGTERM", exitAfterShutdown);
 process.on("message", (message) => {
-  if (message !== "shutdown") return;
-  exitAfterShutdown();
+  if (message === "shutdown") {
+    exitAfterShutdown();
+    return;
+  }
+  if (isBenchmarkMemoryMessage(message)) {
+    process.send?.({
+      id: message.id,
+      memory: process.memoryUsage(),
+      type: "benchmark:memory",
+    });
+  }
 });
+
+function isBenchmarkMemoryMessage(
+  value: unknown,
+): value is { id: string; type: "benchmark:memory" } {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as { id?: unknown; type?: unknown };
+  return candidate.type === "benchmark:memory" && typeof candidate.id === "string";
+}
 
 async function startDevelopmentServer(fetch: typeof app.fetch, port: number): Promise<Server> {
   const server = createServer();
@@ -116,4 +169,45 @@ async function startDevelopmentServer(fetch: typeof app.fetch, port: number): Pr
     });
   });
   return server;
+}
+
+function createIndexEtag(path: string): string {
+  const digest = createHash("sha256").update(readFileSync(path)).digest("base64url");
+  return `"${digest}"`;
+}
+
+function staticHeaders(indexEtag: string) {
+  return (path: string, context: Context) => {
+    const normalized = normalize(path);
+    const filename = basename(normalized);
+    if (filename === "index.html") {
+      context.header("Cache-Control", "no-cache");
+      context.header("ETag", indexEtag);
+      return;
+    }
+    if (normalized.includes(`${normalize("dist/assets")}/`) && hasContentHash(filename)) {
+      context.header("Cache-Control", "public, max-age=31536000, immutable");
+      return;
+    }
+    if (
+      filename === "site.webmanifest" ||
+      filename === "favicon.ico" ||
+      filename === "favicon.svg" ||
+      filename.startsWith("favicon-") ||
+      filename.startsWith("apple-touch-icon")
+    ) {
+      context.header("Cache-Control", "public, max-age=86400");
+      return;
+    }
+    context.header("Cache-Control", "no-cache");
+  };
+}
+
+function hasContentHash(filename: string): boolean {
+  return /-[A-Za-z0-9_-]{8,}\.(?:css|js|map|woff2?|png|svg)$/.test(filename);
+}
+
+function isSpaDocumentPath(path: string): boolean {
+  const filename = path.split("/").at(-1) ?? "";
+  return path === "/" || filename === "index.html" || !filename.includes(".");
 }

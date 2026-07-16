@@ -1,12 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowRight, FolderKanban, Pencil, Sparkles } from "lucide-react";
-import { useMemo, useState } from "react";
+import { ArrowRight, FolderKanban, Pencil } from "lucide-react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { Bar, CartesianGrid, ComposedChart, Line, Tooltip, XAxis, YAxis } from "recharts";
 import { toast } from "sonner";
 
 import { ProductFilterBar } from "@/web/components/product-filter-bar";
-import { ExportActions } from "@/web/components/product-tools";
+import { ExportActions } from "@/web/components/export-actions";
 import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
 import {
@@ -16,7 +15,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/web/components/ui/card";
-import { ChartContainer, type ChartConfig } from "@/web/components/ui/chart";
 import {
   Dialog,
   DialogContent,
@@ -38,7 +36,9 @@ import {
 import { fetchModels } from "@/web/lib/api";
 import {
   compactTokens,
-  fetchProjects,
+  fetchProjectAnalytics,
+  fetchProjectsPage,
+  fetchProjectsSummary,
   filtersFromSearch,
   formatPercent,
   formatTokens,
@@ -46,40 +46,115 @@ import {
   renameProject,
   updateFilterSearch,
 } from "@/web/lib/product-api";
-import type { AgentFilters, DailyUsage, ProjectSummary } from "@/shared/types";
+import { useMediaQuery } from "@/web/lib/use-media-query";
+import { queueLiveMutationScopes } from "@/web/lib/live-events";
+import type {
+  AgentFilters,
+  DailyUsage,
+  ProjectAnalyticsResponse,
+  ProjectListItem,
+  ProjectOptionsResponse,
+  ProjectsPageResponse,
+} from "@/shared/types";
 
-const chartConfig = {
-  cost: { color: "var(--chart-2)", label: "Cost" },
-  tokens: { color: "var(--chart-1)", label: "Token" },
-} satisfies ChartConfig;
+const ProjectTrendChart = lazy(async () => ({
+  default: (await import("@/web/components/project-trend-chart")).ProjectTrendChart,
+}));
+const PROJECT_PAGE_SIZE = 50;
 
 export function ProjectsPage() {
+  const desktopProjects = useMediaQuery("(min-width: 768px)");
   const [search, setSearch] = useSearchParams();
   const filters = useMemo<AgentFilters>(() => filtersFromSearch(search), [search]);
+  const page = positiveInteger(search.get("projectPage")) ?? 1;
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [renaming, setRenaming] = useState<ProjectSummary | null>(null);
+  const [renaming, setRenaming] = useState<ProjectListItem | null>(null);
   const queryClient = useQueryClient();
-  const models = useQuery({ queryKey: ["models"], queryFn: fetchModels });
-  const projects = useQuery({
-    queryKey: ["projects", filters],
-    queryFn: () => fetchProjects(filters),
+  const models = useQuery({
+    queryKey: ["models"],
+    queryFn: ({ signal }) => fetchModels(signal),
+    staleTime: 5 * 60_000,
   });
-  const selected =
+  const projectSummary = useQuery({
+    queryKey: ["projects", "summary", filters],
+    queryFn: ({ signal }) => fetchProjectsSummary(filters, signal),
+    staleTime: 30_000,
+  });
+  const projectPageFilters = useMemo(
+    () => ({ ...filters, page, pageSize: PROJECT_PAGE_SIZE }),
+    [filters, page],
+  );
+  const projects = useQuery({
+    queryKey: ["projects", "page", projectPageFilters],
+    queryFn: ({ signal }) => fetchProjectsPage(projectPageFilters, signal),
+    staleTime: 30_000,
+  });
+  const selectedSummary =
     projects.data?.projects.find((project) => project.id === selectedId) ??
     projects.data?.projects[0];
+  const settledSelectedSummary = projects.isPlaceholderData ? undefined : selectedSummary;
+  const projectDetail = useQuery({
+    enabled: Boolean(settledSelectedSummary),
+    queryKey: ["projects", "detail", settledSelectedSummary?.id, filters],
+    queryFn: ({ signal }) => fetchProjectAnalytics(settledSelectedSummary!.id, filters, signal),
+    placeholderData: () => undefined,
+    staleTime: 30_000,
+  });
+  const selected = projectDetail.data?.project;
+  const pageCount = Math.max(1, Math.ceil((projects.data?.total ?? 0) / PROJECT_PAGE_SIZE));
+
   const rename = useMutation({
     mutationFn: ({ displayName, id }: { displayName: string; id: string }) =>
       renameProject(id, displayName),
     onError: (error) => toast.error(error.message),
-    onSuccess: () => {
+    onSuccess: ({ project }) => {
       setRenaming(null);
       toast.success("Đã đổi alias project.");
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      queryClient.setQueriesData<ProjectsPageResponse>(
+        { queryKey: ["projects", "page"] },
+        (current) =>
+          current
+            ? {
+                ...current,
+                projects: current.projects.map((item) =>
+                  item.id === project.id ? { ...item, displayName: project.displayName } : item,
+                ),
+              }
+            : current,
+      );
+      queryClient.setQueriesData<ProjectAnalyticsResponse>(
+        { queryKey: ["projects", "detail"] },
+        (current) =>
+          current?.project.id === project.id
+            ? { project: { ...current.project, displayName: project.displayName } }
+            : current,
+      );
+      queryClient.setQueriesData<ProjectOptionsResponse>(
+        { queryKey: ["projects", "options"] },
+        (current) =>
+          current
+            ? {
+                projects: current.projects.map((item) =>
+                  item.id === project.id ? { ...item, displayName: project.displayName } : item,
+                ),
+              }
+            : current,
+      );
+      queueLiveMutationScopes(queryClient, ["catalog", "projects"]);
     },
   });
 
   function applyFilters(next: AgentFilters) {
-    setSearch(updateFilterSearch(search, next));
+    const updated = updateFilterSearch(search, next);
+    updated.delete("projectPage");
+    setSearch(updated);
+  }
+
+  function selectPage(next: number) {
+    const updated = new URLSearchParams(search);
+    if (next <= 1) updated.delete("projectPage");
+    else updated.set("projectPage", String(next));
+    setSearch(updated);
   }
 
   function turnTarget(sessionId: string, projectId: string) {
@@ -89,19 +164,7 @@ export function ProjectsPage() {
     return { pathname: "/turns", search: next.toString() };
   }
 
-  const totals = useMemo(
-    () =>
-      (projects.data?.projects ?? []).reduce(
-        (value, project) => ({
-          cost: value.cost + project.estimatedCostUsd,
-          requests: value.requests + project.requestCount,
-          sessions: value.sessions + project.sessionCount,
-          tokens: value.tokens + project.totalTokens,
-        }),
-        { cost: 0, requests: 0, sessions: 0, tokens: 0 },
-      ),
-    [projects.data?.projects],
-  );
+  const totals = projectSummary.data?.kpis;
 
   return (
     <div className="motion-stagger space-y-6">
@@ -118,7 +181,7 @@ export function ProjectsPage() {
             Token, estimated cost, model mix và tỷ trọng subagent theo CWD đã chuẩn hoá.
           </p>
         </div>
-        <Badge variant="outline">{projects.data?.projects.length ?? 0} dự án có usage</Badge>
+        <Badge variant="outline">{projectSummary.data?.projectCount ?? 0} dự án có usage</Badge>
       </header>
 
       <ProductFilterBar
@@ -127,24 +190,25 @@ export function ProjectsPage() {
         onChange={applyFilters}
       />
 
+      {projectSummary.isError ? <ErrorCard message={projectSummary.error.message} /> : null}
       {projects.isError ? <ErrorCard message={projects.error.message} /> : null}
 
       <h2 className="sr-only">Phân tích usage theo project</h2>
 
       <section
         aria-label="Tổng usage theo project"
-        className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"
+        className="grid gap-3 min-[360px]:grid-cols-2 sm:gap-4 xl:grid-cols-4"
       >
-        <SummaryCard label="Dự án" value={formatTokens(projects.data?.projects.length ?? 0)} />
-        <SummaryCard label="Token" value={compactTokens(totals.tokens)} />
-        <SummaryCard label="Cost ước tính" value={formatUsd(totals.cost)} />
+        <SummaryCard label="Dự án" value={formatTokens(projectSummary.data?.projectCount ?? 0)} />
+        <SummaryCard label="Token" value={compactTokens(totals?.totalTokens ?? 0)} />
+        <SummaryCard label="Cost ước tính" value={formatUsd(totals?.estimatedCostUsd ?? 0)} />
         <SummaryCard
           label="Yêu cầu / phiên"
-          value={`${formatTokens(totals.requests)} / ${formatTokens(totals.sessions)}`}
+          value={`${formatTokens(totals?.requestCount ?? 0)} / ${formatTokens(totals?.sessionCount ?? 0)}`}
         />
       </section>
 
-      <Card className="overflow-hidden">
+      <Card className="deferred-section overflow-hidden">
         <CardHeader>
           <CardTitle>Usage theo dự án</CardTitle>
           <CardDescription>
@@ -153,95 +217,132 @@ export function ProjectsPage() {
         </CardHeader>
         <CardContent className="p-0">
           {projects.isLoading ? <ProjectTableSkeleton /> : null}
-          <div className="grid gap-3 p-4 md:hidden">
-            {projects.data?.projects.map((project) => (
-              <ProjectCard
-                key={project.id}
-                active={selected?.id === project.id}
-                project={project}
-                onRename={() => setRenaming(project)}
-                onSelect={() => setSelectedId(project.id)}
-              />
-            ))}
-          </div>
-          <div className="hidden overflow-x-auto md:block">
-            <Table className="min-w-[980px]">
-              <TableHeader className="bg-card sticky top-0 z-10">
-                <TableRow>
-                  <TableHead>Dự án</TableHead>
-                  <TableHead>Token</TableHead>
-                  <TableHead>Cost</TableHead>
-                  <TableHead>Yêu cầu</TableHead>
-                  <TableHead>Phiên</TableHead>
-                  <TableHead>Subagent share</TableHead>
-                  <TableHead>Model mix</TableHead>
-                  <TableHead className="text-right">Thao tác</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {projects.data?.projects.map((project) => (
-                  <TableRow
-                    key={project.id}
-                    data-state={selected?.id === project.id ? "selected" : undefined}
-                  >
-                    <TableCell className="max-w-72">
-                      <button
-                        className="focus-visible:ring-ring w-full rounded-sm text-left outline-none focus-visible:ring-2"
-                        type="button"
-                        onClick={() => setSelectedId(project.id)}
-                      >
-                        <span className="block truncate font-medium">{project.displayName}</span>
-                        <span
-                          className="text-muted-foreground block truncate text-xs"
-                          title={project.displayPath}
-                        >
-                          {project.displayPath}
-                        </span>
-                      </button>
-                    </TableCell>
-                    <TableCell className="font-medium tabular-nums">
-                      {formatTokens(project.totalTokens)}
-                    </TableCell>
-                    <TableCell className="tabular-nums">
-                      {formatUsd(project.estimatedCostUsd)}
-                    </TableCell>
-                    <TableCell className="tabular-nums">
-                      {formatTokens(project.requestCount)}
-                    </TableCell>
-                    <TableCell className="tabular-nums">
-                      {formatTokens(project.sessionCount)}
-                    </TableCell>
-                    <TableCell>
-                      <ShareBar value={safeRatio(project.subagentTokens, project.totalTokens)} />
-                    </TableCell>
-                    <TableCell>
-                      <ModelMix values={project.modelMix} />
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <Button
-                        aria-label={`Đổi alias ${project.displayName}`}
-                        size="icon"
-                        variant="ghost"
-                        onClick={() => setRenaming(project)}
-                      >
-                        <Pencil className="size-4" />
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {!projects.isLoading && projects.data?.projects.length === 0 ? (
+          {desktopProjects ? (
+            <div className="overflow-x-auto" data-testid="project-table">
+              <Table className="min-w-[980px]">
+                <TableHeader className="bg-card sticky top-0 z-10">
                   <TableRow>
-                    <TableCell className="text-muted-foreground h-28 text-center" colSpan={8}>
-                      Chưa có project trong khoảng đã chọn.
-                    </TableCell>
+                    <TableHead>Dự án</TableHead>
+                    <TableHead>Token</TableHead>
+                    <TableHead>Cost</TableHead>
+                    <TableHead>Yêu cầu</TableHead>
+                    <TableHead>Phiên</TableHead>
+                    <TableHead>Subagent share</TableHead>
+                    <TableHead>Model mix</TableHead>
+                    <TableHead className="text-right">Thao tác</TableHead>
                   </TableRow>
-                ) : null}
-              </TableBody>
-            </Table>
-          </div>
+                </TableHeader>
+                <TableBody>
+                  {projects.data?.projects.map((project) => (
+                    <TableRow
+                      key={project.id}
+                      data-state={selectedSummary?.id === project.id ? "selected" : undefined}
+                    >
+                      <TableCell className="max-w-72">
+                        <button
+                          className="focus-visible:ring-ring w-full rounded-sm text-left outline-none focus-visible:ring-2"
+                          type="button"
+                          onClick={() => setSelectedId(project.id)}
+                        >
+                          <span className="block truncate font-medium">{project.displayName}</span>
+                          <span
+                            className="text-muted-foreground block truncate text-xs"
+                            title={project.displayPath}
+                          >
+                            {project.displayPath}
+                          </span>
+                        </button>
+                      </TableCell>
+                      <TableCell className="font-medium tabular-nums">
+                        {formatTokens(project.totalTokens)}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatUsd(project.estimatedCostUsd)}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatTokens(project.requestCount)}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatTokens(project.sessionCount)}
+                      </TableCell>
+                      <TableCell>
+                        <ShareBar value={safeRatio(project.subagentTokens, project.totalTokens)} />
+                      </TableCell>
+                      <TableCell>
+                        <ModelMix count={project.modelCount} values={project.topModels} />
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          aria-label={`Đổi alias ${project.displayName}`}
+                          size="icon"
+                          variant="ghost"
+                          onClick={() => setRenaming(project)}
+                        >
+                          <Pencil className="size-4" />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {!projects.isLoading && projects.data?.projects.length === 0 ? (
+                    <TableRow>
+                      <TableCell className="text-muted-foreground h-28 text-center" colSpan={8}>
+                        Chưa có project trong khoảng đã chọn.
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </TableBody>
+              </Table>
+            </div>
+          ) : (
+            <div className="grid gap-3 p-4" data-testid="project-cards">
+              {projects.data?.projects.map((project) => (
+                <ProjectCard
+                  key={project.id}
+                  active={selectedSummary?.id === project.id}
+                  project={project}
+                  onRename={() => setRenaming(project)}
+                  onSelect={() => setSelectedId(project.id)}
+                />
+              ))}
+            </div>
+          )}
+          {projects.data && projects.data.total > PROJECT_PAGE_SIZE ? (
+            <div className="flex items-center justify-between gap-3 border-t p-4">
+              <p className="text-muted-foreground text-sm">
+                Trang {page} / {pageCount} · {formatTokens(projects.data.total)} dự án
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  aria-label="Trang dự án trước"
+                  disabled={page <= 1 || projects.isFetching}
+                  size="sm"
+                  variant="outline"
+                  onClick={() => selectPage(page - 1)}
+                >
+                  Trước
+                </Button>
+                <Button
+                  aria-label="Trang dự án tiếp theo"
+                  disabled={page >= pageCount || projects.isFetching}
+                  size="sm"
+                  variant="outline"
+                  onClick={() => selectPage(page + 1)}
+                >
+                  Sau
+                </Button>
+              </div>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
+      {selectedSummary && projectDetail.isLoading ? (
+        <section aria-label="Đang tải chi tiết dự án" className="grid gap-4 xl:grid-cols-5">
+          <Skeleton className="h-96 xl:col-span-3" />
+          <Skeleton className="h-96 xl:col-span-2" />
+        </section>
+      ) : null}
+      {projectDetail.isError ? <ErrorCard message={projectDetail.error.message} /> : null}
       {selected ? (
         <section aria-labelledby="project-detail-heading" className="grid gap-4 xl:grid-cols-5">
           <Card className="xl:col-span-3">
@@ -250,7 +351,7 @@ export function ProjectsPage() {
               <CardDescription>Token và estimated cost theo ngày.</CardDescription>
             </CardHeader>
             <CardContent>
-              <ProjectTrend data={selected.daily} />
+              <DeferredProjectTrend data={selected.daily} />
             </CardContent>
           </Card>
           <Card className="xl:col-span-2">
@@ -316,7 +417,7 @@ function ProjectCard({
   active: boolean;
   onRename: () => void;
   onSelect: () => void;
-  project: ProjectSummary;
+  project: ProjectListItem;
 }) {
   return (
     <article
@@ -359,86 +460,37 @@ function ProjectCard({
   );
 }
 
-function ProjectTrend({ data }: { data: DailyUsage[] }) {
-  if (data.length === 0) return <EmptyChart />;
+function DeferredProjectTrend({ data }: { data: DailyUsage[] }) {
+  const container = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(() => typeof IntersectionObserver === "undefined");
+  useEffect(() => {
+    if (visible || !container.current) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry?.isIntersecting) return;
+        setVisible(true);
+        observer.disconnect();
+      },
+      { rootMargin: "500px" },
+    );
+    observer.observe(container.current);
+    return () => observer.disconnect();
+  }, [visible]);
   return (
-    <>
-      <ChartContainer
-        config={chartConfig}
-        role="img"
-        aria-label={`Biểu đồ trend project theo ${data.length} ngày`}
-      >
-        <ComposedChart data={data} margin={{ left: 4, right: 4, top: 8 }}>
-          <CartesianGrid strokeDasharray="3 3" vertical={false} />
-          <XAxis
-            dataKey="date"
-            tickFormatter={(value: string) => value.slice(5)}
-            tickLine={false}
-            axisLine={false}
-          />
-          <YAxis
-            yAxisId="tokens"
-            tickFormatter={compactTokens}
-            tickLine={false}
-            axisLine={false}
-            width={48}
-          />
-          <YAxis
-            yAxisId="cost"
-            orientation="right"
-            tickFormatter={(value: number) => `$${value.toFixed(0)}`}
-            tickLine={false}
-            axisLine={false}
-            width={44}
-          />
-          <Tooltip
-            formatter={(value, name) =>
-              name === "Token" ? formatTokens(Number(value)) : formatUsd(Number(value))
-            }
-          />
-          <Bar
-            dataKey="totalTokens"
-            fill="var(--chart-1)"
-            name="Token"
-            radius={[4, 4, 0, 0]}
-            yAxisId="tokens"
-          />
-          <Line
-            dataKey="estimatedCostUsd"
-            dot={false}
-            name="Cost"
-            stroke="var(--chart-2)"
-            strokeWidth={2}
-            type="monotone"
-            yAxisId="cost"
-          />
-        </ComposedChart>
-      </ChartContainer>
-      <table className="sr-only">
-        <caption>Dữ liệu trend project</caption>
-        <thead>
-          <tr>
-            <th>Ngày</th>
-            <th>Token</th>
-            <th>Cost</th>
-          </tr>
-        </thead>
-        <tbody>
-          {data.map((item) => (
-            <tr key={item.date}>
-              <td>{item.date}</td>
-              <td>{item.totalTokens}</td>
-              <td>{item.estimatedCostUsd}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </>
+    <div ref={container} className="min-h-72">
+      {visible ? (
+        <Suspense fallback={<Skeleton className="h-72" />}>
+          <ProjectTrendChart data={data} />
+        </Suspense>
+      ) : (
+        <Skeleton className="h-72" />
+      )}
+    </div>
   );
 }
 
-function ModelMix({ values }: { values: ProjectSummary["modelMix"] }) {
-  const visible = values.filter((value) => value.totalTokens > 0).slice(0, 2);
+function ModelMix({ count, values }: { count: number; values: ProjectListItem["topModels"] }) {
+  const visible = values.filter((value) => value.totalTokens > 0);
   return (
     <div className="flex max-w-64 flex-wrap gap-1">
       {visible.map((value) => (
@@ -446,7 +498,7 @@ function ModelMix({ values }: { values: ProjectSummary["modelMix"] }) {
           {value.model}
         </Badge>
       ))}
-      {values.length > 2 ? <Badge variant="secondary">+{values.length - 2}</Badge> : null}
+      {count > visible.length ? <Badge variant="secondary">+{count - visible.length}</Badge> : null}
     </div>
   );
 }
@@ -492,7 +544,7 @@ function RenameProjectDialog({
   loading: boolean;
   onClose: () => void;
   onSave: (name: string) => void;
-  project: ProjectSummary;
+  project: Pick<ProjectListItem, "displayName" | "id">;
 }) {
   const [value, setValue] = useState(project.displayName);
   return (
@@ -543,14 +595,6 @@ function ProjectTableSkeleton() {
   );
 }
 
-function EmptyChart() {
-  return (
-    <div className="text-muted-foreground flex h-72 items-center justify-center rounded-lg border border-dashed text-sm">
-      <Sparkles className="mr-2 size-4" /> Chưa có dữ liệu trend.
-    </div>
-  );
-}
-
 function ErrorCard({ message }: { message: string }) {
   return (
     <Card className="border-destructive">
@@ -561,4 +605,9 @@ function ErrorCard({ message }: { message: string }) {
 
 function safeRatio(value: number, total: number) {
   return total > 0 ? value / total : 0;
+}
+
+function positiveInteger(value: string | null): number | null {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }

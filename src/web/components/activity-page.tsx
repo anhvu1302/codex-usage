@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import {
   Activity,
   AlertOctagon,
@@ -19,9 +19,8 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { CartesianGrid, Line, LineChart, Tooltip, XAxis, YAxis } from "recharts";
 
 import { DataHealthCenter } from "@/web/components/data-health-center";
 import { DateRangePicker } from "@/web/components/date-range-picker";
@@ -34,7 +33,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/web/components/ui/card";
-import { ChartContainer, type ChartConfig } from "@/web/components/ui/chart";
 import { Input } from "@/web/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/web/components/ui/popover";
 import {
@@ -48,12 +46,13 @@ import { Skeleton } from "@/web/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/web/components/ui/tabs";
 import {
   activityFiltersFromSearch,
-  fetchActivity,
+  fetchActivitySummary,
+  fetchActivityTimeline,
   updateActivitySearch,
 } from "@/web/lib/activity-api";
 import {
   defaultDateRange,
-  fetchProjects,
+  fetchProjectOptions,
   formatTokens,
   localDate,
   shiftDate,
@@ -65,8 +64,9 @@ import type {
   ActivitySummary,
   ActivityTimelineItem,
   DashboardFilters,
-  ProjectSummary,
 } from "@/shared/types";
+
+type ProjectOption = { displayName: string; id: string };
 
 type TrendGrouping = "agent" | "kind" | "project";
 type ActivityTab = "health" | "overview" | "timeline";
@@ -95,7 +95,19 @@ const activityKindOptions: {
   { icon: Check, kind: "task_completed", label: "Task complete" },
   { icon: Wrench, kind: "other", label: "Other tool" },
 ];
-
+const TIMESTAMP_FORMATTER = new Intl.DateTimeFormat("vi-VN", {
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  month: "2-digit",
+  second: "2-digit",
+  timeZone: "Asia/Ho_Chi_Minh",
+});
+const LOCAL_DATE_FORMATTER = new Intl.DateTimeFormat("vi-VN", {
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+});
 const highlightedKinds: ActivityKind[] = ["patch", "mcp", "web", "compaction", "abort"];
 const chartColors = [
   "var(--chart-1)",
@@ -105,6 +117,9 @@ const chartColors = [
   "var(--chart-5)",
   "oklch(0.66 0.15 220)",
 ];
+const ActivityTrendChart = lazy(async () => ({
+  default: (await import("@/web/components/activity-trend-chart")).ActivityTrendChart,
+}));
 
 export function ActivityPage() {
   const [search, setSearch] = useSearchParams();
@@ -113,8 +128,22 @@ export function ActivityPage() {
   const tabNavigation = useRef(activeTab);
   const [trendGrouping, setTrendGrouping] = useState<TrendGrouping>("kind");
   const activity = useQuery({
-    queryKey: ["activity", filters],
-    queryFn: () => fetchActivity(filters),
+    queryKey: ["activity", "summary", filters],
+    queryFn: ({ signal }) => fetchActivitySummary(filters, signal),
+    staleTime: 30_000,
+  });
+  const timeline = useInfiniteQuery({
+    enabled: activeTab === "timeline",
+    queryKey: ["activity", "timeline", filters],
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam, signal }) =>
+      fetchActivityTimeline(
+        filters,
+        { ...(pageParam ? { cursor: pageParam } : {}), limit: 200 },
+        signal,
+      ),
+    getNextPageParam: (page) => page.nextCursor ?? undefined,
+    staleTime: 30_000,
   });
   const projectFilters = useMemo<DashboardFilters>(() => {
     const next: DashboardFilters = { from: filters.from, to: filters.to };
@@ -122,8 +151,9 @@ export function ActivityPage() {
     return next;
   }, [filters.agentKind, filters.from, filters.to]);
   const projects = useQuery({
-    queryKey: ["projects", "activity-options", projectFilters],
-    queryFn: () => fetchProjects(projectFilters),
+    queryKey: ["projects", "options", projectFilters],
+    queryFn: ({ signal }) => fetchProjectOptions(projectFilters, signal),
+    staleTime: 5 * 60_000,
   });
 
   useEffect(() => {
@@ -150,6 +180,10 @@ export function ActivityPage() {
   const subagentEvents = sumWhere(daily, (row) => row.agentKind === "subagent");
   const counters = new Map(
     highlightedKinds.map((kind) => [kind, sumWhere(daily, (row) => row.kind === kind)]),
+  );
+  const timelineItems = useMemo(
+    () => timeline.data?.pages.flatMap((page) => page.items) ?? [],
+    [timeline.data?.pages],
   );
 
   return (
@@ -197,7 +231,10 @@ export function ActivityPage() {
         </Card>
       ) : null}
 
-      <section aria-label="Tổng quan activity" className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <section
+        aria-label="Tổng quan activity"
+        className="grid gap-3 min-[360px]:grid-cols-2 sm:gap-4 xl:grid-cols-4"
+      >
         <SummaryCard
           description="Mọi metadata event khớp filter"
           icon={Activity}
@@ -222,9 +259,9 @@ export function ActivityPage() {
         <SummaryCard
           description="Session có metadata trong raw timeline"
           icon={Network}
-          label="Session timeline"
+          label="Event timeline"
           loading={activity.isLoading}
-          value={new Set(activity.data?.timeline.map((item) => item.sessionId)).size}
+          value={activity.data?.timelineTotal ?? 0}
         />
       </section>
 
@@ -301,9 +338,13 @@ export function ActivityPage() {
         <TabsContent value="timeline">
           <ActivityTimeline
             key={activityFilterKey(filters)}
-            items={activity.data?.timeline ?? []}
-            loading={activity.isLoading}
-            timelineTruncated={activity.data?.timelineTruncated ?? false}
+            error={timeline.error}
+            hasMore={timeline.hasNextPage}
+            items={timelineItems}
+            loading={timeline.isLoading}
+            loadingMore={timeline.isFetchingNextPage}
+            onLoadMore={() => void timeline.fetchNextPage()}
+            total={activity.data?.timelineTotal ?? 0}
             coverage={activity.data?.timelineCoverage.status ?? "full"}
           />
         </TabsContent>
@@ -323,14 +364,19 @@ function ActivityFilterBar({
 }: {
   filters: ActivityFilters;
   onChange: (filters: ActivityFilters) => void;
-  projects: ProjectSummary[];
+  projects: ProjectOption[];
 }) {
+  const activePresetRef = useRef<HTMLElement | null>(null);
   const [sessionDraft, setSessionDraft] = useState(filters.sessionId ?? "");
   const presets = datePresets();
   const activePreset =
     presets.find((preset) => preset.range.from === filters.from && preset.range.to === filters.to)
       ?.id ?? "custom";
   const selectedKinds = filters.kinds ?? [];
+
+  useEffect(() => {
+    activePresetRef.current?.scrollIntoView({ block: "nearest", inline: "center" });
+  }, [activePreset]);
 
   function toggleKind(kind: ActivityKind) {
     const kinds = selectedKinds.includes(kind)
@@ -347,11 +393,22 @@ function ActivityFilterBar({
       className="bg-background/92 sticky top-16 z-30 -mx-2 space-y-2 rounded-xl border p-2 shadow-sm backdrop-blur-xl lg:top-0"
     >
       <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
-        <div className="flex scrollbar-none gap-1 overflow-x-auto" aria-label="Khoảng thời gian">
+        <div
+          className="flex snap-x snap-proximity scrollbar-none gap-1 overflow-x-auto [mask-image:linear-gradient(to_right,transparent,black_0.75rem,black_calc(100%-0.75rem),transparent)] px-2"
+          aria-label="Khoảng thời gian"
+        >
           {presets.map((preset) => (
             <Button
               key={preset.id}
+              ref={
+                activePreset === preset.id
+                  ? (node) => {
+                      activePresetRef.current = node;
+                    }
+                  : undefined
+              }
               aria-pressed={activePreset === preset.id}
+              className="shrink-0 snap-start"
               size="sm"
               variant={activePreset === preset.id ? "secondary" : "ghost"}
               onClick={() => onChange({ ...filters, ...preset.range })}
@@ -359,7 +416,19 @@ function ActivityFilterBar({
               {preset.label}
             </Button>
           ))}
-          <span className={cn(activePreset === "custom" && "ring-ring rounded-md ring-2")}>
+          <span
+            ref={
+              activePreset === "custom"
+                ? (node) => {
+                    activePresetRef.current = node;
+                  }
+                : undefined
+            }
+            className={cn(
+              "shrink-0 snap-start",
+              activePreset === "custom" && "ring-ring rounded-md ring-2",
+            )}
+          >
             <DateRangePicker
               value={filters}
               onChange={(range) => onChange({ ...filters, ...range })}
@@ -582,55 +651,25 @@ function ActivityTrend({
 }: {
   daily: ActivitySummary[];
   grouping: TrendGrouping;
-  projects: ProjectSummary[];
+  projects: ProjectOption[];
 }) {
+  const [showTable, setShowTable] = useState(false);
   const { points, series } = useMemo(
     () => buildTrend(daily, grouping, projects),
     [daily, grouping, projects],
   );
-  const config = Object.fromEntries(
-    series.map((item) => [item.id, { color: item.color, label: item.label }]),
-  ) satisfies ChartConfig;
-
   if (points.length === 0 || series.length === 0)
     return <EmptyState label="Chưa có event trong range." />;
 
   return (
     <>
-      <ChartContainer
-        aria-label={`Biểu đồ event activity theo ngày, nhóm theo ${groupingLabel(grouping)}`}
-        className="h-72"
-        config={config}
-        role="img"
-      >
-        <LineChart data={points} margin={{ left: 2, right: 8, top: 8 }}>
-          <CartesianGrid strokeDasharray="3 3" vertical={false} />
-          <XAxis
-            axisLine={false}
-            dataKey="date"
-            tickFormatter={(value: string) => value.slice(5)}
-            tickLine={false}
-          />
-          <YAxis
-            axisLine={false}
-            tickFormatter={(value: number) => compactCount(value)}
-            tickLine={false}
-            width={42}
-          />
-          <Tooltip formatter={(value) => formatTokens(Number(value))} />
-          {series.map((item) => (
-            <Line
-              key={item.id}
-              dataKey={item.id}
-              dot={false}
-              name={item.label}
-              stroke={item.color}
-              strokeWidth={2}
-              type="monotone"
-            />
-          ))}
-        </LineChart>
-      </ChartContainer>
+      <Suspense fallback={<Skeleton className="h-72" />}>
+        <ActivityTrendChart
+          ariaLabel={`Biểu đồ event activity theo ngày, nhóm theo ${groupingLabel(grouping)}`}
+          points={points}
+          series={series}
+        />
+      </Suspense>
       <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2" aria-hidden="true">
         {series.map((item) => (
           <span key={item.id} className="flex items-center gap-1.5 text-xs">
@@ -639,27 +678,40 @@ function ActivityTrend({
           </span>
         ))}
       </div>
-      <table className="sr-only">
-        <caption>Hoạt động theo ngày, nhóm theo {groupingLabel(grouping)}</caption>
-        <thead>
-          <tr>
-            <th>Ngày</th>
-            {series.map((item) => (
-              <th key={item.id}>{item.label}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {points.map((point) => (
-            <tr key={point.date}>
-              <th>{point.date}</th>
-              {series.map((item) => (
-                <td key={item.id}>{trendPointValue(point, item.id)}</td>
+      <Button
+        className="mt-3"
+        size="sm"
+        type="button"
+        variant="outline"
+        onClick={() => setShowTable((value) => !value)}
+      >
+        {showTable ? "Ẩn dữ liệu dạng bảng" : "Xem dữ liệu dạng bảng"}
+      </Button>
+      {showTable ? (
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full min-w-[32rem] text-sm">
+            <caption>Hoạt động theo ngày, nhóm theo {groupingLabel(grouping)}</caption>
+            <thead>
+              <tr>
+                <th>Ngày</th>
+                {series.map((item) => (
+                  <th key={item.id}>{item.label}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {points.map((point) => (
+                <tr key={point.date}>
+                  <th>{point.date}</th>
+                  {series.map((item) => (
+                    <td key={item.id}>{trendPointValue(point, item.id)}</td>
+                  ))}
+                </tr>
               ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+            </tbody>
+          </table>
+        </div>
+      ) : null}
     </>
   );
 }
@@ -671,6 +723,7 @@ function ActivityHeatmap({
   daily: ActivitySummary[];
   filters: ActivityFilters;
 }) {
+  const [showTable, setShowTable] = useState(false);
   const totals = new Map<string, number>();
   for (const row of daily) totals.set(row.date, (totals.get(row.date) ?? 0) + row.count);
   const visibleFrom =
@@ -723,41 +776,60 @@ function ActivityHeatmap({
         ))}
         Nhiều
       </div>
-      <table className="sr-only">
-        <caption>Heatmap hoạt động dạng bảng</caption>
-        <thead>
-          <tr>
-            <th>Ngày</th>
-            <th>Số event</th>
-          </tr>
-        </thead>
-        <tbody>
-          {[...totals.entries()].map(([date, count]) => (
-            <tr key={date}>
-              <th>{date}</th>
-              <td>{count}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <Button
+        className="mt-3"
+        size="sm"
+        type="button"
+        variant="outline"
+        onClick={() => setShowTable((value) => !value)}
+      >
+        {showTable ? "Ẩn dữ liệu dạng bảng" : "Xem dữ liệu dạng bảng"}
+      </Button>
+      {showTable ? (
+        <div className="mt-3 max-h-72 overflow-auto">
+          <table className="w-full text-sm">
+            <caption>Heatmap hoạt động dạng bảng</caption>
+            <thead>
+              <tr>
+                <th>Ngày</th>
+                <th>Số event</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...totals.entries()].map(([date, count]) => (
+                <tr key={date}>
+                  <th>{date}</th>
+                  <td>{count}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
     </>
   );
 }
 
 function ActivityTimeline({
   coverage,
+  error,
+  hasMore,
   items,
   loading,
-  timelineTruncated,
+  loadingMore,
+  onLoadMore,
+  total,
 }: {
   coverage: "full" | "none" | "partial";
+  error: Error | null;
+  hasMore: boolean;
   items: ActivityTimelineItem[];
   loading: boolean;
-  timelineTruncated: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
+  total: number;
 }) {
-  const [visibleCount, setVisibleCount] = useState(200);
-  const visible = items.slice(0, visibleCount);
-  const sessions = useMemo(() => buildTimelineSessions(visible), [visible]);
+  const sessions = useMemo(() => buildTimelineSessions(items), [items]);
 
   return (
     <Card>
@@ -769,7 +841,9 @@ function ActivityTimeline({
               Event gần nhất hiển thị trước; indentation lấy từ parentAgentId và depth của Codex.
             </CardDescription>
           </div>
-          <Badge variant="outline">{formatTokens(items.length)} event raw</Badge>
+          <Badge variant="outline">
+            {formatTokens(items.length)} / {formatTokens(total)} event raw
+          </Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -783,16 +857,12 @@ function ActivityTimeline({
             </p>
           </div>
         ) : null}
-        {timelineTruncated ? (
+        {error ? (
           <div
-            className="flex gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm"
-            role="status"
+            className="border-destructive/40 bg-destructive/5 rounded-lg border p-3 text-sm"
+            role="alert"
           >
-            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
-            <p>
-              Kết quả vượt giới hạn 2.000 event. Hãy thu hẹp ngày, project hoặc session để xem
-              timeline đầy đủ.
-            </p>
+            Không tải được timeline: {error.message}
           </div>
         ) : null}
         {loading ? <TimelineSkeleton /> : null}
@@ -822,10 +892,10 @@ function ActivityTimeline({
             </section>
           ))}
         </div>
-        {items.length > visible.length ? (
+        {hasMore ? (
           <div className="flex justify-center border-t pt-4">
-            <Button variant="outline" onClick={() => setVisibleCount((count) => count + 200)}>
-              Hiển thị thêm ({formatTokens(items.length - visible.length)} event)
+            <Button variant="outline" disabled={loadingMore} onClick={onLoadMore}>
+              {loadingMore ? "Đang tải…" : "Hiển thị thêm 200 event"}
             </Button>
           </div>
         ) : null}
@@ -941,7 +1011,7 @@ function coverageLabel(coverage: "full" | "none" | "partial"): string {
 function buildTrend(
   daily: ActivitySummary[],
   grouping: TrendGrouping,
-  projects: ProjectSummary[],
+  projects: ProjectOption[],
 ): { points: TrendPoint[]; series: TrendSeries[] } {
   const labels = new Map(projects.map((project) => [project.id, project.displayName]));
   const totals = new Map<string, number>();
@@ -1158,29 +1228,11 @@ function isActivityTab(value: string | null): value is ActivityTab {
 }
 
 function formatTimestamp(value: string): string {
-  return new Intl.DateTimeFormat("vi-VN", {
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    month: "2-digit",
-    second: "2-digit",
-    timeZone: "Asia/Ho_Chi_Minh",
-  }).format(new Date(value));
+  return TIMESTAMP_FORMATTER.format(new Date(value));
 }
 
 function formatLocalDate(value: string): string {
-  return new Intl.DateTimeFormat("vi-VN", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-  }).format(new Date(`${value}T12:00:00.000Z`));
-}
-
-function compactCount(value: number): string {
-  return new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: 1,
-    notation: "compact",
-  }).format(value);
+  return LOCAL_DATE_FORMATTER.format(new Date(`${value}T12:00:00.000Z`));
 }
 
 function shortId(value: string): string {

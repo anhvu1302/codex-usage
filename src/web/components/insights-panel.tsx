@@ -1,4 +1,3 @@
-import { useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ArrowDownRight,
@@ -7,8 +6,6 @@ import {
   Sparkles,
   TrendingUp,
 } from "lucide-react";
-import { useMemo } from "react";
-import { useSearchParams } from "react-router";
 
 import { Badge } from "@/web/components/ui/badge";
 import {
@@ -19,38 +16,31 @@ import {
   CardTitle,
 } from "@/web/components/ui/card";
 import { Skeleton } from "@/web/components/ui/skeleton";
-import {
-  fetchInsights,
-  filtersFromSearch,
-  formatPercent,
-  formatTokens,
-  formatUsd,
-} from "@/web/lib/product-api";
-import type { MetricDelta } from "@/shared/types";
+import { formatPercent, formatTokens, formatUsd } from "@/web/lib/product-api";
+import type { InsightsResponse, MetricDelta } from "@/shared/types";
 
-export function InsightsPanel() {
-  const [search] = useSearchParams();
-  const filters = useMemo(() => filtersFromSearch(search), [search]);
-  const insights = useQuery({
-    queryKey: ["insights", filters],
-    queryFn: () => fetchInsights(filters),
-  });
-
-  if (insights.isLoading) {
+export function InsightsPanel({
+  data,
+  error,
+  isLoading,
+}: {
+  data: InsightsResponse | undefined;
+  error: Error | null;
+  isLoading: boolean;
+}) {
+  if (isLoading) {
     return <Skeleton aria-label="Đang tải insights" className="h-52" />;
   }
-  if (insights.isError) {
+  if (error) {
     return (
       <Card className="border-destructive">
-        <CardContent className="pt-6 text-sm">
-          Không tải được insights: {insights.error.message}
-        </CardContent>
+        <CardContent className="pt-6 text-sm">Không tải được insights: {error.message}</CardContent>
       </Card>
     );
   }
-  if (!insights.data) return null;
+  if (!data) return null;
 
-  const value = insights.data;
+  const value = data;
   return (
     <section aria-labelledby="insights-heading" className="grid gap-4 xl:grid-cols-5">
       <Card className="overflow-hidden xl:col-span-3">

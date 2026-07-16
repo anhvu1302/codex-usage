@@ -1,53 +1,127 @@
 import type {
   AgentFilters,
-  AgentsResponse,
+  AgentPageFilters,
+  AgentPageQuery,
+  AgentQuery,
+  BudgetSetting,
   DashboardFilters,
-  InsightsResponse,
-  ProjectsResponse,
+  PricingSimulationRequest,
+  ProjectPageFilters,
+  ProjectPageQuery,
 } from "@/shared/types";
+import { apiClient, rpcJson, rpcOptions, toDashboardQuery } from "@/web/lib/rpc-client";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
-  if (!response.ok) {
-    const body: unknown = await response.json().catch(() => null);
-    const message = isErrorPayload(body) ? body.error : null;
-    throw new Error(typeof message === "string" ? message : `Request failed (${response.status})`);
-  }
-  return response.json() as Promise<T>;
-}
+const LOCAL_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  day: "2-digit",
+  month: "2-digit",
+  timeZone: "Asia/Ho_Chi_Minh",
+  year: "numeric",
+});
+const INTEGER_FORMATTER = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+const COMPACT_FORMATTER = new Intl.NumberFormat("en-US", {
+  maximumFractionDigits: 1,
+  notation: "compact",
+});
+const USD_FORMATTER = new Intl.NumberFormat("en-US", {
+  currency: "USD",
+  maximumFractionDigits: 2,
+  style: "currency",
+});
+const PERCENT_FORMATTER = new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 1 });
 
-function dashboardQuery(filters: DashboardFilters): string {
-  const values = new URLSearchParams({ from: filters.from, to: filters.to });
-  const models = filters.models?.length ? filters.models : filters.model ? [filters.model] : [];
-  if (models.length > 0) values.set("models", models.join(","));
-  if (filters.projectId) values.set("project", filters.projectId);
-  if (filters.agentKind && filters.agentKind !== "all") values.set("agentKind", filters.agentKind);
-  return values.toString();
-}
-
-export function fetchInsights(filters: DashboardFilters) {
-  return request<InsightsResponse>(`/api/insights?${dashboardQuery(filters)}`);
-}
-
-export function fetchProjects(filters: DashboardFilters) {
-  return request<ProjectsResponse>(`/api/projects?${dashboardQuery(filters)}`);
-}
-
-export function renameProject(id: string, displayName: string) {
-  return request<{ project: { displayName: string; id: string } }>(
-    `/api/projects/${encodeURIComponent(id)}`,
-    { body: JSON.stringify({ displayName }), method: "PUT" },
+export function fetchOverview(filters: DashboardFilters, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.overview.$get({ query: toDashboardQuery(filters) }, rpcOptions(signal)),
   );
 }
 
-export function fetchAgents(filters: AgentFilters) {
-  const values = new URLSearchParams(dashboardQuery(filters));
-  if (filters.depth !== undefined) values.set("depth", String(filters.depth));
-  if (filters.role) values.set("role", filters.role);
-  return request<AgentsResponse>(`/api/agents?${values.toString()}`);
+export function fetchProjectsSummary(filters: DashboardFilters, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.projects.summary.$get({ query: toDashboardQuery(filters) }, rpcOptions(signal)),
+  );
+}
+
+export function fetchProjectsPage(filters: ProjectPageFilters, signal?: AbortSignal) {
+  const query: ProjectPageQuery = {
+    ...toDashboardQuery(filters),
+    ...(filters.page === undefined ? {} : { page: String(filters.page) }),
+    ...(filters.pageSize === undefined ? {} : { pageSize: String(filters.pageSize) }),
+  };
+  return rpcJson(apiClient.api.projects.page.$get({ query }, rpcOptions(signal)));
+}
+
+export function fetchProjectAnalytics(id: string, filters: DashboardFilters, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.projects[":id"].analytics.$get(
+      { param: { id: encodeURIComponent(id) }, query: toDashboardQuery(filters) },
+      rpcOptions(signal),
+    ),
+  );
+}
+
+export function fetchProjectOptions(filters: DashboardFilters, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.projects.options.$get({ query: toDashboardQuery(filters) }, rpcOptions(signal)),
+  );
+}
+
+export function renameProject(id: string, displayName: string) {
+  return rpcJson(
+    apiClient.api.projects[":id"].$put({
+      json: { displayName },
+      param: { id: encodeURIComponent(id) },
+    }),
+  );
+}
+
+export function fetchAgentsSummary(filters: AgentFilters, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.agents.summary.$get({ query: toAgentQuery(filters) }, rpcOptions(signal)),
+  );
+}
+
+export function fetchAgentsPage(filters: AgentPageFilters, signal?: AbortSignal) {
+  const query: AgentPageQuery = {
+    ...toAgentQuery(filters),
+    ...(filters.order ? { order: filters.order } : {}),
+    ...(filters.page === undefined ? {} : { page: String(filters.page) }),
+    ...(filters.pageSize === undefined ? {} : { pageSize: String(filters.pageSize) }),
+    ...(filters.sort ? { sort: filters.sort } : {}),
+  };
+  return rpcJson(apiClient.api.agents.page.$get({ query }, rpcOptions(signal)));
+}
+
+export function fetchBudgets(signal?: AbortSignal) {
+  return rpcJson(apiClient.api.budgets.$get(undefined, rpcOptions(signal)));
+}
+
+export function saveBudget(budget: Omit<BudgetSetting, "updatedAt">) {
+  return rpcJson(apiClient.api.budgets.$put({ json: budget }));
+}
+
+export function fetchAlerts(signal?: AbortSignal) {
+  return rpcJson(apiClient.api.alerts.$get(undefined, rpcOptions(signal)));
+}
+
+export function updateAlert({ action, id }: { action: "dismiss" | "seen"; id: string }) {
+  return rpcJson(
+    apiClient.api.alerts[":id"].$patch({
+      json: { action },
+      param: { id: encodeURIComponent(id) },
+    }),
+  );
+}
+
+export async function fetchPricingModels(signal?: AbortSignal) {
+  const [models, rates] = await Promise.all([
+    rpcJson(apiClient.api.models.$get(undefined, rpcOptions(signal))),
+    rpcJson(apiClient.api.rates.$get(undefined, rpcOptions(signal))),
+  ]);
+  return { models: models.models, rates: rates.rates };
+}
+
+export function runPricingSimulation(payload: PricingSimulationRequest) {
+  return rpcJson(apiClient.api.pricing.simulate.$post({ json: payload }));
 }
 
 export function filtersFromSearch(search: URLSearchParams): DashboardFilters {
@@ -88,6 +162,14 @@ export function updateFilterSearch(
   return next;
 }
 
+function toAgentQuery(filters: AgentFilters): AgentQuery {
+  return {
+    ...toDashboardQuery(filters),
+    ...(filters.depth === undefined ? {} : { depth: String(filters.depth) }),
+    ...(filters.role ? { role: filters.role } : {}),
+  };
+}
+
 export function defaultDateRange(): DashboardFilters {
   const to = localDate(new Date());
   const from = shiftDate(to, -29);
@@ -96,13 +178,7 @@ export function defaultDateRange(): DashboardFilters {
 
 export function localDate(value: Date): string {
   const values = Object.fromEntries(
-    new Intl.DateTimeFormat("en-CA", {
-      day: "2-digit",
-      month: "2-digit",
-      timeZone: "Asia/Ho_Chi_Minh",
-      year: "numeric",
-    })
-      .formatToParts(value)
+    LOCAL_DATE_FORMATTER.formatToParts(value)
       .filter((part) => part.type !== "literal")
       .map((part) => [part.type, part.value]),
   );
@@ -116,32 +192,21 @@ export function shiftDate(value: string, days: number): string {
 }
 
 export function formatTokens(value: number): string {
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value);
+  return INTEGER_FORMATTER.format(value);
 }
 
 export function compactTokens(value: number): string {
-  return new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: 1,
-    notation: "compact",
-  }).format(value);
+  return COMPACT_FORMATTER.format(value);
 }
 
 export function formatUsd(value: number): string {
-  return new Intl.NumberFormat("en-US", {
-    currency: "USD",
-    maximumFractionDigits: 2,
-    style: "currency",
-  }).format(value);
+  return USD_FORMATTER.format(value);
 }
 
 export function formatPercent(value: number): string {
-  return `${new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 1 }).format(value)}%`;
+  return `${PERCENT_FORMATTER.format(value)}%`;
 }
 
 function validDate(value: string | null): string | null {
   return value && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
-}
-
-function isErrorPayload(value: unknown): value is { error: unknown } {
-  return typeof value === "object" && value !== null && "error" in value;
 }

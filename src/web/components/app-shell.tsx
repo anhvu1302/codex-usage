@@ -11,26 +11,21 @@ import {
   MoonStar,
   Settings2,
   SunMedium,
+  X,
 } from "lucide-react";
-import { useRef, useState, type ComponentType, type SVGProps } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ComponentType,
+  type SVGProps,
+} from "react";
 import { NavLink, Outlet, useLocation } from "react-router";
 
+import { NotificationCenter } from "@/web/components/alerts";
 import { Button } from "@/web/components/ui/button";
-import { NotificationCenter } from "@/web/components/product-tools";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/web/components/ui/select";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/web/components/ui/sheet";
 import {
   usePreferences,
   type DensityPreference,
@@ -38,6 +33,7 @@ import {
   type ThemeRevealOrigin,
 } from "@/web/lib/preferences";
 import { cn } from "@/web/lib/utils";
+import { prefetchPrimaryQuery, preloadRoute } from "@/web/lib/route-prefetch";
 
 type NavigationItem = {
   icon: ComponentType<SVGProps<SVGSVGElement>>;
@@ -58,6 +54,7 @@ const navigation: NavigationItem[] = [
 
 export function AppShell() {
   const [mobileOpen, setMobileOpen] = useState(false);
+  const desktop = useSyncExternalStore(subscribeDesktopShell, desktopShellSnapshot, () => false);
 
   return (
     <div className="app-shell min-h-screen">
@@ -71,7 +68,7 @@ export function AppShell() {
       <aside className="bg-card/88 fixed inset-y-0 left-0 z-40 hidden w-64 border-r backdrop-blur-xl lg:flex lg:flex-col">
         <div className="flex items-center justify-between px-5 py-6">
           <Brand />
-          <NotificationCenter />
+          {desktop ? <NotificationCenter /> : null}
         </div>
         <Navigation className="flex-1 overflow-y-auto px-3" />
         <Preferences className="border-t p-4" />
@@ -80,7 +77,7 @@ export function AppShell() {
       <header className="bg-background/88 fixed inset-x-0 top-0 z-40 flex h-16 items-center justify-between border-b px-4 backdrop-blur-xl lg:hidden">
         <Brand />
         <div className="flex items-center gap-1">
-          <NotificationCenter />
+          {!desktop ? <NotificationCenter /> : null}
           <Button
             aria-label="Mở menu điều hướng"
             size="icon"
@@ -92,19 +89,7 @@ export function AppShell() {
         </div>
       </header>
 
-      <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
-        <SheetContent side="left" className="w-[min(21rem,88vw)] p-0 sm:max-w-sm">
-          <SheetHeader className="border-b p-5 text-left">
-            <SheetTitle>Codex Usage</SheetTitle>
-            <SheetDescription>Điều hướng dashboard</SheetDescription>
-          </SheetHeader>
-          <Navigation
-            className="flex-1 overflow-y-auto p-3"
-            onNavigate={() => setMobileOpen(false)}
-          />
-          <Preferences className="border-t p-4" />
-        </SheetContent>
-      </Sheet>
+      {mobileOpen ? <MobileNavigationDialog onClose={() => setMobileOpen(false)} /> : null}
 
       <main id="main-content" className="relative z-10 pt-20 lg:ml-64 lg:pt-0">
         <div className="mx-auto w-full max-w-[1600px] px-4 pb-10 sm:px-6 lg:px-8 lg:py-8">
@@ -112,6 +97,52 @@ export function AppShell() {
         </div>
       </main>
     </div>
+  );
+}
+
+function MobileNavigationDialog({ onClose }: { onClose: () => void }) {
+  const dialog = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const element = dialog.current;
+    if (!element) return;
+    element.showModal();
+    return () => element.close();
+  }, []);
+
+  return (
+    <dialog
+      ref={dialog}
+      aria-labelledby="mobile-navigation-title"
+      className="bg-background fixed inset-y-0 left-0 m-0 h-dvh max-h-none w-[min(21rem,88vw)] max-w-none border-0 border-r p-0 shadow-xl backdrop:bg-black/40"
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+      onClose={onClose}
+    >
+      <div className="flex h-full flex-col">
+        <header className="flex items-start justify-between gap-4 border-b p-5 text-left">
+          <div>
+            <h2 id="mobile-navigation-title" className="font-semibold">
+              Codex Usage
+            </h2>
+            <p className="text-muted-foreground text-sm">Điều hướng dashboard</p>
+          </div>
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            aria-label="Đóng menu"
+            onClick={onClose}
+          >
+            <X className="size-4" aria-hidden="true" />
+          </Button>
+        </header>
+        <Navigation className="flex-1 overflow-y-auto p-3" onNavigate={onClose} />
+        <Preferences className="border-t p-4" />
+      </div>
+    </dialog>
   );
 }
 
@@ -131,17 +162,24 @@ function Brand({ className }: { className?: string }) {
 
 function Navigation({ className, onNavigate }: { className?: string; onNavigate?: () => void }) {
   const location = useLocation();
+  const queryClient = useQueryClient();
 
   return (
     <nav aria-label="Điều hướng chính" className={cn("space-y-1", className)}>
       {navigation.map((item) => {
         const Icon = item.icon;
+        const prefetch = () => {
+          preloadRoute(item.to);
+          void prefetchPrimaryQuery(queryClient, item.to, new URLSearchParams(location.search));
+        };
         return (
           <NavLink
             key={item.to}
             end={item.to === "/"}
             to={{ pathname: item.to, search: location.search }}
             onClick={onNavigate}
+            onFocus={prefetch}
+            onPointerEnter={prefetch}
             className={({ isActive }) =>
               cn(
                 "focus-visible:ring-ring group flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-[background-color,color,transform] outline-none focus-visible:ring-2",
@@ -162,63 +200,67 @@ function Navigation({ className, onNavigate }: { className?: string; onNavigate?
 
 function Preferences({ className }: { className?: string }) {
   const { density, setDensity, setTheme, theme } = usePreferences();
-  const [themeOpen, setThemeOpen] = useState(false);
-  const pendingTheme = useRef<ThemePreference | null>(null);
-  const themeOrigin = useRef<ThemeRevealOrigin | undefined>(undefined);
-  const themeTrigger = useRef<HTMLButtonElement>(null);
-
-  function handleThemeOpenChange(open: boolean) {
-    setThemeOpen(open);
-    if (open) {
-      themeOrigin.current = centerOf(themeTrigger.current);
-      return;
-    }
-    if (pendingTheme.current === null) return;
-    const nextTheme = pendingTheme.current;
-    pendingTheme.current = null;
-    const origin = themeOrigin.current ?? centerOf(themeTrigger.current);
-    themeOrigin.current = undefined;
-    window.requestAnimationFrame(() => setTheme(nextTheme, origin));
-  }
+  const themeSelect = useRef<HTMLSelectElement>(null);
 
   return (
     <div className={cn("grid gap-3", className)}>
       <div className="space-y-1.5">
-        <p className="text-muted-foreground text-xs font-medium">Giao diện</p>
-        <Select
-          open={themeOpen}
-          value={theme}
-          onOpenChange={handleThemeOpenChange}
-          onValueChange={(value) => {
-            pendingTheme.current = value as ThemePreference;
-          }}
-        >
-          <SelectTrigger ref={themeTrigger} aria-label="Giao diện" className="w-full">
-            <SunMedium className="size-3.5" />
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="system">Theo hệ thống</SelectItem>
-            <SelectItem value="light">Sáng</SelectItem>
-            <SelectItem value="dark">Tối</SelectItem>
-          </SelectContent>
-        </Select>
+        <label htmlFor="shell-theme" className="text-muted-foreground text-xs font-medium">
+          Giao diện
+        </label>
+        <div className="relative">
+          <SunMedium
+            className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2"
+            aria-hidden="true"
+          />
+          <select
+            id="shell-theme"
+            ref={themeSelect}
+            className="border-input bg-background focus-visible:border-ring focus-visible:ring-ring/50 h-9 w-full appearance-none rounded-md border py-1 pr-8 pl-9 text-sm shadow-xs outline-none focus-visible:ring-[3px]"
+            value={theme}
+            onChange={(event) => {
+              const nextTheme = event.target.value as ThemePreference;
+              setTheme(nextTheme, centerOf(themeSelect.current));
+            }}
+          >
+            <option value="system">Theo hệ thống</option>
+            <option value="light">Sáng</option>
+            <option value="dark">Tối</option>
+          </select>
+        </div>
       </div>
       <div className="space-y-1.5">
-        <p className="text-muted-foreground text-xs font-medium">Mật độ</p>
-        <Select value={density} onValueChange={(value) => setDensity(value as DensityPreference)}>
-          <SelectTrigger aria-label="Mật độ" className="w-full">
-            <MoonStar className="size-3.5" />
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="comfortable">Thoải mái</SelectItem>
-            <SelectItem value="compact">Gọn</SelectItem>
-          </SelectContent>
-        </Select>
+        <label htmlFor="shell-density" className="text-muted-foreground text-xs font-medium">
+          Mật độ
+        </label>
+        <div className="relative">
+          <MoonStar
+            className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2"
+            aria-hidden="true"
+          />
+          <select
+            id="shell-density"
+            className="border-input bg-background focus-visible:border-ring focus-visible:ring-ring/50 h-9 w-full appearance-none rounded-md border py-1 pr-8 pl-9 text-sm shadow-xs outline-none focus-visible:ring-[3px]"
+            value={density}
+            onChange={(event) => setDensity(event.target.value as DensityPreference)}
+          >
+            <option value="comfortable">Thoải mái</option>
+            <option value="compact">Gọn</option>
+          </select>
+        </div>
       </div>
     </div>
   );
+}
+
+function subscribeDesktopShell(callback: () => void): () => void {
+  const media = window.matchMedia("(min-width: 1024px)");
+  media.addEventListener("change", callback);
+  return () => media.removeEventListener("change", callback);
+}
+
+function desktopShellSnapshot(): boolean {
+  return window.matchMedia("(min-width: 1024px)").matches;
 }
 
 function centerOf(element: HTMLElement | null): ThemeRevealOrigin | undefined {

@@ -16,46 +16,22 @@ import {
   ArrowUp,
   ArrowUpToLine,
   CircleDollarSign,
-  ChevronLeft,
-  ChevronRight,
   Columns3,
   Database,
   RefreshCw,
-  Search,
   Sparkles,
 } from "lucide-react";
-import {
-  useDeferredValue,
-  useEffect,
-  useMemo,
-  useState,
-  useSyncExternalStore,
-  useTransition,
-} from "react";
-import { Link, useSearchParams } from "react-router";
-import {
-  Bar,
-  CartesianGrid,
-  ComposedChart,
-  Line,
-  Tooltip,
-  XAxis,
-  YAxis,
-  type TooltipContentProps,
-} from "recharts";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useSearchParams } from "react-router";
+import type { TooltipContentProps } from "recharts";
 import { toast } from "sonner";
 
-import {
-  fetchDashboard,
-  fetchModels,
-  fetchSessions,
-  fetchStatus,
-  syncSessions,
-} from "@/web/lib/api";
+import { fetchDashboard, fetchModels, fetchStatus, syncSessions } from "@/web/lib/api";
 import { InsightsPanel } from "@/web/components/insights-panel";
 import { MetricCard } from "@/web/components/metric-card";
 import { ProductFilterBar } from "@/web/components/product-filter-bar";
-import { AlertBanner, ExportActions } from "@/web/components/product-tools";
+import { AlertBanner } from "@/web/components/alerts";
+import { SessionBrowser } from "@/web/components/session-browser";
 import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
 import {
@@ -65,23 +41,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/web/components/ui/card";
-import { ChartContainer, type ChartConfig } from "@/web/components/ui/chart";
-import { Input } from "@/web/components/ui/input";
+import type { ChartConfig } from "@/web/components/ui/chart";
 import { Popover, PopoverContent, PopoverTrigger } from "@/web/components/ui/popover";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/web/components/ui/select";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "@/web/components/ui/sheet";
 import { Skeleton } from "@/web/components/ui/skeleton";
 import {
   Table,
@@ -95,23 +56,54 @@ import type {
   DailyModelUsage,
   DailyUsage,
   DashboardFilters,
+  DashboardKpis,
   HourlyModelUsage,
   HourlyUsage,
   ModelUsage,
-  SessionAgentUsage,
-  SessionFilters,
-  SessionUsage,
 } from "@/shared/types";
 import {
-  fetchProjects,
+  fetchOverview,
+  fetchProjectOptions,
   filtersFromSearch as parseUrlFilters,
   updateFilterSearch,
 } from "@/web/lib/product-api";
+import {
+  IMPORT_MUTATION_SCOPES,
+  queueLiveMutationScopes,
+  useLiveEventsFallbackActive,
+} from "@/web/lib/live-events";
 import { assignModelColors } from "@/web/lib/model-colors";
 
 const chartConfig = {
   cost: { color: "var(--foreground)", label: "Cost (USD)" },
 } satisfies ChartConfig;
+const DELTA_FORMATTER = new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 1 });
+const INTEGER_FORMATTER = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+const COMPACT_FORMATTER = new Intl.NumberFormat("en-US", {
+  maximumFractionDigits: 1,
+  notation: "compact",
+});
+const PERCENT_FORMATTER = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+const USD_FORMATTER = new Intl.NumberFormat("en-US", {
+  currency: "USD",
+  maximumFractionDigits: 2,
+  style: "currency",
+});
+const loadDashboardCharts = () => import("@/web/components/dashboard-chart-primitives");
+const Bar = lazy(async () => ({ default: (await loadDashboardCharts()).Bar }));
+const CartesianGrid = lazy(async () => ({
+  default: (await loadDashboardCharts()).CartesianGrid,
+}));
+const ComposedChart = lazy(async () => ({
+  default: (await loadDashboardCharts()).ComposedChart,
+}));
+const Line = lazy(async () => ({ default: (await loadDashboardCharts()).Line }));
+const Tooltip = lazy(async () => ({ default: (await loadDashboardCharts()).Tooltip }));
+const XAxis = lazy(async () => ({ default: (await loadDashboardCharts()).XAxis }));
+const YAxis = lazy(async () => ({ default: (await loadDashboardCharts()).YAxis }));
+const ChartContainer = lazy(async () => ({
+  default: (await loadDashboardCharts()).ChartContainer,
+}));
 
 const modelColumns: ColumnDef<ModelUsage>[] = [
   {
@@ -178,67 +170,58 @@ const modelColumns: ColumnDef<ModelUsage>[] = [
   },
 ];
 
-type DashboardMode = "explore" | "overview" | "sessions";
+type DashboardMode = "explore" | "overview";
 type ChartMetric = "cost" | "requests" | "tokens";
 
 export function DashboardView({ mode = "overview" }: { mode?: DashboardMode }) {
+  const liveEventsFallbackActive = useLiveEventsFallbackActive();
   const [searchParameters, setSearchParameters] = useSearchParams();
   const urlFilters = useMemo(() => parseUrlFilters(searchParameters), [searchParameters]);
   const [filters, setFilters] = useState<DashboardFilters>(urlFilters);
   const [chartMetric, setChartMetric] = useState<ChartMetric>("tokens");
-  const [selectedSession, setSelectedSession] = useState<SessionUsage | null>(null);
-  const [sessionQuery, setSessionQuery] = useState("");
-  const [sessionPage, setSessionPage] = useState(1);
-  const [sessionSort, setSessionSort] =
-    useState<NonNullable<SessionFilters["sort"]>>("lastActivity");
   const [sorting, setSorting] = useState<SortingState>([]);
   const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
   const [isFiltering, startFiltering] = useTransition();
-  const desktopSessions = useSyncExternalStore(
-    subscribeDesktopLayout,
-    desktopLayoutSnapshot,
-    () => false,
-  );
-  const deferredFilters = useDeferredValue(filters);
-  const deferredSessionQuery = useDeferredValue(sessionQuery.trim());
+  const deferredFilters = filters;
   const queryClient = useQueryClient();
   const dashboard = useQuery({
+    enabled: mode === "explore",
     queryKey: ["dashboard", deferredFilters],
-    queryFn: () => fetchDashboard(deferredFilters),
+    queryFn: ({ signal }) => fetchDashboard(deferredFilters, signal),
+    staleTime: 30_000,
   });
-  const sessionFilters = useMemo<SessionFilters>(
-    () => ({
-      ...deferredFilters,
-      order: "desc",
-      page: sessionPage,
-      pageSize: mode === "sessions" ? 20 : 10,
-      ...(deferredSessionQuery ? { query: deferredSessionQuery } : {}),
-      sort: sessionSort,
-    }),
-    [deferredFilters, deferredSessionQuery, mode, sessionPage, sessionSort],
-  );
-  const sessions = useQuery({
-    queryKey: ["sessions", sessionFilters],
-    queryFn: () => fetchSessions(sessionFilters),
+  const overview = useQuery({
+    enabled: mode === "overview",
+    queryKey: ["overview", deferredFilters],
+    queryFn: ({ signal }) => fetchOverview(deferredFilters, signal),
+    staleTime: 30_000,
   });
-  const models = useQuery({ queryKey: ["models"], queryFn: fetchModels });
+  const models = useQuery({
+    queryKey: ["models"],
+    queryFn: ({ signal }) => fetchModels(signal),
+    staleTime: 5 * 60_000,
+  });
   const projectOptionFilters = useMemo(() => {
     const value = { ...deferredFilters };
     delete value.projectId;
     return value;
   }, [deferredFilters]);
   const projects = useQuery({
-    queryKey: ["projects", "dashboard-options", projectOptionFilters],
-    queryFn: () => fetchProjects(projectOptionFilters),
+    queryKey: ["projects", "options", projectOptionFilters],
+    queryFn: ({ signal }) => fetchProjectOptions(projectOptionFilters, signal),
+    staleTime: 5 * 60_000,
   });
-  const status = useQuery({ queryKey: ["status"], queryFn: fetchStatus, refetchInterval: 10_000 });
+  const status = useQuery({
+    queryKey: ["status"],
+    queryFn: ({ signal }) => fetchStatus(signal),
+    refetchInterval: (query) =>
+      liveEventsFallbackActive ? (query.state.data?.isSyncing ? 2_000 : 30_000) : false,
+    staleTime: 30_000,
+  });
   const showHourly = deferredFilters.from === deferredFilters.to;
-  const previousFilters = useMemo(() => previousDateRange(deferredFilters), [deferredFilters]);
-  const previousDashboard = useQuery({
-    enabled: mode === "overview",
-    queryKey: ["dashboard", "previous", previousFilters],
-    queryFn: () => fetchDashboard(previousFilters),
-  });
+  const dashboardData = mode === "overview" ? overview.data?.dashboard : dashboard.data;
+  const dashboardError = mode === "overview" ? overview.error : dashboard.error;
+  const dashboardIsLoading = mode === "overview" ? overview.isLoading : dashboard.isLoading;
   const sync = useMutation({
     mutationFn: syncSessions,
     onError: (error) => toast.error(error.message),
@@ -250,16 +233,14 @@ export function DashboardView({ mode = "overview" }: { mode?: DashboardMode }) {
       toast.success(
         `Đã sync ${result.filesProcessed} file, thêm ${result.recordsInserted} usage event${repairs.length > 0 ? `; ${repairs.join(", ")}` : ""}.`,
       );
-      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
-      void queryClient.invalidateQueries({ queryKey: ["models"] });
-      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["status"] });
+      queryClient.setQueryData(["status"], result);
+      queueLiveMutationScopes(queryClient, IMPORT_MUTATION_SCOPES);
     },
   });
 
   const table = useReactTable({
     columns: modelColumns,
-    data: dashboard.data?.models ?? [],
+    data: dashboardData?.models ?? [],
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     onColumnVisibilityChange: setColumnVisibility,
@@ -273,7 +254,6 @@ export function DashboardView({ mode = "overview" }: { mode?: DashboardMode }) {
 
   function applyFilters(next: DashboardFilters) {
     startFiltering(() => {
-      setSessionPage(1);
       setFilters(next);
       setSearchParameters(updateFilterSearch(searchParameters, next));
     });
@@ -281,8 +261,7 @@ export function DashboardView({ mode = "overview" }: { mode?: DashboardMode }) {
 
   const pageCopy = dashboardPageCopy(mode);
   const showMetrics = mode === "overview";
-  const showCharts = mode !== "sessions";
-  const showSessions = mode !== "explore";
+  const showCharts = true;
 
   return (
     <div className="space-y-6">
@@ -320,81 +299,87 @@ export function DashboardView({ mode = "overview" }: { mode?: DashboardMode }) {
 
       {mode === "overview" ? <AlertBanner /> : null}
 
-      {dashboard.isError ? (
+      {dashboardError ? (
         <Card className="border-destructive">
           <CardContent className="pt-6 text-sm">
-            Không tải được dữ liệu: {dashboard.error.message}
+            Không tải được dữ liệu: {dashboardError.message}
           </CardContent>
         </Card>
       ) : null}
 
       {showMetrics ? (
-        <section className="motion-stagger grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          {dashboard.isLoading ? (
+        <section className="motion-stagger grid gap-3 min-[360px]:grid-cols-2 sm:gap-4 xl:grid-cols-4">
+          {dashboardIsLoading ? (
             <MetricSkeletons />
           ) : (
             <Metrics
-              data={dashboard.data}
+              data={dashboardData}
               days={inclusiveDays(deferredFilters.from, deferredFilters.to)}
-              previous={previousDashboard.data}
+              previous={overview.data?.insights.previous}
             />
           )}
         </section>
       ) : null}
 
-      {mode === "overview" ? <InsightsPanel /> : null}
+      {mode === "overview" ? (
+        <InsightsPanel
+          data={overview.data?.insights}
+          error={overview.error}
+          isLoading={overview.isLoading}
+        />
+      ) : null}
 
       {showCharts ? (
         <section className="motion-stagger grid gap-4 xl:grid-cols-5">
-          <Card className="xl:col-span-5">
-            <CardHeader className="flex-row flex-wrap items-start justify-between gap-4 space-y-0">
-              <div>
-                <CardTitle>Usage theo ngày</CardTitle>
-                <CardDescription className="mt-1">
-                  Chọn một ngày để xem chi tiết theo giờ. Cost là số USD ước tính.
-                </CardDescription>
-              </div>
-              <MetricToggle value={chartMetric} onChange={setChartMetric} />
-            </CardHeader>
-            <CardContent>
-              <UsageChart
-                data={dashboard.data?.daily ?? []}
-                modelData={dashboard.data?.dailyModels ?? []}
-                models={models.data?.models ?? []}
-                activeModels={selectedModels(filters)}
-                metric={chartMetric}
-                onBucketSelect={(date) => applyFilters({ ...filters, from: date, to: date })}
-                onModelSelect={(model) => applyFilters(toggleModelFilter(filters, model))}
-              />
-            </CardContent>
-          </Card>
-          {showHourly ? (
+          <DeferredChartSection>
             <Card className="xl:col-span-5">
-              <CardHeader>
-                <CardTitle>Usage theo giờ</CardTitle>
-                <CardDescription>
-                  {deferredFilters.from} theo timezone Asia/Ho_Chi_Minh; token và cost theo từng
-                  giờ.
-                </CardDescription>
+              <CardHeader className="flex-row flex-wrap items-start justify-between gap-4 space-y-0">
+                <div>
+                  <CardTitle>Usage theo ngày</CardTitle>
+                  <CardDescription className="mt-1">
+                    Chọn một ngày để xem chi tiết theo giờ. Cost là số USD ước tính.
+                  </CardDescription>
+                </div>
+                <MetricToggle value={chartMetric} onChange={setChartMetric} />
               </CardHeader>
               <CardContent>
-                {dashboard.data && !dashboard.data.retention.hourlyAvailable ? (
-                  <div className="text-muted-foreground flex h-40 items-center justify-center rounded-lg border border-dashed px-6 text-center text-sm">
-                    Dữ liệu này đã quá 90 ngày nên chỉ còn tổng theo ngày; breakdown theo giờ đã
-                    được compact.
-                  </div>
-                ) : (
-                  <HourlyUsageChart
-                    data={dashboard.data?.hourly ?? []}
-                    modelData={dashboard.data?.hourlyModels ?? []}
-                    models={models.data?.models ?? []}
-                    metric={chartMetric}
-                  />
-                )}
+                <UsageChart
+                  data={dashboardData?.daily ?? []}
+                  modelData={dashboardData?.dailyModels ?? []}
+                  activeModels={selectedModels(filters)}
+                  metric={chartMetric}
+                  onBucketSelect={(date) => applyFilters({ ...filters, from: date, to: date })}
+                  onModelSelect={(model) => applyFilters(toggleModelFilter(filters, model))}
+                />
               </CardContent>
             </Card>
-          ) : null}
-          <Card className="overflow-hidden xl:col-span-5">
+            {showHourly ? (
+              <Card className="xl:col-span-5">
+                <CardHeader>
+                  <CardTitle>Usage theo giờ</CardTitle>
+                  <CardDescription>
+                    {deferredFilters.from} theo timezone Asia/Ho_Chi_Minh; token và cost theo từng
+                    giờ.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  {dashboardData && !dashboardData.retention.hourlyAvailable ? (
+                    <div className="text-muted-foreground flex h-40 items-center justify-center rounded-lg border border-dashed px-6 text-center text-sm">
+                      Dữ liệu này đã quá 90 ngày nên chỉ còn tổng theo ngày; breakdown theo giờ đã
+                      được compact.
+                    </div>
+                  ) : (
+                    <HourlyUsageChart
+                      data={dashboardData?.hourly ?? []}
+                      modelData={dashboardData?.hourlyModels ?? []}
+                      metric={chartMetric}
+                    />
+                  )}
+                </CardContent>
+              </Card>
+            ) : null}
+          </DeferredChartSection>
+          <Card className="deferred-section overflow-hidden xl:col-span-5">
             <CardHeader className="flex-row flex-wrap items-start justify-between gap-4 space-y-0">
               <div>
                 <CardTitle>Chi tiết theo model</CardTitle>
@@ -445,7 +430,7 @@ export function DashboardView({ mode = "overview" }: { mode?: DashboardMode }) {
                       ))}
                     </TableRow>
                   ))}
-                  {!dashboard.isLoading && table.getRowModel().rows.length === 0 ? (
+                  {!dashboardIsLoading && table.getRowModel().rows.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={11} className="text-muted-foreground h-24 text-center">
                         Chưa có usage trong khoảng này.
@@ -459,184 +444,13 @@ export function DashboardView({ mode = "overview" }: { mode?: DashboardMode }) {
         </section>
       ) : null}
 
-      {showSessions ? (
-        <Card className="motion-reveal motion-delay-3 overflow-hidden">
-          <CardHeader>
-            <CardTitle className="flex flex-wrap items-center gap-2">
-              Phiên
-              {sessions.data ? <Badge variant="secondary">{sessions.data.total}</Badge> : null}
-            </CardTitle>
-            <CardDescription>
-              Tìm task, session ID, workspace hoặc agent; chọn một dòng để xem chi tiết.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="p-0">
-            {sessions.data && sessions.data.coverage.status !== "full" ? (
-              <div className="bg-muted/50 text-muted-foreground border-b px-6 py-3 text-sm">
-                {sessions.data?.coverage.status === "partial"
-                  ? `Chi tiết session chỉ còn từ ${sessions.data.coverage.from}; KPI và biểu đồ vẫn bao gồm rollup cũ.`
-                  : "Khoảng này đã được compact nên không còn drill-down session; KPI và biểu đồ theo model/ngày vẫn được giữ."}
-              </div>
-            ) : null}
-            <div className="grid gap-2 border-b p-4 sm:grid-cols-[minmax(16rem,1fr)_12rem_12rem]">
-              <div className="relative">
-                <Search
-                  aria-hidden="true"
-                  className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2"
-                />
-                <Input
-                  aria-label="Tìm session"
-                  className="pl-9"
-                  placeholder="Tìm task, ID, workspace, agent…"
-                  value={sessionQuery}
-                  onChange={(event) => {
-                    setSessionQuery(event.target.value);
-                    setSessionPage(1);
-                  }}
-                />
-              </div>
-              <Select
-                value={filters.agentKind ?? "all"}
-                onValueChange={(value) => {
-                  const next = { ...filters };
-                  if (value === "all") delete next.agentKind;
-                  else next.agentKind = value as "main" | "subagent";
-                  applyFilters(next);
-                }}
-              >
-                <SelectTrigger aria-label="Lọc loại agent">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">Tất cả agent</SelectItem>
-                  <SelectItem value="main">Main agent</SelectItem>
-                  <SelectItem value="subagent">Subagent</SelectItem>
-                </SelectContent>
-              </Select>
-              <Select
-                value={sessionSort}
-                onValueChange={(value) => {
-                  setSessionSort(value as NonNullable<SessionFilters["sort"]>);
-                  setSessionPage(1);
-                }}
-              >
-                <SelectTrigger aria-label="Sắp xếp session">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="lastActivity">Mới hoạt động</SelectItem>
-                  <SelectItem value="tokens">Nhiều token</SelectItem>
-                  <SelectItem value="cost">Cost cao</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            {desktopSessions ? (
-              <Table className="motion-table" scrollLabel="Bảng danh sách session">
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Task / session</TableHead>
-                    <TableHead>Agent</TableHead>
-                    <TableHead>Model</TableHead>
-                    <TableHead>Hoạt động cuối</TableHead>
-                    <TableHead>Token</TableHead>
-                    <TableHead>Cost</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {sessions.data?.sessions.map((session) => (
-                    <TableRow
-                      key={session.sessionId}
-                      className="cursor-pointer"
-                      onClick={() => setSelectedSession(session)}
-                    >
-                      <TableCell className="max-w-96">
-                        <button
-                          type="button"
-                          className="focus-visible:ring-ring block w-full rounded-sm text-left outline-none focus-visible:ring-2"
-                          onClick={() => setSelectedSession(session)}
-                        >
-                          <span
-                            className="block truncate font-medium"
-                            title={session.title ?? undefined}
-                          >
-                            {session.title ?? "Chưa có tên task"}
-                          </span>
-                          <span className="text-muted-foreground mt-1 block font-mono text-xs">
-                            {shortId(session.sessionId)}
-                          </span>
-                        </button>
-                      </TableCell>
-                      <TableCell>
-                        <AgentSummary agents={session.agents} />
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex flex-wrap gap-1">
-                          {session.models.map((model) => (
-                            <Badge key={model} variant="outline">
-                              {model}
-                            </Badge>
-                          ))}
-                        </div>
-                      </TableCell>
-                      <TableCell>{formatDateTime(session.lastEventAt)}</TableCell>
-                      <TableCell>{formatTokens(session.totalTokens)}</TableCell>
-                      <TableCell>{formatUsd(session.estimatedCostUsd)}</TableCell>
-                    </TableRow>
-                  ))}
-                  {!sessions.isLoading && sessions.data?.sessions.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={6} className="text-muted-foreground h-24 text-center">
-                        Chưa có session.
-                      </TableCell>
-                    </TableRow>
-                  ) : null}
-                </TableBody>
-              </Table>
-            ) : (
-              <SessionCards
-                sessions={sessions.data?.sessions ?? []}
-                onSelect={setSelectedSession}
-              />
-            )}
-            {sessions.data && sessions.data.total > sessions.data.pageSize ? (
-              <div className="flex flex-col items-center justify-between gap-3 border-t px-4 py-3 sm:flex-row">
-                <p className="text-muted-foreground text-xs">
-                  Trang {sessions.data.page}/
-                  {Math.ceil(sessions.data.total / sessions.data.pageSize)} · {sessions.data.total}{" "}
-                  session
-                </p>
-                <div className="flex gap-2">
-                  <Button
-                    aria-label="Trang session trước"
-                    size="sm"
-                    variant="outline"
-                    disabled={sessions.data.page <= 1}
-                    onClick={() => setSessionPage((page) => Math.max(1, page - 1))}
-                  >
-                    <ChevronLeft className="size-4" /> Trước
-                  </Button>
-                  <Button
-                    aria-label="Trang session tiếp theo"
-                    size="sm"
-                    variant="outline"
-                    disabled={sessions.data.page * sessions.data.pageSize >= sessions.data.total}
-                    onClick={() => setSessionPage((page) => page + 1)}
-                  >
-                    Sau <ChevronRight className="size-4" />
-                  </Button>
-                </div>
-              </div>
-            ) : null}
-          </CardContent>
-        </Card>
+      {mode === "overview" ? (
+        <SessionBrowser
+          key={JSON.stringify(deferredFilters)}
+          filters={deferredFilters}
+          onFiltersChange={applyFilters}
+        />
       ) : null}
-
-      {mode === "sessions" ? <ExportActions filters={sessionFilters} /> : null}
-
-      <SessionSheet
-        session={selectedSession}
-        onOpenChange={(open) => !open && setSelectedSession(null)}
-      />
     </div>
   );
 }
@@ -670,6 +484,56 @@ function MetricToggle({
   );
 }
 
+function DeferredChartSection({ children }: { children: React.ReactNode }) {
+  const container = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(() => typeof IntersectionObserver === "undefined");
+
+  useEffect(() => {
+    if (visible) return;
+    const element = container.current;
+    if (!element) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "600px 0px" },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [visible]);
+
+  return (
+    <div
+      ref={container}
+      className="deferred-section grid gap-4 xl:col-span-5"
+      style={{ containIntrinsicSize: "900px", contentVisibility: "auto" }}
+    >
+      {visible ? (
+        <Suspense fallback={<ChartSectionSkeleton />}>{children}</Suspense>
+      ) : (
+        <ChartSectionSkeleton />
+      )}
+    </div>
+  );
+}
+
+function ChartSectionSkeleton() {
+  return (
+    <Card aria-label="Đang tải biểu đồ" role="status">
+      <CardHeader>
+        <Skeleton className="h-5 w-40" />
+        <Skeleton className="h-4 w-72 max-w-full" />
+      </CardHeader>
+      <CardContent>
+        <Skeleton className="h-72 w-full" />
+      </CardContent>
+    </Card>
+  );
+}
+
 function ColumnPicker({ table }: { table: TanStackTable<ModelUsage> }) {
   return (
     <Popover>
@@ -699,49 +563,6 @@ function ColumnPicker({ table }: { table: TanStackTable<ModelUsage> }) {
   );
 }
 
-function SessionCards({
-  onSelect,
-  sessions,
-}: {
-  onSelect: (session: SessionUsage) => void;
-  sessions: SessionUsage[];
-}) {
-  return (
-    <div className="grid gap-3 p-4 md:hidden">
-      {sessions.map((session) => (
-        <button
-          key={session.sessionId}
-          type="button"
-          className="bg-card hover:border-primary/30 focus-visible:ring-ring rounded-lg border p-4 text-left shadow-sm transition-[border-color,transform] hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:outline-none"
-          onClick={() => onSelect(session)}
-        >
-          <span className="block truncate font-medium">{session.title ?? "Chưa có tên task"}</span>
-          <span className="text-muted-foreground mt-1 block font-mono text-xs">
-            {shortId(session.sessionId)}
-          </span>
-          <span className="mt-3 flex flex-wrap gap-1">
-            {session.models.map((model) => (
-              <Badge key={model} variant="outline">
-                {model}
-              </Badge>
-            ))}
-          </span>
-          <span className="mt-3 grid grid-cols-2 gap-2 text-xs">
-            <span>
-              <span className="text-muted-foreground block">Token</span>
-              <span className="font-semibold">{formatTokens(session.totalTokens)}</span>
-            </span>
-            <span>
-              <span className="text-muted-foreground block">Cost</span>
-              <span className="font-semibold">{formatUsd(session.estimatedCostUsd)}</span>
-            </span>
-          </span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
 function Metrics({
   data,
   days,
@@ -749,10 +570,10 @@ function Metrics({
 }: {
   data: Awaited<ReturnType<typeof fetchDashboard>> | undefined;
   days: number;
-  previous: Awaited<ReturnType<typeof fetchDashboard>> | undefined;
+  previous: DashboardKpis | undefined;
 }) {
   const kpis = data?.kpis;
-  const previousKpis = previous?.kpis;
+  const previousKpis = previous;
   const cacheRate = safeRatio(kpis?.cachedInputTokens ?? 0, kpis?.inputTokens ?? 0);
   return (
     <>
@@ -826,7 +647,6 @@ function UsageChart({
   data,
   metric,
   modelData,
-  models,
   onBucketSelect,
   onModelSelect,
 }: {
@@ -834,10 +654,31 @@ function UsageChart({
   data: DailyUsage[];
   metric: ChartMetric;
   modelData: DailyModelUsage[];
-  models: string[];
   onBucketSelect: (bucket: string) => void;
   onModelSelect: (model: string) => void;
 }) {
+  const [showTable, setShowTable] = useState(false);
+  const chart = useMemo(
+    () =>
+      buildModelChart(
+        data.map((usage) => ({
+          bucket: usage.date,
+          cost: usage.estimatedCostUsd,
+          requestCount: usage.requestCount,
+          totalTokens: usage.totalTokens,
+        })),
+        modelData.map((usage) => ({
+          bucket: usage.date,
+          cost: usage.estimatedCostUsd,
+          model: usage.model,
+          requestCount: usage.requestCount,
+          totalTokens: usage.totalTokens,
+        })),
+        metric,
+      ),
+    [data, metric, modelData],
+  );
+
   if (data.length === 0) {
     return (
       <div className="text-muted-foreground flex h-72 items-center justify-center rounded-lg border border-dashed text-sm">
@@ -845,24 +686,6 @@ function UsageChart({
       </div>
     );
   }
-
-  const chart = buildModelChart(
-    data.map((usage) => ({
-      bucket: usage.date,
-      cost: usage.estimatedCostUsd,
-      requestCount: usage.requestCount,
-      totalTokens: usage.totalTokens,
-    })),
-    modelData.map((usage) => ({
-      bucket: usage.date,
-      cost: usage.estimatedCostUsd,
-      model: usage.model,
-      requestCount: usage.requestCount,
-      totalTokens: usage.totalTokens,
-    })),
-    models,
-    metric,
-  );
 
   return (
     <div className="space-y-3">
@@ -927,7 +750,23 @@ function UsageChart({
           ) : null}
         </ComposedChart>
       </ChartContainer>
-      <ChartDataTable data={data} metric={metric} modelData={modelData} onSelect={onBucketSelect} />
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        aria-expanded={showTable}
+        onClick={() => setShowTable((value) => !value)}
+      >
+        {showTable ? "Ẩn dữ liệu dạng bảng" : "Xem dữ liệu dạng bảng"}
+      </Button>
+      {showTable ? (
+        <ChartDataTable
+          data={data}
+          metric={metric}
+          modelData={modelData}
+          onSelect={onBucketSelect}
+        />
+      ) : null}
     </div>
   );
 }
@@ -936,29 +775,31 @@ function HourlyUsageChart({
   data,
   metric,
   modelData,
-  models,
 }: {
   data: HourlyUsage[];
   metric: ChartMetric;
   modelData: HourlyModelUsage[];
-  models: string[];
 }) {
-  const chart = buildModelChart(
-    data.map((usage) => ({
-      bucket: usage.hour,
-      cost: usage.estimatedCostUsd,
-      requestCount: usage.requestCount,
-      totalTokens: usage.totalTokens,
-    })),
-    modelData.map((usage) => ({
-      bucket: usage.hour,
-      cost: usage.estimatedCostUsd,
-      model: usage.model,
-      requestCount: usage.requestCount,
-      totalTokens: usage.totalTokens,
-    })),
-    models,
-    metric,
+  const [showTable, setShowTable] = useState(false);
+  const chart = useMemo(
+    () =>
+      buildModelChart(
+        data.map((usage) => ({
+          bucket: usage.hour,
+          cost: usage.estimatedCostUsd,
+          requestCount: usage.requestCount,
+          totalTokens: usage.totalTokens,
+        })),
+        modelData.map((usage) => ({
+          bucket: usage.hour,
+          cost: usage.estimatedCostUsd,
+          model: usage.model,
+          requestCount: usage.requestCount,
+          totalTokens: usage.totalTokens,
+        })),
+        metric,
+      ),
+    [data, metric, modelData],
   );
 
   return (
@@ -1014,7 +855,18 @@ function HourlyUsageChart({
           ) : null}
         </ComposedChart>
       </ChartContainer>
-      <HourlyChartDataTable data={data} metric={metric} modelData={modelData} />
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        aria-expanded={showTable}
+        onClick={() => setShowTable((value) => !value)}
+      >
+        {showTable ? "Ẩn dữ liệu dạng bảng" : "Xem dữ liệu dạng bảng"}
+      </Button>
+      {showTable ? (
+        <HourlyChartDataTable data={data} metric={metric} modelData={modelData} />
+      ) : null}
     </div>
   );
 }
@@ -1036,12 +888,13 @@ function buildModelChart(
     requestCount: number;
     totalTokens: number;
   }[],
-  models: string[],
   metric: ChartMetric,
 ) {
-  const modelNames = [...new Set([...models, ...modelUsage.map((usage) => usage.model)])].sort(
-    (left, right) => left.localeCompare(right),
-  );
+  const metricValue = (usage: (typeof modelUsage)[number]) =>
+    metric === "tokens" ? usage.totalTokens : metric === "cost" ? usage.cost : usage.requestCount;
+  const modelNames = [
+    ...new Set(modelUsage.filter((usage) => metricValue(usage) > 0).map((usage) => usage.model)),
+  ].sort((left, right) => left.localeCompare(right));
   const colors = assignModelColors(modelNames);
   const series = modelNames.map((model, index) => ({
     color: colors.get(model) ?? "var(--chart-1)",
@@ -1060,8 +913,7 @@ function buildModelChart(
   for (const usage of modelUsage) {
     const point = pointByBucket.get(usage.bucket);
     const dataKey = dataKeyByModel.get(usage.model);
-    const value =
-      metric === "tokens" ? usage.totalTokens : metric === "cost" ? usage.cost : usage.requestCount;
+    const value = metricValue(usage);
     if (point && dataKey) Reflect.set(point, dataKey, value);
   }
 
@@ -1144,36 +996,52 @@ function ChartDataTable({
 }) {
   const modelsByDate = groupModelUsage(modelData, (usage) => usage.date);
   return (
-    <table className="sr-only">
-      <caption>{metricTableCaption(metric, "ngày")}; chọn ngày ở dòng tổng để xem theo giờ</caption>
-      <thead>
-        <tr>
-          <th>Ngày</th>
-          <th>Model</th>
-          <th>{metricLabel(metric)}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {data.flatMap((usage) => [
-          <tr key={`${usage.date}-total`}>
-            <th scope="row">
-              <button type="button" onClick={() => onSelect(usage.date)}>
-                {usage.date}
-              </button>
-            </th>
-            <th scope="row">Tất cả model</th>
-            <td>{formatChartMetric(metric, usage)}</td>
-          </tr>,
-          ...(modelsByDate.get(usage.date) ?? []).map((model) => (
-            <tr key={`${usage.date}-${model.model}`}>
-              <td>{usage.date}</td>
-              <th scope="row">{model.model}</th>
-              <td>{formatChartMetric(metric, model)}</td>
-            </tr>
-          )),
-        ])}
-      </tbody>
-    </table>
+    <div className="overflow-x-auto rounded-lg border">
+      <table className="w-full min-w-[34rem] text-sm">
+        <caption className="sr-only">
+          {metricTableCaption(metric, "ngày")}; chọn ngày ở dòng tổng để xem theo giờ
+        </caption>
+        <thead className="bg-muted/50">
+          <tr>
+            <th className="px-3 py-2 text-left">Ngày</th>
+            <th className="px-3 py-2 text-left">Model</th>
+            <th className="px-3 py-2 text-right">{metricLabel(metric)}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.flatMap((usage) => [
+            <tr key={`${usage.date}-total`} className="border-t font-medium">
+              <th scope="row" className="px-3 py-2 text-left">
+                <button
+                  type="button"
+                  className="text-primary underline-offset-4 hover:underline"
+                  onClick={() => onSelect(usage.date)}
+                >
+                  {usage.date}
+                </button>
+              </th>
+              <th scope="row" className="px-3 py-2 text-left">
+                Tất cả model
+              </th>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatChartMetric(metric, usage)}
+              </td>
+            </tr>,
+            ...(modelsByDate.get(usage.date) ?? []).map((model) => (
+              <tr key={`${usage.date}-${model.model}`} className="border-t">
+                <td className="px-3 py-2">{usage.date}</td>
+                <th scope="row" className="px-3 py-2 text-left font-normal">
+                  {model.model}
+                </th>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {formatChartMetric(metric, model)}
+                </td>
+              </tr>
+            )),
+          ])}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -1188,32 +1056,44 @@ function HourlyChartDataTable({
 }) {
   const modelsByHour = groupModelUsage(modelData, (usage) => usage.hour);
   return (
-    <table className="sr-only">
-      <caption>{metricTableCaption(metric, "giờ")}</caption>
-      <thead>
-        <tr>
-          <th>Giờ</th>
-          <th>Model</th>
-          <th>{metricLabel(metric)}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {data.flatMap((usage) => [
-          <tr key={`${usage.hour}-total`}>
-            <th scope="row">{usage.hour}</th>
-            <th scope="row">Tất cả model</th>
-            <td>{formatChartMetric(metric, usage)}</td>
-          </tr>,
-          ...(modelsByHour.get(usage.hour) ?? []).map((model) => (
-            <tr key={`${usage.hour}-${model.model}`}>
-              <td>{usage.hour}</td>
-              <th scope="row">{model.model}</th>
-              <td>{formatChartMetric(metric, model)}</td>
-            </tr>
-          )),
-        ])}
-      </tbody>
-    </table>
+    <div className="overflow-x-auto rounded-lg border">
+      <table className="w-full min-w-[34rem] text-sm">
+        <caption className="sr-only">{metricTableCaption(metric, "giờ")}</caption>
+        <thead className="bg-muted/50">
+          <tr>
+            <th className="px-3 py-2 text-left">Giờ</th>
+            <th className="px-3 py-2 text-left">Model</th>
+            <th className="px-3 py-2 text-right">{metricLabel(metric)}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.flatMap((usage) => [
+            <tr key={`${usage.hour}-total`} className="border-t font-medium">
+              <th scope="row" className="px-3 py-2 text-left">
+                {usage.hour}
+              </th>
+              <th scope="row" className="px-3 py-2 text-left">
+                Tất cả model
+              </th>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatChartMetric(metric, usage)}
+              </td>
+            </tr>,
+            ...(modelsByHour.get(usage.hour) ?? []).map((model) => (
+              <tr key={`${usage.hour}-${model.model}`} className="border-t">
+                <td className="px-3 py-2">{usage.hour}</td>
+                <th scope="row" className="px-3 py-2 text-left font-normal">
+                  {model.model}
+                </th>
+                <td className="px-3 py-2 text-right tabular-nums">
+                  {formatChartMetric(metric, model)}
+                </td>
+              </tr>
+            )),
+          ])}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -1286,232 +1166,6 @@ function ShareBar({ value }: { value: number }) {
   );
 }
 
-function SessionSheet({
-  onOpenChange,
-  session,
-}: {
-  onOpenChange: (open: boolean) => void;
-  session: SessionUsage | null;
-}) {
-  return (
-    <Sheet open={Boolean(session)} onOpenChange={onOpenChange}>
-      <SheetContent className="overflow-y-auto sm:max-w-2xl">
-        <SheetHeader>
-          <SheetTitle>{session?.title ?? "Chưa có tên task"}</SheetTitle>
-          <SheetDescription>
-            {session ? `Session ${shortId(session.sessionId)}` : ""}
-          </SheetDescription>
-        </SheetHeader>
-        {session ? (
-          <div className="motion-stagger grid gap-4 text-sm">
-            <Detail label="Workspace" value={session.cwd ?? "Không có CWD"} />
-            <Detail label="Model" value={session.models.join(", ")} />
-            <Detail
-              label="Tổng token (main + subagents)"
-              value={formatTokens(session.totalTokens)}
-            />
-            <Detail
-              label="Input / cached / output"
-              value={`${formatTokens(session.inputTokens)} / ${formatTokens(session.cachedInputTokens)} / ${formatTokens(session.outputTokens)}`}
-            />
-            <Detail label="Cost ước tính" value={formatUsd(session.estimatedCostUsd)} />
-            <Detail label="Hoạt động đầu" value={formatDateTime(session.firstEventAt)} />
-            <Detail label="Hoạt động cuối" value={formatDateTime(session.lastEventAt)} />
-            <Detail
-              label="Nguồn dữ liệu"
-              value={session.sourceDeleted ? "Đã bị xoá (lịch sử vẫn lưu)" : "Còn trên ổ đĩa"}
-            />
-            <Button asChild className="justify-self-start" variant="outline">
-              <Link to={`/turns?session=${encodeURIComponent(session.sessionId)}`}>
-                Xem turns của session
-              </Link>
-            </Button>
-            <AgentBreakdown agents={session.agents} />
-          </div>
-        ) : null}
-      </SheetContent>
-    </Sheet>
-  );
-}
-
-function AgentSummary({ agents }: { agents: SessionAgentUsage[] }) {
-  const subagents = agents.filter((agent) => agent.isSubagent);
-  if (subagents.length === 0) return <Badge variant="outline">Chỉ main agent</Badge>;
-
-  const names = subagents
-    .map((agent) => agent.name ?? "Chưa đặt tên")
-    .slice(0, 2)
-    .join(", ");
-  const remaining = subagents.length - 2;
-  return (
-    <div className="flex min-w-48 flex-wrap items-center gap-1">
-      <Badge variant="secondary">
-        {subagents.length} subagent{subagents.length === 1 ? "" : "s"}
-      </Badge>
-      <span className="text-muted-foreground text-xs">
-        {names}
-        {remaining > 0 ? ` +${remaining}` : ""}
-      </span>
-    </div>
-  );
-}
-
-function AgentBreakdown({ agents }: { agents: SessionAgentUsage[] }) {
-  const mainAgent = agents.find((agent) => !agent.isSubagent);
-  const subagents = buildAgentTree(agents, mainAgent?.agentId);
-
-  return (
-    <section className="grid gap-3">
-      <div>
-        <h3 className="font-semibold">Chi tiết agent</h3>
-        <p className="text-muted-foreground mt-1 text-xs">
-          Token và cost đã được gán theo từng JSONL source của Codex.
-        </p>
-      </div>
-      {mainAgent ? <AgentCard agent={mainAgent} /> : null}
-      {subagents.length > 0 ? (
-        <div className="motion-agent-list grid gap-2">
-          <p className="text-muted-foreground text-xs font-medium uppercase">
-            Subagent ({subagents.length})
-          </p>
-          {subagents.map(({ agent, visualDepth }) => (
-            <div
-              key={agent.agentId}
-              className="border-primary/20 border-l-2 pl-2"
-              style={{ marginLeft: `${Math.min(Math.max(visualDepth - 1, 0), 4) * 12}px` }}
-            >
-              <AgentCard agent={agent} />
-            </div>
-          ))}
-        </div>
-      ) : (
-        <p className="text-muted-foreground rounded-lg border border-dashed p-3 text-xs">
-          Session này không có subagent nào dùng token trong khoảng ngày đang lọc.
-        </p>
-      )}
-    </section>
-  );
-}
-
-function buildAgentTree(
-  agents: SessionAgentUsage[],
-  mainAgentId: string | undefined,
-): { agent: SessionAgentUsage; visualDepth: number }[] {
-  const subagents = agents.filter((agent) => agent.isSubagent);
-  const agentIds = new Set(agents.map((agent) => agent.agentId));
-  const children = new Map<string, SessionAgentUsage[]>();
-  const root = mainAgentId ?? "__session_root__";
-
-  for (const agent of subagents) {
-    const parent =
-      agent.parentAgentId && agentIds.has(agent.parentAgentId) ? agent.parentAgentId : root;
-    const values = children.get(parent) ?? [];
-    values.push(agent);
-    children.set(parent, values);
-  }
-  for (const values of children.values()) {
-    values.sort(
-      (left, right) =>
-        left.depth - right.depth ||
-        (left.name ?? "").localeCompare(right.name ?? "") ||
-        left.agentId.localeCompare(right.agentId),
-    );
-  }
-
-  const ordered: { agent: SessionAgentUsage; visualDepth: number }[] = [];
-  const visited = new Set<string>();
-  function visit(parentId: string, depth: number) {
-    for (const agent of children.get(parentId) ?? []) {
-      if (visited.has(agent.agentId)) continue;
-      visited.add(agent.agentId);
-      ordered.push({ agent, visualDepth: depth });
-      visit(agent.agentId, depth + 1);
-    }
-  }
-
-  visit(root, 1);
-  for (const agent of subagents) {
-    if (visited.has(agent.agentId)) continue;
-    visited.add(agent.agentId);
-    ordered.push({ agent, visualDepth: Math.max(1, agent.depth) });
-    visit(agent.agentId, Math.max(2, agent.depth + 1));
-  }
-  return ordered;
-}
-
-function AgentCard({ agent }: { agent: SessionAgentUsage }) {
-  const name = agent.isSubagent ? (agent.name ?? "Subagent chưa đặt tên") : "Main agent";
-  return (
-    <article className="hover:border-primary/25 grid gap-3 rounded-lg border p-3 transition-[border-color,box-shadow,transform] duration-300 hover:-translate-y-0.5 hover:shadow-sm">
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <div>
-          <p className="font-medium">{name}</p>
-          <div className="mt-1 flex flex-wrap gap-1">
-            <Badge variant={agent.isSubagent ? "secondary" : "outline"}>
-              {agent.isSubagent ? "Subagent" : "Main agent"}
-            </Badge>
-            {agent.role ? <Badge variant="outline">{agent.role}</Badge> : null}
-            {agent.depth > 0 ? <Badge variant="outline">Depth {agent.depth}</Badge> : null}
-            {agent.parentAgentId ? (
-              <Badge variant="outline">Agent cha {shortId(agent.parentAgentId)}</Badge>
-            ) : null}
-            {agent.lastEventAt === null ? (
-              <Badge variant="outline">Không có usage trong bộ lọc</Badge>
-            ) : null}
-            {agent.sourceDeleted ? <Badge variant="outline">Nguồn đã xoá</Badge> : null}
-          </div>
-        </div>
-        <span className="text-muted-foreground font-mono text-xs">{shortId(agent.agentId)}</span>
-      </div>
-      {agent.taskSummary ? (
-        <p className="text-muted-foreground text-xs">{agent.taskSummary}</p>
-      ) : null}
-      <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-        <AgentMetric label="Token" value={formatTokens(agent.totalTokens)} />
-        <AgentMetric label="Cost" value={formatUsd(agent.estimatedCostUsd)} />
-        <AgentMetric label="Model" value={agent.models.join(", ") || "Không xác định"} />
-        <AgentMetric
-          label="Hoạt động cuối"
-          value={agent.lastEventAt ? formatDateTime(agent.lastEventAt) : "—"}
-        />
-      </div>
-    </article>
-  );
-}
-
-function AgentMetric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="bg-muted rounded-md p-2">
-      <p className="text-muted-foreground">{label}</p>
-      <p className="mt-1 font-medium break-words">{value}</p>
-    </div>
-  );
-}
-
-function Detail({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="bg-muted rounded-lg p-3">
-      <p className="text-muted-foreground text-xs">{label}</p>
-      <p className="mt-1 font-medium break-words">{value}</p>
-    </div>
-  );
-}
-
-function localDate(value: Date): string {
-  const values = Object.fromEntries(
-    new Intl.DateTimeFormat("en-CA", {
-      day: "2-digit",
-      month: "2-digit",
-      timeZone: "Asia/Ho_Chi_Minh",
-      year: "numeric",
-    })
-      .formatToParts(value)
-      .filter((part) => part.type !== "literal")
-      .map((part) => [part.type, part.value]),
-  );
-  return `${values["year"]}-${values["month"]}-${values["day"]}`;
-}
-
 function sameFilters(left: DashboardFilters, right: DashboardFilters): boolean {
   return (
     left.from === right.from &&
@@ -1539,32 +1193,11 @@ function toggleModelFilter(filters: DashboardFilters, model: string): DashboardF
   return next;
 }
 
-function previousDateRange(filters: DashboardFilters): DashboardFilters {
-  const from = new Date(`${filters.from}T12:00:00`);
-  const to = new Date(`${filters.to}T12:00:00`);
-  const days = Math.max(1, Math.round((to.getTime() - from.getTime()) / 86_400_000) + 1);
-  const previousTo = new Date(from);
-  previousTo.setDate(previousTo.getDate() - 1);
-  const previousFrom = new Date(previousTo);
-  previousFrom.setDate(previousFrom.getDate() - days + 1);
-  return {
-    ...filters,
-    from: localDate(previousFrom),
-    to: localDate(previousTo),
-  };
-}
-
 function dashboardPageCopy(mode: DashboardMode): { description: string; title: string } {
   if (mode === "explore") {
     return {
       description: "Xem chi tiết token, cost và yêu cầu theo ngày, giờ và model.",
       title: "Khám phá mức sử dụng",
-    };
-  }
-  if (mode === "sessions") {
-    return {
-      description: "Xem task, model, main agent và subagent trong từng phiên.",
-      title: "Khám phá phiên",
     };
   }
   return {
@@ -1608,16 +1241,6 @@ function inclusiveDays(from: string | undefined, to: string | undefined): number
   );
 }
 
-function subscribeDesktopLayout(callback: () => void): () => void {
-  const media = window.matchMedia("(min-width: 768px)");
-  media.addEventListener("change", callback);
-  return () => media.removeEventListener("change", callback);
-}
-
-function desktopLayoutSnapshot(): boolean {
-  return window.matchMedia("(min-width: 768px)").matches;
-}
-
 function safeRatio(numerator: number, denominator: number): number {
   return denominator > 0 ? numerator / denominator : 0;
 }
@@ -1626,34 +1249,18 @@ function formatDelta(current: number | undefined, previous: number | undefined):
   if (current === undefined || previous === undefined || previous === 0) return null;
   const delta = ((current - previous) / previous) * 100;
   const sign = delta > 0 ? "+" : "";
-  return `${sign}${new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 1 }).format(delta)}%`;
+  return `${sign}${DELTA_FORMATTER.format(delta)}%`;
 }
 
 function formatTokens(value: number): string {
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value);
+  return INTEGER_FORMATTER.format(value);
 }
 function compactNumber(value: number): string {
-  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(
-    value,
-  );
+  return COMPACT_FORMATTER.format(value);
 }
 function formatPercent(value: number): string {
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 }).format(value) + "%";
+  return PERCENT_FORMATTER.format(value) + "%";
 }
 function formatUsd(value: number): string {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 2,
-  }).format(value);
-}
-function formatDateTime(value: string): string {
-  return new Intl.DateTimeFormat("vi-VN", {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone: "Asia/Ho_Chi_Minh",
-  }).format(new Date(value));
-}
-function shortId(value: string): string {
-  return `${value.slice(0, 8)}…${value.slice(-6)}`;
+  return USD_FORMATTER.format(value);
 }

@@ -1,37 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  Bell,
-  BellRing,
-  Calculator,
-  Check,
-  Download,
-  FileJson,
-  FileSpreadsheet,
-  LoaderCircle,
-  RotateCcw,
-  ShieldCheck,
-  Trash2,
-  TriangleAlert,
-  WalletCards,
-} from "lucide-react";
+import { Calculator, LoaderCircle, RotateCcw, TriangleAlert, WalletCards } from "lucide-react";
 import { useId, useState } from "react";
-import { Link } from "react-router";
 import { toast } from "sonner";
 
 import type {
-  AgentFilters,
-  AlertEvent,
-  AlertsResponse,
   BudgetPeriod,
   BudgetSetting,
   DashboardFilters,
   ModelRate,
   PricingSimulationRequest,
   PricingSimulationResponse,
-  SessionFilters,
-  TurnFilters,
 } from "@/shared/types";
-import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
 import {
   Card,
@@ -42,25 +21,14 @@ import {
 } from "@/web/components/ui/card";
 import { Input } from "@/web/components/ui/input";
 import { Label } from "@/web/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/web/components/ui/select";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger,
-} from "@/web/components/ui/sheet";
 import { Skeleton } from "@/web/components/ui/skeleton";
-
-type ExportDataset = "agents" | "models" | "projects" | "sessions" | "turns";
-type ExportFormat = "csv" | "json";
+import { queueLiveMutationScopes } from "@/web/lib/live-events";
+import {
+  fetchBudgets,
+  fetchPricingModels,
+  runPricingSimulation,
+  saveBudget,
+} from "@/web/lib/product-api";
 
 type RateDraft = {
   cachedInputRate: string;
@@ -69,177 +37,19 @@ type RateDraft = {
   outputRate: string;
 };
 
-const exportLabels: Record<ExportDataset, string> = {
-  agents: "Agent",
-  models: "Model",
-  projects: "Dự án",
-  sessions: "Phiên",
-  turns: "Turns",
-};
-const allExportDatasets = Object.keys(exportLabels) as ExportDataset[];
-
-export function NotificationCenter() {
-  const [open, setOpen] = useState(false);
-  const queryClient = useQueryClient();
-  const alerts = useQuery({
-    queryKey: ["alerts"],
-    queryFn: fetchAlerts,
-    refetchInterval: 60_000,
-  });
-  const update = useMutation({
-    mutationFn: updateAlert,
-    onError: (error) => toast.error(error.message),
-    onSuccess: (_, variables) => {
-      void queryClient.invalidateQueries({ queryKey: ["alerts"] });
-      if (variables.action === "dismiss") toast.success("Đã ẩn thông báo.");
-    },
-  });
-  const unseen = alerts.data?.unseenCount ?? 0;
-
-  return (
-    <Sheet open={open} onOpenChange={setOpen}>
-      <SheetTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="relative"
-          aria-label={unseen > 0 ? `Thông báo: ${unseen} chưa đọc` : "Thông báo"}
-        >
-          {unseen > 0 ? (
-            <BellRing className="size-4" aria-hidden="true" />
-          ) : (
-            <Bell className="size-4" aria-hidden="true" />
-          )}
-          {unseen > 0 ? (
-            <span className="bg-destructive text-destructive-foreground absolute -top-0.5 -right-0.5 flex min-w-4 items-center justify-center rounded-full px-1 text-[10px] leading-4 font-semibold">
-              {unseen > 99 ? "99+" : unseen}
-            </span>
-          ) : null}
-        </Button>
-      </SheetTrigger>
-      <SheetContent className="w-full overflow-y-auto sm:max-w-md">
-        <SheetHeader className="pr-8">
-          <SheetTitle className="flex items-center gap-2">
-            <BellRing className="text-primary size-5" aria-hidden="true" />
-            Trung tâm thông báo
-          </SheetTitle>
-          <SheetDescription>
-            Cảnh báo budget, usage bất thường, context pressure và sức khoẻ dữ liệu chỉ hiển thị
-            trong app.
-          </SheetDescription>
-        </SheetHeader>
-
-        <div className="space-y-3" aria-live="polite" aria-busy={alerts.isLoading}>
-          {alerts.isLoading ? <AlertSkeletons /> : null}
-          {alerts.isError ? (
-            <InlineError message={alerts.error.message} onRetry={() => void alerts.refetch()} />
-          ) : null}
-          {alerts.data?.alerts.map((alert) => (
-            <article
-              key={alert.id}
-              className={`rounded-xl border p-4 ${alertSurface(alert.severity)}`}
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0 space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Badge variant={alert.severity === "critical" ? "destructive" : "secondary"}>
-                      {severityLabel(alert.severity)}
-                    </Badge>
-                    <span className="text-muted-foreground text-xs">
-                      {formatDateTime(alert.createdAt)}
-                    </span>
-                  </div>
-                  <h3 className="text-sm font-semibold">{alert.title}</h3>
-                  <p className="text-muted-foreground text-sm leading-5">{alert.message}</p>
-                </div>
-                {alert.seenAt === null ? (
-                  <span
-                    className="bg-primary mt-1 size-2 shrink-0 rounded-full"
-                    aria-hidden="true"
-                  />
-                ) : null}
-              </div>
-              <div className="mt-3 flex flex-wrap justify-end gap-2">
-                {alert.turnKey ? (
-                  <Button asChild size="sm" variant="outline">
-                    <Link to={`/turns/${alert.turnKey}`} onClick={() => setOpen(false)}>
-                      Xem turn
-                    </Link>
-                  </Button>
-                ) : null}
-                {alert.seenAt === null ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    disabled={update.isPending}
-                    onClick={() => update.mutate({ action: "seen", id: alert.id })}
-                  >
-                    <Check className="size-3.5" aria-hidden="true" />
-                    Đã đọc
-                  </Button>
-                ) : null}
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  disabled={update.isPending}
-                  onClick={() => update.mutate({ action: "dismiss", id: alert.id })}
-                >
-                  <Trash2 className="size-3.5" aria-hidden="true" />
-                  Ẩn
-                </Button>
-              </div>
-            </article>
-          ))}
-          {alerts.data?.alerts.length === 0 ? (
-            <div className="flex flex-col items-center rounded-xl border border-dashed px-6 py-12 text-center">
-              <ShieldCheck className="text-primary mb-3 size-8" aria-hidden="true" />
-              <p className="font-medium">Chưa có cảnh báo</p>
-              <p className="text-muted-foreground mt-1 text-sm">
-                App sẽ báo khi budget vượt ngưỡng hoặc phát hiện usage bất thường.
-              </p>
-            </div>
-          ) : null}
-        </div>
-      </SheetContent>
-    </Sheet>
-  );
-}
-
-export function AlertBanner() {
-  const alerts = useQuery({
-    queryKey: ["alerts"],
-    queryFn: fetchAlerts,
-    refetchInterval: 60_000,
-  });
-  const alert =
-    alerts.data?.alerts.find((value) => value.type === "budget" && value.seenAt === null) ??
-    alerts.data?.alerts.find((value) => value.severity === "critical" && value.seenAt === null);
-  if (!alert) return null;
-
-  return (
-    <section
-      aria-label="Cảnh báo usage"
-      className={`flex flex-col justify-between gap-3 rounded-xl border p-4 sm:flex-row sm:items-center ${alertSurface(alert.severity)}`}
-    >
-      <div className="flex items-start gap-3">
-        <TriangleAlert className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
-        <div>
-          <p className="font-semibold">{alert.title}</p>
-          <p className="text-muted-foreground mt-1 text-sm">{alert.message}</p>
-        </div>
-      </div>
-      <Button asChild size="sm" variant="outline">
-        <Link to="/settings">Xem budget</Link>
-      </Button>
-    </section>
-  );
-}
+const USD_FORMATTER = new Intl.NumberFormat("en-US", {
+  currency: "USD",
+  maximumFractionDigits: 2,
+  minimumFractionDigits: 2,
+  style: "currency",
+});
 
 export function BudgetSettings() {
-  const budgets = useQuery({ queryKey: ["budgets"], queryFn: fetchBudgets });
+  const budgets = useQuery({
+    queryKey: ["budgets"],
+    queryFn: ({ signal }) => fetchBudgets(signal),
+    staleTime: 5 * 60_000,
+  });
 
   return (
     <Card>
@@ -291,8 +101,13 @@ function BudgetEditor({ budget }: { budget: BudgetSetting }) {
       toast.success(
         `Đã lưu budget ${periodLabel(payload.budget.period).toLocaleLowerCase("vi-VN")}.`,
       );
-      void queryClient.invalidateQueries({ queryKey: ["budgets"] });
-      void queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.setQueryData<{ budgets: BudgetSetting[] }>(["budgets"], (current) => ({
+        budgets: [
+          ...(current?.budgets.filter((item) => item.period !== payload.budget.period) ?? []),
+          payload.budget,
+        ],
+      }));
+      queueLiveMutationScopes(queryClient, ["alerts", "budgets"]);
     },
   });
 
@@ -384,7 +199,11 @@ function BudgetEditor({ budget }: { budget: BudgetSetting }) {
 }
 
 export function PricingSimulator({ filters }: { filters: DashboardFilters }) {
-  const pricing = useQuery({ queryKey: ["pricing-models"], queryFn: fetchPricingModels });
+  const pricing = useQuery({
+    queryKey: ["pricing-models"],
+    queryFn: ({ signal }) => fetchPricingModels(signal),
+    staleTime: 5 * 60_000,
+  });
   const [draftOverrides, setDraftOverrides] = useState<RateDraft[] | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
   const simulate = useMutation({
@@ -589,108 +408,6 @@ function ResultMetric({
   );
 }
 
-type ExportFilters = (AgentFilters & SessionFilters) | TurnFilters;
-
-export function ExportActions({
-  datasets = allExportDatasets,
-  filters,
-}: {
-  datasets?: ExportDataset[];
-  filters: ExportFilters;
-}) {
-  const [dataset, setDataset] = useState<ExportDataset>(datasets.at(0) ?? "models");
-  const [format, setFormat] = useState<ExportFormat>("csv");
-  const [isExporting, setIsExporting] = useState(false);
-
-  async function download() {
-    setIsExporting(true);
-    try {
-      await downloadExport(dataset, format, filters);
-      toast.success(`Đã xuất ${exportDatasetLabel(dataset)} dạng ${format.toUpperCase()}.`);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Không thể export dữ liệu.");
-    } finally {
-      setIsExporting(false);
-    }
-  }
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Download className="text-primary size-4" aria-hidden="true" />
-          Export dữ liệu
-        </CardTitle>
-        <CardDescription>
-          File dùng chính xác khoảng ngày, model, project và loại agent đang được lọc.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_140px_auto] sm:items-end">
-          <div className="space-y-2">
-            <Label htmlFor="export-dataset">Dữ liệu</Label>
-            <Select value={dataset} onValueChange={(value: ExportDataset) => setDataset(value)}>
-              <SelectTrigger id="export-dataset">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {datasets.map((value) => (
-                  <SelectItem key={value} value={value}>
-                    {exportDatasetLabel(value)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="export-format">Định dạng</Label>
-            <Select value={format} onValueChange={(value: ExportFormat) => setFormat(value)}>
-              <SelectTrigger id="export-format">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="csv">
-                  <span className="flex items-center gap-2">
-                    <FileSpreadsheet className="size-3.5" aria-hidden="true" /> CSV
-                  </span>
-                </SelectItem>
-                <SelectItem value="json">
-                  <span className="flex items-center gap-2">
-                    <FileJson className="size-3.5" aria-hidden="true" /> JSON
-                  </span>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <Button
-            type="button"
-            onClick={() => void download()}
-            disabled={isExporting}
-            className="w-full sm:w-auto"
-          >
-            {isExporting ? (
-              <LoaderCircle className="size-4 animate-spin" />
-            ) : (
-              <Download className="size-4" aria-hidden="true" />
-            )}
-            Export
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function AlertSkeletons() {
-  return Array.from({ length: 3 }, (_, index) => (
-    <div key={index} className="space-y-3 rounded-xl border p-4">
-      <Skeleton className="h-5 w-28" />
-      <Skeleton className="h-4 w-4/5" />
-      <Skeleton className="h-4 w-full" />
-    </div>
-  ));
-}
-
 function InlineError({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
     <div className="border-destructive/30 bg-destructive/5 rounded-xl border p-4" role="alert">
@@ -708,45 +425,8 @@ function InlineError({ message, onRetry }: { message: string; onRetry: () => voi
   );
 }
 
-function alertSurface(severity: AlertEvent["severity"]) {
-  switch (severity) {
-    case "critical":
-      return "border-destructive/35 bg-destructive/5";
-    case "warning":
-      return "border-amber-500/35 bg-amber-500/5";
-    case "info":
-      return "border-primary/25 bg-primary/5";
-  }
-}
-
-function severityLabel(severity: AlertEvent["severity"]) {
-  switch (severity) {
-    case "critical":
-      return "Khẩn cấp";
-    case "warning":
-      return "Cảnh báo";
-    case "info":
-      return "Thông tin";
-  }
-}
-
 function periodLabel(period: BudgetPeriod) {
   return period === "daily" ? "Hàng ngày" : "Hàng tháng";
-}
-
-function exportDatasetLabel(dataset: ExportDataset) {
-  switch (dataset) {
-    case "agents":
-      return exportLabels.agents;
-    case "models":
-      return exportLabels.models;
-    case "projects":
-      return exportLabels.projects;
-    case "sessions":
-      return exportLabels.sessions;
-    case "turns":
-      return exportLabels.turns;
-  }
 }
 
 function parseThresholds(value: string): number[] | null {
@@ -817,131 +497,6 @@ function toSimulationRate(draft: RateDraft): Omit<ModelRate, "updatedAt"> | null
   return { cachedInputRate, inputRate, model: draft.model, outputRate };
 }
 
-function formatDateTime(value: string) {
-  const date = new Date(value);
-  if (Number.isNaN(date.valueOf())) return value;
-  return new Intl.DateTimeFormat("vi-VN", {
-    dateStyle: "short",
-    timeStyle: "short",
-    timeZone: "Asia/Ho_Chi_Minh",
-  }).format(date);
-}
-
 function formatUsd(value: number) {
-  return new Intl.NumberFormat("en-US", {
-    currency: "USD",
-    maximumFractionDigits: 2,
-    minimumFractionDigits: 2,
-    style: "currency",
-  }).format(value);
-}
-
-function dashboardQuery(dataset: ExportDataset, filters: ExportFilters) {
-  const query = new URLSearchParams({ from: filters.from, to: filters.to });
-  const models = filters.models?.length ? filters.models : filters.model ? [filters.model] : [];
-  if (models.length > 0) query.set("models", models.join(","));
-  if (filters.projectId) query.set("project", filters.projectId);
-  if (filters.agentKind && filters.agentKind !== "all") {
-    query.set("agentKind", filters.agentKind);
-  }
-  if ("depth" in filters && filters.depth !== undefined) query.set("depth", String(filters.depth));
-  if ("role" in filters && filters.role) query.set("role", filters.role);
-  if ("hasSubagents" in filters && filters.hasSubagents !== undefined) {
-    query.set("hasSubagents", String(filters.hasSubagents));
-  }
-  if (filters.query) query.set("q", filters.query);
-  if (filters.order) query.set("order", filters.order);
-  if (dataset === "turns" && filters.sort) query.set("sort", filters.sort);
-  if (
-    dataset === "sessions" &&
-    (filters.sort === "cost" || filters.sort === "lastActivity" || filters.sort === "tokens")
-  ) {
-    query.set("sort", filters.sort);
-  }
-  if ("agentId" in filters && filters.agentId) query.set("agent", filters.agentId);
-  if ("effort" in filters && filters.effort) query.set("effort", filters.effort);
-  if ("pressure" in filters && filters.pressure) query.set("pressure", filters.pressure);
-  if ("sessionId" in filters && filters.sessionId) query.set("session", filters.sessionId);
-  if ("status" in filters && filters.status) query.set("status", filters.status);
-  return query;
-}
-
-async function fetchAlerts() {
-  return request<AlertsResponse>("/api/alerts");
-}
-
-async function updateAlert({ action, id }: { action: "dismiss" | "seen"; id: string }) {
-  return request<{ alert: AlertEvent }>(`/api/alerts/${encodeURIComponent(id)}`, {
-    body: JSON.stringify({ action }),
-    method: "PATCH",
-  });
-}
-
-async function fetchBudgets() {
-  return request<{ budgets: BudgetSetting[] }>("/api/budgets");
-}
-
-async function saveBudget(budget: Omit<BudgetSetting, "updatedAt">) {
-  return request<{ budget: BudgetSetting }>("/api/budgets", {
-    body: JSON.stringify(budget),
-    method: "PUT",
-  });
-}
-
-async function fetchPricingModels() {
-  const [models, rates] = await Promise.all([
-    request<{ models: string[] }>("/api/models"),
-    request<{ rates: ModelRate[] }>("/api/rates"),
-  ]);
-  return { models: models.models, rates: rates.rates };
-}
-
-async function runPricingSimulation(payload: PricingSimulationRequest) {
-  return request<PricingSimulationResponse>("/api/pricing/simulate", {
-    body: JSON.stringify(payload),
-    method: "POST",
-  });
-}
-
-async function downloadExport(
-  dataset: ExportDataset,
-  format: ExportFormat,
-  filters: ExportFilters,
-) {
-  const query = dashboardQuery(dataset, filters);
-  query.set("dataset", dataset);
-  query.set("format", format);
-  const response = await fetch(`/api/export?${query.toString()}`);
-  if (!response.ok) throw new Error(await errorMessage(response));
-  const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `codex-usage-${dataset}.${format}`;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
-}
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
-  if (!response.ok) throw new Error(await errorMessage(response));
-  return response.json() as Promise<T>;
-}
-
-async function errorMessage(response: Response) {
-  const payload: unknown = await response.json().catch(() => null);
-  if (
-    typeof payload === "object" &&
-    payload !== null &&
-    "error" in payload &&
-    typeof payload.error === "string"
-  ) {
-    return payload.error;
-  }
-  return `Request failed (${response.status})`;
+  return USD_FORMATTER.format(value);
 }

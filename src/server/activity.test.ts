@@ -221,6 +221,7 @@ describe("activity import and retention", () => {
       .prepare("insert into import_states (source_path, updated_at) values (?, ?)")
       .run("/legacy/source.jsonl", 1);
     client.exec(await migrationSql(10));
+    client.exec(await migrationSql(11));
 
     expect(
       client
@@ -241,6 +242,13 @@ describe("activity import and retention", () => {
         )
         .get(),
     ).toEqual({ turnKey: null, version: 0 });
+    expect(
+      client
+        .prepare(
+          "select count(*) as count from sqlite_master where type = 'index' and name = 'activity_events_timestamp_id_index'",
+        )
+        .get(),
+    ).toEqual({ count: 1 });
     expect(
       client
         .prepare(
@@ -420,6 +428,78 @@ describe("activity import and retention", () => {
     expect(getActivity(harness.database, { from: "2026-05-01", to: "2026-05-01" }).daily).toEqual(
       archived.daily,
     );
+  });
+
+  it("paginates activity by timestamp and id and binds cursors to filters", async () => {
+    const harness = await createHarness();
+    harness.database
+      .insert(sessions)
+      .values({
+        id: "cursor-session",
+        lastSeenAt: 1,
+        projectId: "cursor-project",
+        sourcePath: "/cursor.jsonl",
+      })
+      .run();
+    harness.database
+      .insert(activityEvents)
+      .values(
+        ["a", "b", "c"].map((id) => ({
+          agentId: "cursor-session",
+          agentKind: "main",
+          createdAt: 1,
+          id: `cursor-${id}`,
+          kind: id === "b" ? "shell" : "turn",
+          localDate: "2026-07-12",
+          projectId: "cursor-project",
+          sessionId: "cursor-session",
+          timestamp: "2026-07-12T01:00:00.000Z",
+        })),
+      )
+      .run();
+    const app = createApp(harness.database, harness.importer, harness.retention);
+    const firstResponse = await app.request(
+      "/api/activity/timeline?from=2026-07-12&to=2026-07-12&limit=1",
+    );
+    const first = (await firstResponse.json()) as {
+      hasMore: boolean;
+      items: { id: string }[];
+      nextCursor: string;
+    };
+    expect(first).toMatchObject({ hasMore: true, items: [{ id: "cursor-c" }] });
+    const secondResponse = await app.request(
+      `/api/activity/timeline?from=2026-07-12&to=2026-07-12&limit=1&cursor=${first.nextCursor}`,
+    );
+    const second = (await secondResponse.json()) as {
+      hasMore: boolean;
+      items: { id: string }[];
+      nextCursor: string;
+    };
+    expect(second).toMatchObject({ hasMore: true, items: [{ id: "cursor-b" }] });
+    const third = await (
+      await app.request(
+        `/api/activity/timeline?from=2026-07-12&to=2026-07-12&limit=1&cursor=${second.nextCursor}`,
+      )
+    ).json();
+    expect(third).toMatchObject({ hasMore: false, items: [{ id: "cursor-a" }], nextCursor: null });
+
+    expect(
+      (
+        await app.request(
+          `/api/activity/timeline?from=2026-07-12&to=2026-07-12&limit=1&kinds=shell&cursor=${first.nextCursor}`,
+        )
+      ).status,
+    ).toBe(400);
+    expect((await app.request("/api/activity/timeline?limit=1&cursor=not-a-cursor")).status).toBe(
+      400,
+    );
+    expect((await app.request("/api/activity/timeline?limit=0")).status).toBe(400);
+    expect((await app.request("/api/activity/timeline?limit=201")).status).toBe(400);
+
+    const summary = await app.request("/api/activity/summary?from=2026-07-12&to=2026-07-12");
+    expect(await summary.json()).toMatchObject({ timelineTotal: 3 });
+    const legacy = await app.request("/api/activity?from=2026-07-12&to=2026-07-12");
+    expect(await legacy.json()).toMatchObject({ timeline: expect.any(Array) });
   });
 
   it("serves project/agent timelines and reports actionable data health", async () => {

@@ -3,9 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { eq } from "drizzle-orm";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { AlertMaterializer } from "@/server/alert-materializer";
 import { getDashboard, upsertModelRate } from "@/server/analytics";
+import { AppEventBus } from "@/server/app-events";
 import { createApp } from "@/server/app";
 import { createDatabase, migrateDatabase, type AppDatabase } from "@/server/db/client";
 import {
@@ -27,8 +29,15 @@ import {
   exportTurnDataset,
   getAlertFeed,
   getAgents,
+  getAgentsPage,
+  getAgentsSummary,
   getBudgets,
   getInsights,
+  getOverview,
+  getProjectOptions,
+  getProjectAnalytics,
+  getProjectsPage,
+  getProjectsSummary,
   getProjects,
   refreshAlerts,
   saveBudget,
@@ -37,6 +46,7 @@ import {
 } from "@/server/product-analytics";
 import { renameProject } from "@/server/projects";
 import { RetentionService } from "@/server/retention";
+import type { AgentLeaderboardMetric, AgentUsageSummary } from "@/shared/types";
 
 type Harness = Awaited<ReturnType<typeof createHarness>>;
 
@@ -53,6 +63,35 @@ afterEach(async () => {
 });
 
 describe("phase 2 product analytics", () => {
+  it("reuses dashboard contracts for overview and returns compact project options", () => {
+    const filters = { from: "2026-07-12", to: "2026-07-12" };
+    const overview = getOverview(harness.database, filters, fixedNow());
+    expect(overview.dashboard).toEqual(getDashboard(harness.database, filters, fixedNow()));
+    expect(overview.insights).toEqual(getInsights(harness.database, filters, fixedNow()));
+    expect(overview.insights.current).toEqual(overview.dashboard.kpis);
+
+    harness.database
+      .insert(projects)
+      .values({
+        createdAt: 1,
+        displayName: "Unused",
+        displayPath: "/unused",
+        id: "unused-project",
+        normalizedPath: "/unused",
+        updatedAt: 1,
+      })
+      .run();
+    expect(getProjectOptions(harness.database, filters)).toEqual({
+      projects: [
+        { displayName: "=SUM(A1:A2)", id: "project-alpha" },
+        { displayName: "Beta", id: "project-beta" },
+      ],
+    });
+    expect(getProjectOptions(harness.database, { ...filters, models: ["model-b"] })).toEqual({
+      projects: [{ displayName: "=SUM(A1:A2)", id: "project-alpha" }],
+    });
+  });
+
   it("compares the previous period and projects the current calendar month", () => {
     const insights = getInsights(
       harness.database,
@@ -129,6 +168,101 @@ describe("phase 2 product analytics", () => {
     expect(filtered.agents.map((agent) => agent.agentId)).toEqual(["agent-mapper"]);
     expect(filtered.main).toMatchObject({ requestCount: 0, totalTokens: 0 });
     expect(filtered.subagent).toMatchObject({ requestCount: 1, totalTokens: 2_500 });
+  });
+
+  it("returns set-based paged agents and projects with lazy project analytics", () => {
+    const range = { from: "2026-07-12", to: "2026-07-12" };
+    expect(getAgentsSummary(harness.database, range, fixedNow())).toMatchObject({
+      main: { totalTokens: 1_400 },
+      subagent: { totalTokens: 2_500 },
+      totalAgents: 3,
+    });
+    const agents = getAgentsPage(harness.database, {
+      ...range,
+      order: "desc",
+      page: 1,
+      pageSize: 1,
+      sort: "tokens",
+    });
+    expect(agents).toMatchObject({
+      agents: [
+        {
+          agentId: "agent-mapper",
+          modelCount: 1,
+          topModels: ["model-b"],
+          totalTokens: 2_500,
+        },
+      ],
+      page: 1,
+      pageSize: 1,
+      total: 3,
+    });
+    expect(getAgentsPage(harness.database, { ...range, page: 4, pageSize: 1 })).toMatchObject({
+      agents: [],
+      total: 3,
+    });
+    expect(
+      getAgentsPage(harness.database, { ...range, depth: 1, role: "explorer" }).agents.map(
+        (agent) => agent.agentId,
+      ),
+    ).toEqual(["agent-mapper"]);
+
+    const legacyAgents = getAgents(harness.database, range, fixedNow()).agents;
+    const metrics = ["tokens", "cost", "requests", "cache", "output"] as const;
+    for (const sort of metrics) {
+      for (const order of ["asc", "desc"] as const) {
+        const expected = [...legacyAgents]
+          .sort((left, right) => {
+            const difference = agentMetric(left, sort) - agentMetric(right, sort);
+            if (difference !== 0) return order === "asc" ? difference : -difference;
+            return left.agentId.localeCompare(right.agentId);
+          })
+          .map((agent) => agent.agentId);
+        expect(
+          getAgentsPage(harness.database, {
+            ...range,
+            order,
+            page: 1,
+            pageSize: 100,
+            sort,
+          }).agents.map((agent) => agent.agentId),
+        ).toEqual(expected);
+      }
+    }
+
+    expect(getProjectsSummary(harness.database, range)).toMatchObject({
+      kpis: { sessionCount: 2, totalTokens: 3_900 },
+      projectCount: 2,
+    });
+    const projects = getProjectsPage(harness.database, { ...range, page: 1, pageSize: 1 });
+    expect(projects).toMatchObject({
+      page: 1,
+      pageSize: 1,
+      projects: [
+        {
+          id: "project-alpha",
+          modelCount: 2,
+          subagentTokens: 2_500,
+          totalTokens: 3_600,
+        },
+      ],
+      total: 2,
+    });
+    expect(projects.projects[0]?.topModels).toEqual([
+      { model: "model-b", totalTokens: 2_500 },
+      { model: "model-a", totalTokens: 1_100 },
+    ]);
+    expect(getProjectsPage(harness.database, { ...range, page: 3, pageSize: 1 })).toMatchObject({
+      projects: [],
+      total: 2,
+    });
+    const legacyProject = getProjects(harness.database, range, fixedNow()).projects.find(
+      (project) => project.id === "project-alpha",
+    );
+    expect(getProjectAnalytics(harness.database, "project-alpha", range, fixedNow())).toEqual({
+      project: legacyProject,
+    });
+    expect(getProjectAnalytics(harness.database, "missing", range, fixedNow())).toBeNull();
   });
 
   it("renames projects without changing their identity or aggregate usage", () => {
@@ -217,9 +351,22 @@ describe("phase 2 product analytics", () => {
         totalTokens: 350,
       }),
     ]);
+    expect(getAgentsSummary(harness.database, range, fixedNow())).toMatchObject({
+      subagent: { sessionCount: 1, totalTokens: 350 },
+      totalAgents: 1,
+    });
+    expect(getAgentsPage(harness.database, range)).toMatchObject({
+      agents: [expect.objectContaining({ agentId: "agent-mapper", totalTokens: 350 })],
+      total: 1,
+    });
+    expect(getProjectsSummary(harness.database, range)).toMatchObject({
+      kpis: { totalTokens: 350 },
+      projectCount: 1,
+    });
   });
 
   it("keeps legacy main/subagent totals when per-agent rollups do not exist yet", () => {
+    const range = { from: "2026-03-01", to: "2026-03-01" };
     const base = {
       cachedInputTokens: 60,
       costUsd: 0.4,
@@ -271,11 +418,7 @@ describe("phase 2 product analytics", () => {
       ])
       .run();
 
-    const response = getAgents(
-      harness.database,
-      { from: "2026-03-01", to: "2026-03-01" },
-      fixedNow(),
-    );
+    const response = getAgents(harness.database, range, fixedNow());
     expect(response.agents).toEqual([]);
     expect(response.main).toMatchObject({ requestCount: 1, sessionCount: 1, totalTokens: 120 });
     expect(response.subagent).toMatchObject({
@@ -290,6 +433,11 @@ describe("phase 2 product analytics", () => {
         subagent: expect.objectContaining({ totalTokens: 240 }),
       }),
     ]);
+    expect(getAgentsSummary(harness.database, range, fixedNow())).toMatchObject({
+      main: { totalTokens: 120 },
+      subagent: { totalTokens: 240 },
+      totalAgents: 0,
+    });
     expect(
       getDashboard(
         harness.database,
@@ -430,6 +578,7 @@ describe("phase 2 product analytics", () => {
       )
       .run();
 
+    refreshAlerts(harness.database, fixedNow());
     const first = getAlertFeed(harness.database, fixedNow());
     expect(first.alerts).toHaveLength(100);
     expect(first.unseenCount).toBe(200);
@@ -441,6 +590,8 @@ describe("phase 2 product analytics", () => {
         .all(),
     ).toHaveLength(200);
 
+    expect(getAlertFeed(harness.database, fixedNow())).toEqual(first);
+    refreshAlerts(harness.database, fixedNow());
     const second = getAlertFeed(harness.database, fixedNow());
     expect(second.alerts).toHaveLength(100);
     expect(second.unseenCount).toBe(205);
@@ -633,6 +784,78 @@ describe("phase 2 product analytics", () => {
 });
 
 describe("phase 2 API", () => {
+  it("serves additive overview and project-option contracts with no-store caching", async () => {
+    const app = createApp(harness.database, harness.importer, harness.retention);
+    const overview = await app.request("/api/overview?from=2026-07-12&to=2026-07-12");
+    expect(overview.status).toBe(200);
+    expect(overview.headers.get("cache-control")).toBe("no-store");
+    expect(await overview.json()).toMatchObject({
+      dashboard: { kpis: { totalTokens: 3_900 } },
+      insights: { current: { totalTokens: 3_900 } },
+    });
+
+    const options = await app.request("/api/projects/options?from=2026-07-12&to=2026-07-12");
+    expect(options.status).toBe(200);
+    expect(await options.json()).toEqual({
+      projects: [
+        { displayName: "=SUM(A1:A2)", id: "project-alpha" },
+        { displayName: "Beta", id: "project-beta" },
+      ],
+    });
+    expect((await app.request("/api/dashboard?from=2026-07-12&to=2026-07-12")).status).toBe(200);
+    expect((await app.request("/api/insights?from=2026-07-12&to=2026-07-12")).status).toBe(200);
+    expect((await app.request("/api/projects?from=2026-07-12&to=2026-07-12")).status).toBe(200);
+  });
+
+  it("returns slim session summaries and lazy filtered details", async () => {
+    const app = createApp(harness.database, harness.importer, harness.retention);
+    const summaryResponse = await app.request(
+      "/api/sessions/summary?from=2026-07-12&to=2026-07-12&page=1&pageSize=1&sort=tokens&order=desc",
+    );
+    expect(summaryResponse.status).toBe(200);
+    const summary = (await summaryResponse.json()) as {
+      sessions: Record<string, unknown>[];
+      total: number;
+    };
+    expect(summary.total).toBe(2);
+    expect(summary.sessions[0]).toMatchObject({
+      agentCount: 2,
+      sessionId: "session-alpha",
+      subagentCount: 1,
+      subagentNames: ["Mapper"],
+      totalTokens: 3_600,
+    });
+    expect(summary.sessions[0]).not.toHaveProperty("agents");
+
+    const detail = await app.request(
+      "/api/sessions/session-alpha?from=2026-07-12&to=2026-07-12&project=project-alpha",
+    );
+    expect(detail.status).toBe(200);
+    expect(await detail.json()).toMatchObject({
+      agents: expect.arrayContaining([expect.objectContaining({ agentId: "agent-mapper" })]),
+      sessionId: "session-alpha",
+      totalTokens: 3_600,
+    });
+    expect(
+      (
+        await app.request(
+          "/api/sessions/session-alpha?from=2026-07-12&to=2026-07-12&project=project-beta",
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (await app.request("/api/sessions/summary?from=2026-07-12&to=2026-07-12&q=%27")).status,
+    ).toBe(200);
+    expect((await app.request(`/api/sessions/${"x".repeat(161)}`)).status).toBe(400);
+
+    const legacy = await app.request(
+      "/api/sessions?from=2026-07-12&to=2026-07-12&page=1&pageSize=1",
+    );
+    expect(await legacy.json()).toMatchObject({
+      sessions: [expect.objectContaining({ agents: expect.any(Array) })],
+    });
+  });
+
   it("supports session search, server-side sort, pagination, and validation", async () => {
     const app = createApp(harness.database, harness.importer, harness.retention);
     const page = await app.request(
@@ -665,6 +888,11 @@ describe("phase 2 API", () => {
     expect((await app.request("/api/sessions?pageSize=101")).status).toBe(400);
     expect((await app.request("/api/sessions?sort=unknown")).status).toBe(400);
     expect((await app.request("/api/sessions?hasSubagents=maybe")).status).toBe(400);
+    expect(
+      await (
+        await app.request("/api/sessions?from=2026-07-12&to=2026-07-12&page=3&pageSize=1")
+      ).json(),
+    ).toMatchObject({ sessions: [], total: 2 });
   });
 
   it("exposes projects and agents with strict validation", async () => {
@@ -712,6 +940,38 @@ describe("phase 2 API", () => {
     expect(await agentsResponse.json()).toMatchObject({
       agents: [expect.objectContaining({ agentId: "agent-mapper" })],
     });
+    expect(
+      await (
+        await app.request("/api/agents/summary?from=2026-07-12&to=2026-07-12&role=explorer&depth=1")
+      ).json(),
+    ).toMatchObject({ subagent: { totalTokens: 2_500 }, totalAgents: 1 });
+    expect(
+      await (
+        await app.request(
+          "/api/agents/page?from=2026-07-12&to=2026-07-12&page=1&pageSize=1&sort=cache&order=desc",
+        )
+      ).json(),
+    ).toMatchObject({ agents: [expect.any(Object)], pageSize: 1, total: 3 });
+    expect(
+      await (await app.request("/api/projects/summary?from=2026-07-12&to=2026-07-12")).json(),
+    ).toMatchObject({ kpis: { totalTokens: 3_900 }, projectCount: 2 });
+    expect(
+      await (
+        await app.request("/api/projects/page?from=2026-07-12&to=2026-07-12&page=1&pageSize=1")
+      ).json(),
+    ).toMatchObject({ projects: [expect.objectContaining({ id: "project-alpha" })], total: 2 });
+    expect(
+      await (
+        await app.request("/api/projects/project-alpha/analytics?from=2026-07-12&to=2026-07-12")
+      ).json(),
+    ).toMatchObject({ project: { id: "project-alpha", totalTokens: 3_600 } });
+    expect((await app.request("/api/projects/missing/analytics")).status).toBe(404);
+    expect((await app.request("/api/agents/page?page=0")).status).toBe(400);
+    expect((await app.request("/api/agents/page?pageSize=101")).status).toBe(400);
+    expect((await app.request("/api/agents/page?sort=unknown")).status).toBe(400);
+    expect((await app.request("/api/agents/page?order=sideways")).status).toBe(400);
+    expect((await app.request("/api/projects/page?page=0")).status).toBe(400);
+    expect((await app.request("/api/projects/page?pageSize=101")).status).toBe(400);
     expect((await app.request("/api/agents?depth=-1")).status).toBe(400);
     expect((await app.request(`/api/agents?role=${"x".repeat(101)}`)).status).toBe(400);
     expect((await app.request("/api/projects?from=invalid")).status).toBe(400);
@@ -807,6 +1067,70 @@ describe("phase 2 API", () => {
         })
       ).status,
     ).toBe(404);
+  });
+
+  it("invalidates alert analytics only for data-changing mutation groups", async () => {
+    const refresh = vi.fn();
+    const materializer = new AlertMaterializer(harness.database, { refresh });
+    const app = createApp(
+      harness.database,
+      harness.importer,
+      harness.retention,
+      new AppEventBus(),
+      materializer,
+    );
+    await app.request("/api/alerts");
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    await app.request("/api/projects/project-alpha", {
+      body: JSON.stringify({ displayName: "No alert refresh" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    await app.request("/api/alerts");
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    await app.request("/api/rates/model-a", {
+      body: JSON.stringify({ cachedInputRate: 1, inputRate: 2, outputRate: 3 }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    await app.request("/api/alerts");
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    await app.request("/api/budgets", {
+      body: JSON.stringify({
+        enabled: true,
+        limitUsd: 10,
+        period: "daily",
+        warningThresholds: [50, 100],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    await app.request("/api/alerts");
+    expect(refresh).toHaveBeenCalledTimes(2);
+
+    harness.database
+      .insert(alertEvents)
+      .values({
+        createdAt: Date.now(),
+        id: "seen-without-refresh",
+        message: "Stable feed",
+        periodStart: "2026-07-12",
+        scopeKey: "stable",
+        severity: "info",
+        title: "Stable",
+        type: "anomaly",
+      })
+      .run();
+    await app.request("/api/alerts/seen-without-refresh", {
+      body: JSON.stringify({ action: "seen" }),
+      headers: { "content-type": "application/json" },
+      method: "PATCH",
+    });
+    await app.request("/api/alerts");
+    expect(refresh).toHaveBeenCalledTimes(2);
   });
 
   it("validates pricing simulation and export responses without mutation", async () => {
@@ -1118,4 +1442,19 @@ function turnUsage(
 
 function fixedNow() {
   return new Date("2026-07-12T12:00:00.000Z");
+}
+
+function agentMetric(agent: AgentUsageSummary, metric: AgentLeaderboardMetric): number {
+  switch (metric) {
+    case "cache":
+      return agent.inputTokens > 0 ? agent.cachedInputTokens / agent.inputTokens : 0;
+    case "cost":
+      return agent.estimatedCostUsd;
+    case "output":
+      return agent.outputTokens;
+    case "requests":
+      return agent.requestCount;
+    case "tokens":
+      return agent.totalTokens;
+  }
 }

@@ -1,90 +1,81 @@
-import type {
-  DashboardFilters,
-  DashboardResponse,
-  ImportStatus,
-  ModelRate,
-  SessionFilters,
-  SessionsResponse,
-  StorageStatus,
-} from "@/shared/types";
+import type { DashboardFilters, ModelRate, SessionFilters } from "@/shared/types";
+import { apiClient, rpcJson, rpcOptions, toDashboardQuery } from "@/web/lib/rpc-client";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    headers: { "content-type": "application/json", ...init?.headers },
-    ...init,
-  });
-  if (!response.ok) {
-    const body: unknown = await response.json().catch(() => null);
-    const message = isErrorPayload(body) ? body.error : `Request failed (${response.status})`;
-    throw new Error(typeof message === "string" ? message : "Request failed");
-  }
-  return response.json() as Promise<T>;
+export function fetchDashboard(filters: DashboardFilters, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.dashboard.$get({ query: toDashboardQuery(filters) }, rpcOptions(signal)),
+  );
 }
 
-function query(filters: DashboardFilters) {
-  const values = new URLSearchParams({ from: filters.from, to: filters.to });
-  const models = filters.models?.length ? filters.models : filters.model ? [filters.model] : [];
-  if (models.length > 0) values.set("models", models.join(","));
-  if (filters.projectId) values.set("project", filters.projectId);
-  if (filters.agentKind && filters.agentKind !== "all") values.set("agentKind", filters.agentKind);
-  return values.toString();
+export function fetchSessionSummaries(filters: SessionFilters, signal?: AbortSignal) {
+  const query = {
+    ...toDashboardQuery(filters),
+    ...(filters.query ? { q: filters.query } : {}),
+    ...(filters.hasSubagents === undefined
+      ? {}
+      : { hasSubagents: filters.hasSubagents ? ("true" as const) : ("false" as const) }),
+    ...(filters.order ? { order: filters.order } : {}),
+    ...(filters.page ? { page: String(filters.page) } : {}),
+    ...(filters.pageSize ? { pageSize: String(filters.pageSize) } : {}),
+    ...(filters.sort ? { sort: filters.sort } : {}),
+  };
+  return rpcJson(apiClient.api.sessions.summary.$get({ query }, rpcOptions(signal)));
 }
 
-export function fetchDashboard(filters: DashboardFilters) {
-  return request<DashboardResponse>(`/api/dashboard?${query(filters)}`);
+export function fetchSessionDetail(
+  sessionId: string,
+  filters: DashboardFilters,
+  signal?: AbortSignal,
+) {
+  return rpcJson(
+    apiClient.api.sessions[":sessionId"].$get(
+      {
+        param: { sessionId: encodeURIComponent(sessionId) },
+        query: toDashboardQuery(filters),
+      },
+      rpcOptions(signal),
+    ),
+  );
 }
 
-export function fetchSessions(filters: SessionFilters) {
-  const values = new URLSearchParams(query(filters));
-  if (filters.query) values.set("q", filters.query);
-  if (filters.hasSubagents !== undefined) values.set("hasSubagents", String(filters.hasSubagents));
-  if (filters.order) values.set("order", filters.order);
-  if (filters.page) values.set("page", String(filters.page));
-  if (filters.pageSize) values.set("pageSize", String(filters.pageSize));
-  if (filters.sort) values.set("sort", filters.sort);
-  return request<SessionsResponse>(`/api/sessions?${values.toString()}`);
-}
-
-export function fetchStorageStatus() {
-  return request<StorageStatus>("/api/storage/status");
+export function fetchStorageStatus(signal?: AbortSignal) {
+  return rpcJson(apiClient.api.storage.status.$get(undefined, rpcOptions(signal)));
 }
 
 export function compactStorage() {
-  return request<StorageStatus>("/api/storage/compact", { method: "POST" });
+  return rpcJson(apiClient.api.storage.compact.$post());
 }
 
-export function fetchModels() {
-  return request<{ models: string[] }>("/api/models");
+export function fetchModels(signal?: AbortSignal) {
+  return rpcJson(apiClient.api.models.$get(undefined, rpcOptions(signal)));
 }
 
-export function fetchRates() {
-  return request<{ rates: ModelRate[] }>("/api/rates");
+export function fetchRates(signal?: AbortSignal) {
+  return rpcJson(apiClient.api.rates.$get(undefined, rpcOptions(signal)));
 }
 
-export function fetchStatus() {
-  return request<ImportStatus>("/api/status");
+export function fetchStatus(signal?: AbortSignal) {
+  return rpcJson(apiClient.api.status.$get(undefined, rpcOptions(signal)));
 }
 
 export function syncSessions() {
-  return request<ImportStatus>("/api/sync", { method: "POST" });
+  return rpcJson(apiClient.api.sync.$post());
 }
 
 export function saveRate(rate: Omit<ModelRate, "updatedAt">) {
-  return request<{ backfilled: number; rate: ModelRate }>(
-    `/api/rates/${encodeURIComponent(rate.model)}`,
-    {
-      body: JSON.stringify(rate),
-      method: "PUT",
-    },
+  const { model, ...json } = rate;
+  return rpcJson(
+    apiClient.api.rates[":model"].$put({
+      json,
+      param: { model: encodeURIComponent(model) },
+    }),
   );
 }
 
 export function backfillRate(model: string) {
-  return request<{ updated: number }>(`/api/rates/${encodeURIComponent(model)}/backfill`, {
-    method: "POST",
-  });
-}
-
-function isErrorPayload(value: unknown): value is { error: unknown } {
-  return typeof value === "object" && value !== null && "error" in value;
+  return rpcJson(
+    apiClient.api.rates[":model"].backfill.$post({
+      param: { model: encodeURIComponent(model) },
+    }),
+  );
 }

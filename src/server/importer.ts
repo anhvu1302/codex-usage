@@ -34,6 +34,7 @@ import {
 import { TURN_ATTRIBUTION_VERSION, TURN_BACKFILL_STATE_ID } from "@/server/turn-constants";
 import type {
   ActivityKind,
+  AppRevisionScope,
   ImportStatus,
   SourceScanMode,
   SourceScanStatus,
@@ -72,8 +73,26 @@ type RateSnapshot = {
 };
 
 type CanonicalBoundary = {
+  fork?: {
+    forkedFromId: string;
+    sessionId: string;
+  };
+  owner?: SessionSourceHeader;
   resolved: boolean;
   startLine: number;
+};
+
+type SessionSourceHeader = {
+  agentId: string;
+  forkedFromId: string | null;
+  isSubagent: boolean;
+  sessionId: string;
+};
+
+type RolloutCopyLine = {
+  fingerprint: string | null;
+  lineIndex: number;
+  recordType: string | null;
 };
 
 type ParsedJsonLine = {
@@ -99,7 +118,26 @@ type JsonStructureState = {
 
 type ImportFileResult = {
   bytesRead: number;
+  diagnostic: typeof importDiagnostics.$inferSelect;
   inserted: number;
+  savedState: typeof importStates.$inferSelect;
+};
+
+type ImporterChanges = {
+  alertsRelevant: boolean;
+  scopes: Set<AppRevisionScope>;
+};
+
+type UsageRepairPreparation = {
+  forceAll: boolean;
+  required: boolean;
+};
+
+type UsageEventRow = typeof usageEvents.$inferSelect;
+
+type ImportFileCache = {
+  diagnostic: typeof importDiagnostics.$inferSelect | undefined;
+  savedState: typeof importStates.$inferSelect | undefined;
 };
 
 type IndexedTitle = {
@@ -110,6 +148,8 @@ type IndexedTitle = {
 export type SessionImporterOptions = {
   inventory?: SourceInventory;
   now?: () => Date;
+  onDataChanged?: () => void;
+  onRevision?: (scopes: readonly AppRevisionScope[]) => void;
   scanIntervalMs?: number;
 };
 
@@ -119,8 +159,19 @@ const DATE_PARTS = new Intl.DateTimeFormat("en-CA", {
   timeZone: TIME_ZONE,
   year: "numeric",
 });
-const USAGE_DEDUPE_VERSION = 5;
+const PREVIOUS_USAGE_DEDUPE_VERSION = 6;
+const USAGE_DEDUPE_VERSION = 7;
+const SOURCE_HEADER_CONCURRENCY = 32;
 const DEFAULT_SCAN_INTERVAL_MS = 15 * 60 * 1_000;
+
+const USAGE_REVISION_SCOPES = [
+  "agents",
+  "catalog",
+  "dashboard",
+  "projects",
+  "sessions",
+  "turns",
+] as const satisfies readonly AppRevisionScope[];
 
 const EMPTY_TURN_BACKFILL: TurnBackfillStatus = {
   attributionVersion: TURN_ATTRIBUTION_VERSION,
@@ -132,6 +183,27 @@ const EMPTY_TURN_BACKFILL: TurnBackfillStatus = {
   sourceDeletedGaps: 0,
   totalFiles: 0,
 };
+
+function createImporterChanges(): ImporterChanges {
+  return { alertsRelevant: false, scopes: new Set<AppRevisionScope>() };
+}
+
+function markUsageChanged(changes: ImporterChanges) {
+  for (const scope of USAGE_REVISION_SCOPES) changes.scopes.add(scope);
+  changes.alertsRelevant = true;
+}
+
+function markSessionChanged(changes: ImporterChanges) {
+  changes.scopes.add("agents");
+  changes.scopes.add("projects");
+  changes.scopes.add("sessions");
+}
+
+function markTurnChanged(changes: ImporterChanges, alertsRelevant = false) {
+  changes.scopes.add("data-health");
+  changes.scopes.add("turns");
+  if (alertsRelevant) changes.alertsRelevant = true;
+}
 
 export function normalizeTokenUsage(value: unknown): TokenUsage | null {
   if (!isRecord(value)) return null;
@@ -179,11 +251,14 @@ export function calculateCost(usage: TokenUsage, rate: RateSnapshot): number {
 
 export class SessionImporter {
   private readonly activityResetAgents = new Set<string>();
+  private readonly derivedResetAgents = new Set<string>();
   private readonly legacyArchivedUsageClaims = new Set<string>();
   private readonly rateCache = new Map<string, RateSnapshot | null>();
   private readonly fileTimers = new Map<string, NodeJS.Timeout>();
   private readonly inventory: SourceInventory;
   private readonly now: () => Date;
+  private readonly onDataChanged: () => void;
+  private readonly onRevision: (scopes: readonly AppRevisionScope[]) => void;
   private readonly scanIntervalMs: number;
   private readonly sessionIndexPath: string;
   private deepSyncPromise: Promise<ImportStatus> | null = null;
@@ -214,6 +289,8 @@ export class SessionImporter {
     options: SessionImporterOptions = {},
   ) {
     this.now = options.now ?? (() => new Date());
+    this.onDataChanged = options.onDataChanged ?? (() => undefined);
+    this.onRevision = options.onRevision ?? (() => undefined);
     this.inventory = options.inventory ?? new SourceInventory(sessionsDirectory, this.now);
     this.scanIntervalMs = options.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
     this.sessionIndexPath = join(dirname(sessionsDirectory), "session_index.jsonl");
@@ -264,7 +341,12 @@ export class SessionImporter {
         return;
       }
       this.clearFileTimer(filePath);
-      void this.enqueue(() => Promise.resolve(this.markSourceDeleted(filePath)));
+      void this.enqueue(() => {
+        const changes = createImporterChanges();
+        this.markSourceDeleted(filePath, changes);
+        this.publishChanges(changes);
+        return Promise.resolve();
+      });
     });
 
     void this.requestInventory("startup");
@@ -323,16 +405,17 @@ export class SessionImporter {
 
     return this.enqueue(async () => {
       this.beginSync();
+      const changes = createImporterChanges();
       try {
         const metadata = await readSourceFileMetadata(filePath);
         if (!metadata) {
-          this.markSourceDeleted(filePath);
+          this.markSourceDeleted(filePath, changes);
           throw new Error(`ENOENT: no such source file, stat '${filePath}'`);
         }
-        const { bytesRead, inserted } = await this.importFile(metadata);
+        const { bytesRead, inserted } = await this.importFile(metadata, false, undefined, changes);
         this.status.filesProcessed += 1;
         this.status.recordsInserted += inserted;
-        if (bytesRead > 0) this.reconcileUsage();
+        if (bytesRead > 0) this.reconcileUsage(changes);
         this.status.lastSyncAt = this.now().toISOString();
         return inserted;
       } catch (error) {
@@ -340,6 +423,7 @@ export class SessionImporter {
         return 0;
       } finally {
         this.status.isSyncing = false;
+        this.publishChanges(changes);
       }
     });
   }
@@ -385,6 +469,7 @@ export class SessionImporter {
       startedAt: startedAt.toISOString(),
       trigger,
     };
+    const changes = createImporterChanges();
 
     try {
       const snapshot = await this.inventory.refresh();
@@ -396,9 +481,23 @@ export class SessionImporter {
       currentScan.phase = "reading";
       this.status.filesProcessed = files.length;
 
-      const usageRepairRequired = this.prepareUsageHistoryForDeduplication(files);
-      const turnBackfill = this.prepareTurnAttribution(files);
-      const repairRequired = usageRepairRequired || turnBackfill.required;
+      const states = new Map(
+        this.database
+          .select()
+          .from(importStates)
+          .all()
+          .map((state) => [state.sourcePath, state]),
+      );
+      const diagnostics = new Map(
+        this.database
+          .select()
+          .from(importDiagnostics)
+          .all()
+          .map((diagnostic) => [diagnostic.sourcePath, diagnostic]),
+      );
+      const usageRepair = await this.prepareUsageHistoryForDeduplication(files, states);
+      const turnBackfill = this.prepareTurnAttribution(files, states);
+      const repairRequired = usageRepair.required || turnBackfill.required;
       if (
         turnBackfill.required ||
         this.status.turnBackfill.isRunning ||
@@ -410,20 +509,34 @@ export class SessionImporter {
       }
 
       for (const metadata of snapshot.files) {
-        if (mode === "inventory" && !repairRequired && this.canSkipFile(metadata)) {
+        if (
+          mode === "inventory" &&
+          !usageRepair.forceAll &&
+          this.canSkipFile(metadata, states.get(metadata.path), diagnostics.get(metadata.path))
+        ) {
           currentScan.filesSkipped += 1;
           continue;
         }
-        const result = await this.importFile(metadata, mode === "deep");
+        const result = await this.importFile(
+          metadata,
+          mode === "deep",
+          {
+            diagnostic: diagnostics.get(metadata.path),
+            savedState: states.get(metadata.path),
+          },
+          changes,
+        );
+        states.set(metadata.path, result.savedState);
+        diagnostics.set(metadata.path, result.diagnostic);
         currentScan.filesRead += 1;
         this.status.recordsInserted += result.inserted;
         if (this.status.turnBackfill.isRunning) this.advanceTurnBackfill();
       }
 
       currentScan.phase = "reconciling";
-      await this.refreshSessionTitles(mode === "deep");
-      if (currentScan.filesRead > 0 || repairRequired) this.reconcileUsage();
-      this.refreshDeletedSources(availablePaths);
+      await this.refreshSessionTitles(mode === "deep", changes);
+      if (currentScan.filesRead > 0 || repairRequired) this.reconcileUsage(changes);
+      this.refreshDeletedSources(availablePaths, changes);
       if (this.status.turnBackfill.isRunning) this.finishTurnBackfill(null);
       const completedAt = this.now();
       this.status.lastSyncAt = completedAt.toISOString();
@@ -437,6 +550,8 @@ export class SessionImporter {
         sourceBytes: snapshot.sourceBytes,
         trigger,
       };
+      changes.scopes.add("storage");
+      changes.scopes.add("data-health");
     } catch (error) {
       this.status.error = errorMessage(error);
       if (this.status.turnBackfill.isRunning) this.finishTurnBackfill(this.status.error);
@@ -445,11 +560,14 @@ export class SessionImporter {
       this.status.isSyncing = false;
     }
 
+    this.publishChanges(changes);
+
     return this.getStatus();
   }
 
   private beginSync() {
     this.activityResetAgents.clear();
+    this.derivedResetAgents.clear();
     this.legacyArchivedUsageClaims.clear();
     this.status = {
       error: null,
@@ -491,13 +609,15 @@ export class SessionImporter {
       if (this.stopping) return;
       void this.enqueue(async () => {
         this.beginSync();
+        const changes = createImporterChanges();
         try {
-          await this.refreshSessionTitles(false);
+          await this.refreshSessionTitles(false, changes);
           this.status.lastSyncAt = this.now().toISOString();
         } catch (error) {
           this.status.error = errorMessage(error);
         } finally {
           this.status.isSyncing = false;
+          this.publishChanges(changes);
         }
       });
     }, 350);
@@ -507,6 +627,24 @@ export class SessionImporter {
     const timer = this.fileTimers.get(filePath);
     if (timer) clearTimeout(timer);
     this.fileTimers.delete(filePath);
+  }
+
+  private publishChanges(changes: ImporterChanges) {
+    if (changes.alertsRelevant) this.publishDataChanged();
+    if (changes.scopes.size === 0) return;
+    try {
+      this.onRevision([...changes.scopes].sort());
+    } catch (error) {
+      console.warn("Could not publish importer revision", error);
+    }
+  }
+
+  private publishDataChanged() {
+    try {
+      this.onDataChanged();
+    } catch (error) {
+      console.warn("Could not publish importer data change", error);
+    }
   }
 
   private clearSessionIndexTimer() {
@@ -533,41 +671,98 @@ export class SessionImporter {
     this.periodicTimer.unref();
   }
 
-  private prepareUsageHistoryForDeduplication(files: string[]): boolean {
-    const states = this.database.select().from(importStates).all();
+  private async prepareUsageHistoryForDeduplication(
+    files: string[],
+    statesByPath: Map<string, typeof importStates.$inferSelect>,
+  ): Promise<UsageRepairPreparation> {
+    const states = [...statesByPath.values()];
     if (
       states.length === 0 ||
       states.every((state) => state.dedupeVersion === USAGE_DEDUPE_VERSION)
     ) {
-      return false;
+      return { forceAll: false, required: false };
     }
 
     const availablePaths = new Set(files);
-    const availableStates = states.filter((state) => availablePaths.has(state.sourcePath));
-    const unavailableStates = states.filter((state) => !availablePaths.has(state.sourcePath));
+    const hasLegacyVersion = states.some(
+      (state) =>
+        state.dedupeVersion !== PREVIOUS_USAGE_DEDUPE_VERSION &&
+        state.dedupeVersion !== USAGE_DEDUPE_VERSION,
+    );
+    const outdatedStates = hasLegacyVersion
+      ? states
+      : states.filter((state) => state.dedupeVersion !== USAGE_DEDUPE_VERSION);
+    const availableStates = outdatedStates.filter((state) => availablePaths.has(state.sourcePath));
+    const unavailableStates = outdatedStates.filter(
+      (state) => !availablePaths.has(state.sourcePath),
+    );
+    const previousVersionStates = availableStates.filter(
+      (state) => state.dedupeVersion === PREVIOUS_USAGE_DEDUPE_VERSION,
+    );
+    const previousVersionHeaders = await mapWithConcurrency(
+      previousVersionStates,
+      SOURCE_HEADER_CONCURRENCY,
+      async (state) => ({
+        header: await readSessionSourceHeader(state.sourcePath),
+        sourcePath: state.sourcePath,
+      }),
+    );
+    const rootForkPaths = new Set(
+      previousVersionHeaders
+        .filter(({ header }) => header?.forkedFromId && !header.isSubagent)
+        .map(({ sourcePath }) => sourcePath),
+    );
     const now = Date.now();
+    let repairRequired = false;
 
     for (const state of availableStates) {
+      const requiresFullRepair =
+        hasLegacyVersion ||
+        state.dedupeVersion === PREVIOUS_USAGE_DEDUPE_VERSION ||
+        rootForkPaths.has(state.sourcePath);
+      if (!requiresFullRepair) {
+        const nextState = { ...state, dedupeVersion: USAGE_DEDUPE_VERSION, updatedAt: now };
+        this.database
+          .update(importStates)
+          .set({ dedupeVersion: USAGE_DEDUPE_VERSION, updatedAt: now })
+          .where(eq(importStates.sourcePath, state.sourcePath))
+          .run();
+        statesByPath.set(state.sourcePath, nextState);
+        continue;
+      }
+      repairRequired = true;
+      const nextState = {
+        ...state,
+        activeModel: null,
+        agentId: null,
+        dedupeVersion: PREVIOUS_USAGE_DEDUPE_VERSION,
+        lastOffset: 0,
+        sessionId: null,
+        updatedAt: now,
+      };
       this.database
         .update(importStates)
         .set({
           activeModel: null,
           agentId: null,
-          dedupeVersion: USAGE_DEDUPE_VERSION - 1,
+          dedupeVersion: PREVIOUS_USAGE_DEDUPE_VERSION,
           lastOffset: 0,
           sessionId: null,
           updatedAt: now,
         })
         .where(eq(importStates.sourcePath, state.sourcePath))
         .run();
+      statesByPath.set(state.sourcePath, nextState);
     }
 
     for (const state of unavailableStates) {
+      const nextState = { ...state, dedupeVersion: USAGE_DEDUPE_VERSION, updatedAt: now };
       this.database
         .update(importStates)
         .set({ dedupeVersion: USAGE_DEDUPE_VERSION, updatedAt: now })
         .where(eq(importStates.sourcePath, state.sourcePath))
         .run();
+      statesByPath.set(state.sourcePath, nextState);
     }
 
     if (unavailableStates.length > 0) {
@@ -575,11 +770,14 @@ export class SessionImporter {
         `Bỏ qua attribution repair cho ${unavailableStates.length} JSONL source đã bị xóa; history hiện có vẫn được giữ.`,
       );
     }
-    return true;
+    return { forceAll: hasLegacyVersion, required: repairRequired };
   }
 
-  private prepareTurnAttribution(files: string[]) {
-    const states = this.database.select().from(importStates).all();
+  private prepareTurnAttribution(
+    files: string[],
+    statesByPath: Map<string, typeof importStates.$inferSelect>,
+  ) {
+    const states = [...statesByPath.values()];
     const outdated = states.filter(
       (state) => state.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION,
     );
@@ -591,6 +789,17 @@ export class SessionImporter {
     const now = Date.now();
 
     for (const state of available) {
+      const nextState = {
+        ...state,
+        activeModel: null,
+        activeTurnKey: null,
+        agentId: null,
+        lastOffset: 0,
+        sessionContextWindow: null,
+        sessionId: null,
+        turnAttributionVersion: TURN_ATTRIBUTION_VERSION - 1,
+        updatedAt: now,
+      };
       this.database
         .update(importStates)
         .set({
@@ -605,6 +814,7 @@ export class SessionImporter {
         })
         .where(eq(importStates.sourcePath, state.sourcePath))
         .run();
+      statesByPath.set(state.sourcePath, nextState);
     }
 
     for (const state of unavailable) {
@@ -630,6 +840,7 @@ export class SessionImporter {
         .set({ activeTurnKey: null, updatedAt: now })
         .where(eq(importStates.sourcePath, state.sourcePath))
         .run();
+      statesByPath.set(state.sourcePath, { ...state, activeTurnKey: null, updatedAt: now });
     }
 
     return {
@@ -719,18 +930,22 @@ export class SessionImporter {
     this.status.turnBackfill = this.readTurnBackfillStatus();
   }
 
-  private reconcileUsage() {
-    this.status.recordsReclassified += reconcileUnknownModels(this.database);
-    this.status.recordsBackfilled += backfillAllUnpricedUsage(this.database);
+  private reconcileUsage(changes: ImporterChanges) {
+    const reclassified = reconcileUnknownModels(this.database);
+    this.status.recordsReclassified += reclassified;
+    if (reclassified > 0) markUsageChanged(changes);
+    backfillAllUnpricedUsage(this.database, (backfilled) => {
+      this.status.recordsBackfilled += backfilled;
+      markUsageChanged(changes);
+    });
   }
 
-  private canSkipFile(metadata: SourceFileMetadata): boolean {
+  private canSkipFile(
+    metadata: SourceFileMetadata,
+    savedState: typeof importStates.$inferSelect | undefined,
+    diagnostic: typeof importDiagnostics.$inferSelect | undefined,
+  ): boolean {
     if (this.status.turnBackfill.isRunning) return false;
-    const savedState = this.database
-      .select()
-      .from(importStates)
-      .where(eq(importStates.sourcePath, metadata.path))
-      .get();
     if (!savedState) return false;
     if (
       savedState.agentId === null ||
@@ -741,24 +956,23 @@ export class SessionImporter {
     ) {
       return false;
     }
-    const diagnostic = this.database
-      .select()
-      .from(importDiagnostics)
-      .where(eq(importDiagnostics.sourcePath, metadata.path))
-      .get();
     return diagnostic?.lastError === null && !diagnostic.incompleteLine;
   }
 
   private async importFile(
     metadata: SourceFileMetadata,
     forceFromStart = false,
+    cache?: ImportFileCache,
+    changes: ImporterChanges = createImporterChanges(),
   ): Promise<ImportFileResult> {
     const filePath = metadata.path;
-    const savedState = this.database
-      .select()
-      .from(importStates)
-      .where(eq(importStates.sourcePath, filePath))
-      .get();
+    const savedState = cache
+      ? cache.savedState
+      : this.database
+          .select()
+          .from(importStates)
+          .where(eq(importStates.sourcePath, filePath))
+          .get();
     const needsAgentAttribution =
       savedState?.agentId === null ||
       savedState?.dedupeVersion !== USAGE_DEDUPE_VERSION ||
@@ -786,7 +1000,17 @@ export class SessionImporter {
         ? savedState.lastOffset
         : 0;
     const canonicalBoundary =
-      startOffset === 0 ? await findCanonicalBoundary(filePath) : { resolved: true, startLine: 0 };
+      startOffset === 0
+        ? await findCanonicalBoundary(
+            filePath,
+            (forkedFromId) =>
+              this.database
+                .select({ sourcePath: sessions.sourcePath })
+                .from(sessions)
+                .where(eq(sessions.id, forkedFromId))
+                .get()?.sourcePath ?? null,
+          )
+        : { resolved: true, startLine: 0 };
     const savedSession =
       startOffset > 0 && savedState?.sessionId
         ? this.database
@@ -807,16 +1031,45 @@ export class SessionImporter {
     let lineIndex = 0;
     let activityResetPending =
       savedState !== undefined && savedState.dedupeVersion !== USAGE_DEDUPE_VERSION;
-    const previousDiagnostic = this.database
-      .select()
-      .from(importDiagnostics)
-      .where(eq(importDiagnostics.sourcePath, filePath))
-      .get();
+    const previousDiagnostic = cache
+      ? cache.diagnostic
+      : this.database
+          .select()
+          .from(importDiagnostics)
+          .where(eq(importDiagnostics.sourcePath, filePath))
+          .get();
     let malformedLines = startOffset === 0 ? 0 : (previousDiagnostic?.malformedLines ?? 0);
-    let readResult: CompleteJsonLinesResult;
+    let repairTransactionOpen = false;
+    let repairAgentId: string | null = null;
+    let repairAgentActivityWasReset = false;
+    let repairChangesSnapshot: ImporterChanges | null = null;
 
     try {
-      readResult = await readCompleteJsonLines(filePath, startOffset, (line) => {
+      if (
+        startOffset === 0 &&
+        savedState !== undefined &&
+        savedState.dedupeVersion !== USAGE_DEDUPE_VERSION &&
+        canonicalBoundary.resolved &&
+        canonicalBoundary.owner &&
+        !this.derivedResetAgents.has(canonicalBoundary.owner.agentId)
+      ) {
+        repairChangesSnapshot = {
+          alertsRelevant: changes.alertsRelevant,
+          scopes: new Set(changes.scopes),
+        };
+        this.database.$client.exec("BEGIN IMMEDIATE");
+        repairTransactionOpen = true;
+        repairAgentId = canonicalBoundary.owner.agentId;
+        repairAgentActivityWasReset = this.activityResetAgents.has(repairAgentId);
+        this.activityResetAgents.add(repairAgentId);
+        this.resetAgentDerivedData(
+          canonicalBoundary.owner.agentId,
+          canonicalBoundary.owner.sessionId,
+          changes,
+        );
+      }
+
+      const readResult = await readCompleteJsonLines(filePath, startOffset, (line) => {
         if (line.malformed) malformedLines += 1;
         inserted += this.handleLine(
           line,
@@ -824,52 +1077,154 @@ export class SessionImporter {
           state,
           lineIndex >= canonicalBoundary.startLine,
           activityResetPending,
+          changes,
         );
         if (state.agentId && activityResetPending) activityResetPending = false;
         lineIndex += 1;
         return Promise.resolve();
       });
+
+      const diagnostic = this.saveImportDiagnostic(
+        filePath,
+        malformedLines,
+        readResult.incompleteLine,
+        null,
+      );
+      if (
+        (previousDiagnostic?.incompleteLine ?? false) !== diagnostic.incompleteLine ||
+        (previousDiagnostic?.lastError ?? null) !== diagnostic.lastError ||
+        (previousDiagnostic?.malformedLines ?? 0) !== diagnostic.malformedLines
+      ) {
+        changes.scopes.add("data-health");
+      }
+
+      const currentMetadata = await readSourceFileMetadata(filePath);
+      const metadataToSave =
+        currentMetadata && sourceMetadataEquals(currentMetadata, metadata)
+          ? currentMetadata
+          : metadata;
+      const nextState = {
+        activeModel: state.activeModel,
+        activeTurnKey: state.activeTurnKey,
+        agentId: state.agentId,
+        dedupeVersion:
+          !canonicalBoundary.resolved && savedState?.dedupeVersion === PREVIOUS_USAGE_DEDUPE_VERSION
+            ? PREVIOUS_USAGE_DEDUPE_VERSION
+            : USAGE_DEDUPE_VERSION,
+        lastOffset: canonicalBoundary.resolved ? readResult.lastCompleteOffset : 0,
+        sessionContextWindow: state.sessionContextWindow,
+        sessionId: state.sessionId,
+        sourceCtimeNs: metadataToSave.ctimeNs,
+        sourceFileId: metadataToSave.fileId,
+        sourceMtimeNs: metadataToSave.mtimeNs,
+        sourceSize: metadataToSave.size,
+        turnAttributionVersion: TURN_ATTRIBUTION_VERSION,
+        updatedAt: Date.now(),
+      };
+
+      this.database
+        .insert(importStates)
+        .values({
+          ...nextState,
+          sourcePath: filePath,
+        })
+        .onConflictDoUpdate({
+          target: importStates.sourcePath,
+          set: nextState,
+        })
+        .run();
+      if (repairTransactionOpen) {
+        this.database.$client.exec("COMMIT");
+        repairTransactionOpen = false;
+        if (repairAgentId) this.derivedResetAgents.add(repairAgentId);
+      }
+
+      return {
+        bytesRead: Math.max(0, metadata.size - startOffset),
+        diagnostic,
+        inserted,
+        savedState: { ...nextState, sourcePath: filePath },
+      };
     } catch (error) {
-      this.saveImportDiagnostic(filePath, malformedLines, false, errorMessage(error));
+      if (repairTransactionOpen) {
+        this.database.$client.exec("ROLLBACK");
+        repairTransactionOpen = false;
+        if (repairAgentId && !repairAgentActivityWasReset) {
+          this.activityResetAgents.delete(repairAgentId);
+        }
+        if (repairChangesSnapshot) {
+          changes.alertsRelevant = repairChangesSnapshot.alertsRelevant;
+          changes.scopes.clear();
+          for (const scope of repairChangesSnapshot.scopes) changes.scopes.add(scope);
+        }
+      }
+      const diagnostic = this.saveImportDiagnostic(
+        filePath,
+        malformedLines,
+        false,
+        errorMessage(error),
+      );
+      if (
+        (previousDiagnostic?.incompleteLine ?? false) !== diagnostic.incompleteLine ||
+        (previousDiagnostic?.lastError ?? null) !== diagnostic.lastError ||
+        (previousDiagnostic?.malformedLines ?? 0) !== diagnostic.malformedLines
+      ) {
+        changes.scopes.add("data-health");
+      }
       throw error;
     }
+  }
 
-    this.saveImportDiagnostic(filePath, malformedLines, readResult.incompleteLine, null);
-
-    const currentMetadata = await readSourceFileMetadata(filePath);
-    const metadataToSave =
-      currentMetadata && sourceMetadataEquals(currentMetadata, metadata)
-        ? currentMetadata
-        : metadata;
-    const nextState = {
-      activeModel: state.activeModel,
-      activeTurnKey: state.activeTurnKey,
-      agentId: state.agentId,
-      dedupeVersion: USAGE_DEDUPE_VERSION,
-      lastOffset: canonicalBoundary.resolved ? readResult.lastCompleteOffset : 0,
-      sessionContextWindow: state.sessionContextWindow,
-      sessionId: state.sessionId,
-      sourceCtimeNs: metadataToSave.ctimeNs,
-      sourceFileId: metadataToSave.fileId,
-      sourceMtimeNs: metadataToSave.mtimeNs,
-      sourceSize: metadataToSave.size,
-      turnAttributionVersion: TURN_ATTRIBUTION_VERSION,
-      updatedAt: Date.now(),
-    };
-
-    this.database
-      .insert(importStates)
-      .values({
-        ...nextState,
-        sourcePath: filePath,
-      })
-      .onConflictDoUpdate({
-        target: importStates.sourcePath,
-        set: nextState,
-      })
+  private resetAgentDerivedData(agentId: string, sessionId: string, changes: ImporterChanges) {
+    const usageDeleted = this.database
+      .delete(usageEvents)
+      .where(eq(usageEvents.agentId, agentId))
       .run();
+    if (usageDeleted.changes > 0) {
+      this.status.recordsReclassified += usageDeleted.changes;
+      markUsageChanged(changes);
+    }
 
-    return { bytesRead: Math.max(0, metadata.size - startOffset), inserted };
+    const activityDeleted = this.database
+      .delete(activityEvents)
+      .where(eq(activityEvents.agentId, agentId))
+      .run();
+    if (activityDeleted.changes > 0) {
+      changes.scopes.add("activity");
+      changes.scopes.add("data-health");
+    }
+
+    this.database.$client
+      .prepare(
+        `update archived_usage_event_ids
+            set turn_key = null, turn_attribution_version = 0
+          where turn_key in (select id from turns where agent_id = ?)`,
+      )
+      .run(agentId);
+    this.database.$client
+      .prepare(
+        `update archived_activity_event_ids
+            set turn_key = null, turn_attribution_version = 0
+          where turn_key in (select id from turns where agent_id = ?)`,
+      )
+      .run(agentId);
+    const turnsDeleted = this.database.delete(turns).where(eq(turns.agentId, agentId)).run();
+    if (turnsDeleted.changes > 0) markTurnChanged(changes, true);
+
+    const titleReset =
+      agentId === sessionId
+        ? this.database
+            .update(sessions)
+            .set({ title: this.sessionIndexTitles.get(sessionId)?.title ?? null })
+            .where(eq(sessions.id, sessionId))
+            .run()
+        : { changes: 0 };
+    const summaryReset = this.database
+      .update(sessionAgents)
+      .set({ taskSummary: null })
+      .where(eq(sessionAgents.id, agentId))
+      .run();
+    if (titleReset.changes > 0 || summaryReset.changes > 0) markSessionChanged(changes);
   }
 
   private handleLine(
@@ -878,6 +1233,7 @@ export class SessionImporter {
     state: MutableImportState,
     isCanonicalLine: boolean,
     resetActivityForAgent: boolean,
+    changes: ImporterChanges,
   ): number {
     const { rawLine, record } = line;
     if (!record) return 0;
@@ -899,7 +1255,14 @@ export class SessionImporter {
       const agentId = asString(payload["id"]) ?? sessionId;
       state.agentId = agentId;
       if (resetActivityForAgent && !this.activityResetAgents.has(agentId)) {
-        this.database.delete(activityEvents).where(eq(activityEvents.agentId, agentId)).run();
+        const reset = this.database
+          .delete(activityEvents)
+          .where(eq(activityEvents.agentId, agentId))
+          .run();
+        if (reset.changes > 0) {
+          changes.scopes.add("activity");
+          changes.scopes.add("data-health");
+        }
         this.activityResetAgents.add(agentId);
       }
       const timestamp = asString(payload["timestamp"]) ?? asString(record["timestamp"]) ?? null;
@@ -914,7 +1277,7 @@ export class SessionImporter {
       const now = Date.now();
       const cwd = asString(payload["cwd"]);
       const existingSession = this.database
-        .select({ cwd: sessions.cwd, projectId: sessions.projectId })
+        .select()
         .from(sessions)
         .where(eq(sessions.id, sessionId))
         .get();
@@ -923,7 +1286,17 @@ export class SessionImporter {
           ? (existingSession.projectId ?? ensureProject(this.database, existingSession.cwd ?? cwd))
           : ensureProject(this.database, cwd);
       state.projectId = projectId;
-      this.database
+      const indexedTitle = this.sessionIndexTitles.get(sessionId)?.title;
+      const sessionChanged =
+        !existingSession ||
+        existingSession.sourceDeleted ||
+        (indexedTitle !== undefined && indexedTitle !== existingSession.title) ||
+        (agentId === sessionId &&
+          (existingSession.cwd !== cwd ||
+            existingSession.projectId !== projectId ||
+            existingSession.sourcePath !== sourcePath ||
+            existingSession.startedAt !== timestamp));
+      const sessionWrite = this.database
         .insert(sessions)
         .values({
           cwd,
@@ -933,26 +1306,45 @@ export class SessionImporter {
           sourceDeleted: false,
           sourcePath,
           startedAt: timestamp,
-          title: null,
+          title: indexedTitle ?? null,
         })
         .onConflictDoUpdate({
           target: sessions.id,
           set: {
             lastSeenAt: now,
             sourceDeleted: false,
+            ...(indexedTitle ? { title: indexedTitle } : {}),
             ...(agentId === sessionId ? { cwd, projectId, sourcePath, startedAt: timestamp } : {}),
           },
         })
         .run();
-      this.database
+      if (sessionChanged && sessionWrite.changes > 0) markSessionChanged(changes);
+      const agentName = asString(payload["agent_nickname"]);
+      const agentRole = asString(payload["agent_role"]);
+      const existingAgent = this.database
+        .select()
+        .from(sessionAgents)
+        .where(eq(sessionAgents.id, agentId))
+        .get();
+      const agentChanged = existingAgent
+        ? existingAgent.depth !== depth ||
+          existingAgent.name !== agentName ||
+          existingAgent.parentThreadId !== parentThreadId ||
+          existingAgent.role !== agentRole ||
+          existingAgent.sessionId !== sessionId ||
+          existingAgent.sourceDeleted ||
+          existingAgent.sourcePath !== sourcePath ||
+          existingAgent.threadSource !== threadSource
+        : true;
+      const agentWrite = this.database
         .insert(sessionAgents)
         .values({
           depth,
           id: agentId,
           lastSeenAt: now,
-          name: asString(payload["agent_nickname"]),
+          name: agentName,
           parentThreadId,
-          role: asString(payload["agent_role"]),
+          role: agentRole,
           sessionId,
           sourceDeleted: false,
           sourcePath,
@@ -964,9 +1356,9 @@ export class SessionImporter {
           set: {
             depth,
             lastSeenAt: now,
-            name: asString(payload["agent_nickname"]),
+            name: agentName,
             parentThreadId,
-            role: asString(payload["agent_role"]),
+            role: agentRole,
             sessionId,
             sourceDeleted: false,
             sourcePath,
@@ -974,14 +1366,15 @@ export class SessionImporter {
           },
         })
         .run();
+      if (agentChanged && agentWrite.changes > 0) markSessionChanged(changes);
       return 0;
     }
 
     if (!isCanonicalLine) return 0;
 
-    const lifecycle = this.captureTurnLifecycle(record, payload, state);
+    const lifecycle = this.captureTurnLifecycle(record, payload, state, changes);
     const attributionTurnKey = this.resolveRecordTurnKey(record, payload, state, lifecycle.turnKey);
-    this.insertActivity(record, state, attributionTurnKey);
+    this.insertActivity(record, state, attributionTurnKey, changes);
     if (lifecycle.terminal && lifecycle.turnKey === state.activeTurnKey) {
       state.activeTurnKey = null;
     }
@@ -992,7 +1385,9 @@ export class SessionImporter {
     }
 
     if (record["type"] === "event_msg" && payload["type"] === "user_message") {
-      this.captureTaskSummary(state, asString(payload["message"]));
+      if (this.captureTaskSummary(state, asString(payload["message"]))) {
+        markSessionChanged(changes);
+      }
       return 0;
     }
 
@@ -1008,9 +1403,19 @@ export class SessionImporter {
     const cumulativeUsage = normalizeTokenUsage(info?.["total_token_usage"]);
     const model = state.activeModel ?? "unknown";
     const agentId = state.agentId ?? state.sessionId;
-    const sourceHash = createUsageFingerprint(rawLine, usage, cumulativeUsage, agentId, model);
+    const sourceHash = createUsageFingerprint(rawLine, cumulativeUsage, agentId);
     const eventId = createHash("sha256")
       .update(`${state.sessionId}\u0000${sourceHash}`)
+      .digest("hex");
+    const previousSourceHash = createPreviousUsageFingerprint(
+      rawLine,
+      usage,
+      cumulativeUsage,
+      agentId,
+      model,
+    );
+    const previousEventId = createHash("sha256")
+      .update(`${state.sessionId}\u0000${previousSourceHash}`)
       .digest("hex");
     const legacySourceHash = createLegacyUsageFingerprint(rawLine, usage, cumulativeUsage);
     const legacyEventId = createHash("sha256")
@@ -1022,28 +1427,44 @@ export class SessionImporter {
       .where(eq(archivedUsageEventIds.id, eventId))
       .get();
     if (archived) {
-      this.attributeArchivedUsage(archived, attributionTurnKey, usage, model, timestamp);
+      if (this.attributeArchivedUsage(archived, attributionTurnKey, usage, model, timestamp)) {
+        markTurnChanged(changes, true);
+      }
       return 0;
     }
-    const currentEvent = this.database
-      .select()
-      .from(usageEvents)
-      .where(eq(usageEvents.id, eventId))
-      .get();
-    const legacyArchived = this.database
-      .select()
-      .from(archivedUsageEventIds)
-      .where(eq(archivedUsageEventIds.id, legacyEventId))
-      .get();
-    if (legacyArchived && !currentEvent && !this.legacyArchivedUsageClaims.has(legacyEventId)) {
-      this.legacyArchivedUsageClaims.add(legacyEventId);
+
+    const candidateEventIds = [...new Set([eventId, previousEventId, legacyEventId])];
+    const existingEvents = candidateEventIds.flatMap((candidateId) => {
+      const event = this.database
+        .select()
+        .from(usageEvents)
+        .where(eq(usageEvents.id, candidateId))
+        .get();
+      return event ? [event] : [];
+    });
+    const archivedCandidate =
+      existingEvents.length === 0
+        ? candidateEventIds
+            .filter((candidateId) => candidateId !== eventId)
+            .flatMap((candidateId) => {
+              const archivedEvent = this.database
+                .select()
+                .from(archivedUsageEventIds)
+                .where(eq(archivedUsageEventIds.id, candidateId))
+                .get();
+              return archivedEvent ? [archivedEvent] : [];
+            })
+            .find((candidate) => !this.legacyArchivedUsageClaims.has(candidate.id))
+        : undefined;
+    if (archivedCandidate) {
+      this.legacyArchivedUsageClaims.add(archivedCandidate.id);
       this.database
         .insert(archivedUsageEventIds)
         .values({
-          archivedAt: legacyArchived.archivedAt,
+          archivedAt: archivedCandidate.archivedAt,
           id: eventId,
-          turnAttributionVersion: legacyArchived.turnAttributionVersion,
-          turnKey: legacyArchived.turnKey,
+          turnAttributionVersion: archivedCandidate.turnAttributionVersion,
+          turnKey: archivedCandidate.turnKey,
         })
         .onConflictDoNothing()
         .run();
@@ -1053,7 +1474,11 @@ export class SessionImporter {
         .where(eq(archivedUsageEventIds.id, eventId))
         .get();
       if (migratedArchive) {
-        this.attributeArchivedUsage(migratedArchive, attributionTurnKey, usage, model, timestamp);
+        if (
+          this.attributeArchivedUsage(migratedArchive, attributionTurnKey, usage, model, timestamp)
+        ) {
+          markTurnChanged(changes, true);
+        }
       }
       return 0;
     }
@@ -1074,121 +1499,22 @@ export class SessionImporter {
       timestamp,
       totalTokens: usage.totalTokens,
     };
-    if (currentEvent) {
-      const needsRepair =
-        currentEvent.agentId !== agentId ||
-        currentEvent.cachedInputTokens !== usage.cachedInputTokens ||
-        currentEvent.inputTokens !== usage.inputTokens ||
-        currentEvent.localDate !== localDate ||
-        currentEvent.model !== model ||
-        currentEvent.outputTokens !== usage.outputTokens ||
-        currentEvent.reasoningOutputTokens !== usage.reasoningOutputTokens ||
-        currentEvent.sourceHash !== sourceHash ||
-        timestamp < currentEvent.timestamp ||
-        currentEvent.totalTokens !== usage.totalTokens;
-      if (needsRepair) {
-        const repaired = this.database.$client.transaction(() => {
-          const isAttributed =
-            currentEvent.turnKey !== null &&
-            currentEvent.turnAttributionVersion === TURN_ATTRIBUTION_VERSION;
-          if (isAttributed && currentEvent.turnKey) {
-            this.applyTurnUsage(
-              currentEvent.turnKey,
-              turnUsageInputFromEvent(currentEvent),
-              false,
-              -1,
-            );
-          }
-          const result = this.database
-            .update(usageEvents)
-            .set({
-              agentId,
-              cachedInputTokens: usage.cachedInputTokens,
-              inputTokens: usage.inputTokens,
-              localDate,
-              model,
-              outputTokens: usage.outputTokens,
-              reasoningOutputTokens: usage.reasoningOutputTokens,
-              sourceHash,
-              ...(timestamp < currentEvent.timestamp ? { timestamp } : {}),
-              totalTokens: usage.totalTokens,
-            })
-            .where(eq(usageEvents.id, eventId))
-            .run();
-          const updated = this.database
-            .select()
-            .from(usageEvents)
-            .where(eq(usageEvents.id, eventId))
-            .get();
-          if (isAttributed && currentEvent.turnKey && updated) {
-            const input = turnUsageInputFromEvent(updated);
-            this.applyTurnUsage(currentEvent.turnKey, input, false, 1);
-            this.updateTurnContext(currentEvent.turnKey, input);
-          }
-          return result;
-        })();
-        this.status.recordsReclassified += repaired.changes;
-      }
-      this.attributeRawUsage(eventId, attributionTurnKey);
-      return 0;
-    }
-    const legacyEvent = this.database
-      .select()
-      .from(usageEvents)
-      .where(eq(usageEvents.id, legacyEventId))
-      .get();
-    if (legacyEvent) {
-      const migrated = this.database.$client.transaction(() => {
-        const isAttributed =
-          legacyEvent.turnKey !== null &&
-          legacyEvent.turnAttributionVersion === TURN_ATTRIBUTION_VERSION;
-        if (isAttributed && legacyEvent.turnKey) {
-          this.applyTurnUsage(legacyEvent.turnKey, turnUsageInputFromEvent(legacyEvent), false, -1);
-        }
-        const result = this.database
-          .update(usageEvents)
-          .set({
-            agentId,
-            cachedInputTokens: usage.cachedInputTokens,
-            id: eventId,
-            inputTokens: usage.inputTokens,
-            localDate,
-            model,
-            outputTokens: usage.outputTokens,
-            reasoningOutputTokens: usage.reasoningOutputTokens,
-            sourceHash,
-            timestamp,
-            totalTokens: usage.totalTokens,
-          })
-          .where(eq(usageEvents.id, legacyEventId))
-          .run();
-        const updated = this.database
-          .select()
-          .from(usageEvents)
-          .where(eq(usageEvents.id, eventId))
-          .get();
-        if (isAttributed && legacyEvent.turnKey && updated) {
-          const input = turnUsageInputFromEvent(updated);
-          this.applyTurnUsage(legacyEvent.turnKey, input, false, 1);
-          this.updateTurnContext(legacyEvent.turnKey, input);
-        }
-        return result;
-      })();
-      this.status.recordsReclassified += migrated.changes;
-      this.attributeRawUsage(eventId, attributionTurnKey);
+    const incomingEvent: UsageEventRow = {
+      ...usageEventValues,
+      createdAt: Date.now(),
+      id: eventId,
+      sessionId: state.sessionId,
+      sourceHash,
+      turnAttributionVersion: 0,
+      turnKey: null,
+    };
+    if (existingEvents.length > 0) {
+      this.consolidateUsageReplay(existingEvents, incomingEvent, attributionTurnKey, changes);
       return 0;
     }
     const result = this.database
       .insert(usageEvents)
-      .values({
-        createdAt: Date.now(),
-        id: eventId,
-        sessionId: state.sessionId,
-        sourceHash,
-        turnAttributionVersion: 0,
-        turnKey: null,
-        ...usageEventValues,
-      })
+      .values(incomingEvent)
       .onConflictDoNothing()
       .run();
 
@@ -1202,24 +1528,109 @@ export class SessionImporter {
         .get();
       if (!existing) return 0;
       if (timestamp < existing.timestamp) {
-        this.database
-          .update(usageEvents)
-          .set({ localDate, timestamp })
-          .where(eq(usageEvents.id, existing.id))
-          .run();
+        this.consolidateUsageReplay([existing], incomingEvent, attributionTurnKey, changes);
+      } else if (
+        timestamp === existing.timestamp &&
+        (existing.turnKey === null ||
+          existing.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION) &&
+        sameUsageObservation(existing, incomingEvent) &&
+        this.attributeRawUsage(existing.id, attributionTurnKey)
+      ) {
+        markTurnChanged(changes, true);
       }
-      this.attributeRawUsage(existing.id, attributionTurnKey);
     }
 
-    if (result.changes > 0) this.attributeRawUsage(eventId, attributionTurnKey);
+    if (result.changes > 0) {
+      markUsageChanged(changes);
+      if (this.attributeRawUsage(eventId, attributionTurnKey)) markTurnChanged(changes, true);
+    }
 
     return result.changes;
+  }
+
+  private consolidateUsageReplay(
+    existingEvents: readonly UsageEventRow[],
+    incomingEvent: UsageEventRow,
+    attributionTurnKey: string | null,
+    changes: ImporterChanges,
+  ) {
+    const uniqueEvents = [...new Map(existingEvents.map((event) => [event.id, event])).values()];
+    const canonicalExisting = uniqueEvents.reduce((earliest, event) =>
+      compareUsageEventOrder(event, earliest) < 0 ? event : earliest,
+    );
+    const incomingIsCanonical = incomingEvent.timestamp < canonicalExisting.timestamp;
+    const canonical = incomingIsCanonical ? incomingEvent : canonicalExisting;
+    const base = uniqueEvents.find((event) => event.id === incomingEvent.id) ?? canonicalExisting;
+    const desired: UsageEventRow = {
+      ...canonical,
+      agentId: incomingEvent.agentId,
+      id: incomingEvent.id,
+      localDate: toLocalDate(canonical.timestamp) ?? canonical.localDate,
+      sessionId: incomingEvent.sessionId,
+      sourceHash: incomingEvent.sourceHash,
+      ...(incomingIsCanonical ? { turnAttributionVersion: 0, turnKey: null } : {}),
+    };
+    const staleEvents = uniqueEvents.filter((event) => event.id !== base.id);
+    const mutationRequired = staleEvents.length > 0 || !sameUsageEventForRepair(base, desired);
+
+    if (mutationRequired) {
+      const reclassified = this.database.$client.transaction(() => {
+        for (const event of uniqueEvents) {
+          if (event.turnKey !== null && event.turnAttributionVersion === TURN_ATTRIBUTION_VERSION) {
+            this.applyTurnUsage(event.turnKey, turnUsageInputFromEvent(event), false, -1);
+          }
+        }
+
+        let mutationCount = 0;
+        for (const event of staleEvents) {
+          mutationCount += this.database
+            .delete(usageEvents)
+            .where(eq(usageEvents.id, event.id))
+            .run().changes;
+        }
+        mutationCount += this.database
+          .update(usageEvents)
+          .set(desired)
+          .where(eq(usageEvents.id, base.id))
+          .run().changes;
+
+        const updated = this.database
+          .select()
+          .from(usageEvents)
+          .where(eq(usageEvents.id, incomingEvent.id))
+          .get();
+        if (updated?.turnKey && updated.turnAttributionVersion === TURN_ATTRIBUTION_VERSION) {
+          const input = turnUsageInputFromEvent(updated);
+          this.applyTurnUsage(updated.turnKey, input, false, 1);
+          this.updateTurnContext(updated.turnKey, input);
+        }
+        return mutationCount;
+      })();
+      this.status.recordsReclassified += reclassified;
+      if (reclassified > 0) markUsageChanged(changes);
+    }
+
+    const consolidated = this.database
+      .select()
+      .from(usageEvents)
+      .where(eq(usageEvents.id, incomingEvent.id))
+      .get();
+    const canAttributeIncoming =
+      consolidated !== undefined &&
+      (incomingIsCanonical ||
+        ((consolidated.turnKey === null ||
+          consolidated.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION) &&
+          sameUsageObservation(consolidated, incomingEvent)));
+    if (canAttributeIncoming && this.attributeRawUsage(incomingEvent.id, attributionTurnKey)) {
+      markTurnChanged(changes, true);
+    }
   }
 
   private captureTurnLifecycle(
     record: JsonRecord,
     payload: JsonRecord,
     state: MutableImportState,
+    changes: ImporterChanges,
   ): TurnLifecycle {
     if (!state.sessionId || !state.agentId) return { terminal: false, turnKey: null };
 
@@ -1257,7 +1668,9 @@ export class SessionImporter {
     const eventAt = startedAt ?? completedAt ?? recordTimestamp;
     if (!eventAt) return { terminal: terminalStatus !== null, turnKey: null };
 
-    this.upsertTurn({
+    const modelContextWindow =
+      toNonNegativeInteger(payload["model_context_window"]) ?? state.sessionContextWindow;
+    const turnMutation = this.upsertTurn({
       agentId: state.agentId,
       collaborationMode: readCollaborationMode(payload),
       completedAt,
@@ -1267,8 +1680,7 @@ export class SessionImporter {
         asString(payload["reasoning_effort"]) ??
         asString(asRecord(payload["reasoning"])?.["effort"]),
       eventAt,
-      modelContextWindow:
-        toNonNegativeInteger(payload["model_context_window"]) ?? state.sessionContextWindow,
+      modelContextWindow,
       projectId: state.projectId,
       sessionId: state.sessionId,
       startedAt,
@@ -1277,6 +1689,7 @@ export class SessionImporter {
       turnId: explicitTurnId,
       turnKey,
     });
+    if (turnMutation.changed) markTurnChanged(changes, turnMutation.pressureRelevant);
 
     if (isStart) state.activeTurnKey = turnKey;
     return { terminal: terminalStatus !== null, turnKey };
@@ -1312,14 +1725,14 @@ export class SessionImporter {
     timeToFirstTokenMs: number | null;
     turnId: string;
     turnKey: string;
-  }) {
+  }): { changed: boolean; pressureRelevant: boolean } {
     const existing = this.database.select().from(turns).where(eq(turns.id, value.turnKey)).get();
     const now = Date.now();
     const localDate = toLocalDate(value.startedAt ?? value.eventAt);
-    if (!localDate) return;
+    if (!localDate) return { changed: false, pressureRelevant: false };
 
     if (!existing) {
-      this.database
+      const inserted = this.database
         .insert(turns)
         .values({
           agentId: value.agentId,
@@ -1342,46 +1755,65 @@ export class SessionImporter {
         })
         .onConflictDoNothing()
         .run();
-      return;
+      return { changed: inserted.changes > 0, pressureRelevant: false };
     }
 
     const startedAt = earlierTimestamp(existing.startedAt, value.startedAt);
     const shouldApplyTerminal =
       value.status !== "unknown" &&
       (!existing.completedAt || !value.completedAt || value.completedAt >= existing.completedAt);
+    const next = {
+      collaborationMode: value.collaborationMode ?? existing.collaborationMode,
+      completedAt: shouldApplyTerminal ? value.completedAt : existing.completedAt,
+      durationMs:
+        value.durationMs ??
+        durationBetween(startedAt ?? existing.startedAt, value.completedAt) ??
+        existing.durationMs,
+      effort: value.effort ?? existing.effort,
+      lastEventAt: laterTimestamp(existing.lastEventAt, value.eventAt),
+      localDate:
+        toLocalDate(startedAt ?? existing.startedAt ?? value.eventAt) ?? existing.localDate,
+      modelContextWindow: value.modelContextWindow ?? existing.modelContextWindow,
+      projectId: value.projectId ?? existing.projectId,
+      startedAt,
+      status: shouldApplyTerminal ? value.status : existing.status,
+      timeToFirstTokenMs: value.timeToFirstTokenMs ?? existing.timeToFirstTokenMs,
+    };
+    const changed =
+      existing.collaborationMode !== next.collaborationMode ||
+      existing.completedAt !== next.completedAt ||
+      existing.durationMs !== next.durationMs ||
+      existing.effort !== next.effort ||
+      existing.lastEventAt !== next.lastEventAt ||
+      existing.localDate !== next.localDate ||
+      existing.modelContextWindow !== next.modelContextWindow ||
+      existing.projectId !== next.projectId ||
+      existing.startedAt !== next.startedAt ||
+      existing.status !== next.status ||
+      existing.timeToFirstTokenMs !== next.timeToFirstTokenMs;
+    const pressureRelevant =
+      existing.modelContextWindow !== next.modelContextWindow &&
+      (existing.peakInputTokens ?? 0) > 0;
     this.database
       .update(turns)
       .set({
-        collaborationMode: value.collaborationMode ?? existing.collaborationMode,
-        completedAt: shouldApplyTerminal ? value.completedAt : existing.completedAt,
-        durationMs:
-          value.durationMs ??
-          durationBetween(startedAt ?? existing.startedAt, value.completedAt) ??
-          existing.durationMs,
-        effort: value.effort ?? existing.effort,
-        lastEventAt: laterTimestamp(existing.lastEventAt, value.eventAt),
-        localDate:
-          toLocalDate(startedAt ?? existing.startedAt ?? value.eventAt) ?? existing.localDate,
-        modelContextWindow: value.modelContextWindow ?? existing.modelContextWindow,
-        projectId: value.projectId ?? existing.projectId,
-        startedAt,
-        status: shouldApplyTerminal ? value.status : existing.status,
-        timeToFirstTokenMs: value.timeToFirstTokenMs ?? existing.timeToFirstTokenMs,
+        ...next,
         updatedAt: now,
       })
       .where(eq(turns.id, value.turnKey))
       .run();
+    return { changed, pressureRelevant };
   }
 
-  private attributeRawUsage(eventId: string, turnKey: string | null) {
-    this.database.$client.transaction(() => {
-      this.attributeRawUsageInTransaction(eventId, turnKey);
-    })();
+  private attributeRawUsage(eventId: string, turnKey: string | null): boolean {
+    return this.database.$client.transaction(() =>
+      this.attributeRawUsageInTransaction(eventId, turnKey),
+    )();
   }
 
-  private attributeRawUsageInTransaction(eventId: string, turnKey: string | null) {
+  private attributeRawUsageInTransaction(eventId: string, turnKey: string | null): boolean {
     const event = this.database.select().from(usageEvents).where(eq(usageEvents.id, eventId)).get();
-    if (!event) return;
+    if (!event) return false;
     if (!turnKey) {
       if (event.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION) {
         this.database
@@ -1390,10 +1822,10 @@ export class SessionImporter {
           .where(eq(usageEvents.id, eventId))
           .run();
       }
-      return;
+      return false;
     }
     if (event.turnKey === turnKey && event.turnAttributionVersion === TURN_ATTRIBUTION_VERSION) {
-      return;
+      return false;
     }
 
     const input: TurnUsageInput = {
@@ -1416,6 +1848,7 @@ export class SessionImporter {
       .run();
     if (event.turnKey !== turnKey) this.applyTurnUsage(turnKey, input, false, 1);
     this.updateTurnContext(turnKey, input);
+    return true;
   }
 
   private attributeArchivedUsage(
@@ -1424,10 +1857,10 @@ export class SessionImporter {
     usage: TokenUsage,
     model: string,
     timestamp: string,
-  ) {
-    this.database.$client.transaction(() => {
-      this.attributeArchivedUsageInTransaction(archived, turnKey, usage, model, timestamp);
-    })();
+  ): boolean {
+    return this.database.$client.transaction(() =>
+      this.attributeArchivedUsageInTransaction(archived, turnKey, usage, model, timestamp),
+    )();
   }
 
   private attributeArchivedUsageInTransaction(
@@ -1436,7 +1869,7 @@ export class SessionImporter {
     usage: TokenUsage,
     model: string,
     timestamp: string,
-  ) {
+  ): boolean {
     if (!turnKey) {
       if (archived.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION) {
         this.database
@@ -1445,15 +1878,15 @@ export class SessionImporter {
           .where(eq(archivedUsageEventIds.id, archived.id))
           .run();
       }
-      return;
+      return false;
     }
     if (
       archived.turnKey === turnKey &&
       archived.turnAttributionVersion === TURN_ATTRIBUTION_VERSION
     ) {
-      return;
+      return false;
     }
-    if (archived.turnKey && archived.turnKey !== turnKey) return;
+    if (archived.turnKey && archived.turnKey !== turnKey) return false;
     this.database
       .update(archivedUsageEventIds)
       .set({ turnAttributionVersion: TURN_ATTRIBUTION_VERSION, turnKey })
@@ -1464,6 +1897,7 @@ export class SessionImporter {
       this.applyTurnUsage(turnKey, input, true, 1);
       this.updateTurnContext(turnKey, input);
     }
+    return true;
   }
 
   private applyTurnUsage(
@@ -1563,6 +1997,7 @@ export class SessionImporter {
     record: JsonRecord,
     state: MutableImportState,
     attributionTurnKey: string | null,
+    changes: ImporterChanges,
   ) {
     if (!state.sessionId) return;
     const activity = parseActivityRecord(record, state.sessionId);
@@ -1579,12 +2014,16 @@ export class SessionImporter {
       .where(eq(archivedActivityEventIds.id, id))
       .get();
     if (archived) {
-      this.attributeArchivedActivity(
-        archived,
-        attributionTurnKey,
-        toActivityKind(activity),
-        activity.timestamp,
-      );
+      if (
+        this.attributeArchivedActivity(
+          archived,
+          attributionTurnKey,
+          toActivityKind(activity),
+          activity.timestamp,
+        )
+      ) {
+        markTurnChanged(changes);
+      }
       return;
     }
     const legacyArchived = this.database
@@ -1609,12 +2048,16 @@ export class SessionImporter {
         .where(eq(archivedActivityEventIds.id, id))
         .get();
       if (migratedArchive) {
-        this.attributeArchivedActivity(
-          migratedArchive,
-          attributionTurnKey,
-          toActivityKind(activity),
-          activity.timestamp,
-        );
+        if (
+          this.attributeArchivedActivity(
+            migratedArchive,
+            attributionTurnKey,
+            toActivityKind(activity),
+            activity.timestamp,
+          )
+        ) {
+          markTurnChanged(changes);
+        }
       }
       return;
     }
@@ -1623,7 +2066,7 @@ export class SessionImporter {
     if (!localDate) return;
     const agentKind = agentId === state.sessionId ? "main" : "subagent";
     const projectId = state.projectId ?? "legacy-unknown";
-    this.database
+    const inserted = this.database
       .insert(activityEvents)
       .values({
         agentId,
@@ -1640,26 +2083,32 @@ export class SessionImporter {
       })
       .onConflictDoNothing()
       .run();
-    this.attributeRawActivity(id, attributionTurnKey, toActivityKind(activity));
+    if (inserted.changes > 0) {
+      changes.scopes.add("activity");
+      changes.scopes.add("data-health");
+    }
+    if (this.attributeRawActivity(id, attributionTurnKey, toActivityKind(activity))) {
+      markTurnChanged(changes);
+    }
   }
 
-  private attributeRawActivity(id: string, turnKey: string | null, kind: ActivityKind) {
-    this.database.$client.transaction(() => {
-      this.attributeRawActivityInTransaction(id, turnKey, kind);
-    })();
+  private attributeRawActivity(id: string, turnKey: string | null, kind: ActivityKind): boolean {
+    return this.database.$client.transaction(() =>
+      this.attributeRawActivityInTransaction(id, turnKey, kind),
+    )();
   }
 
   private attributeRawActivityInTransaction(
     id: string,
     turnKey: string | null,
     kind: ActivityKind,
-  ) {
+  ): boolean {
     const event = this.database
       .select()
       .from(activityEvents)
       .where(eq(activityEvents.id, id))
       .get();
-    if (!event) return;
+    if (!event) return false;
     if (!turnKey) {
       if (event.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION) {
         this.database
@@ -1668,10 +2117,10 @@ export class SessionImporter {
           .where(eq(activityEvents.id, id))
           .run();
       }
-      return;
+      return false;
     }
     if (event.turnKey === turnKey && event.turnAttributionVersion === TURN_ATTRIBUTION_VERSION) {
-      return;
+      return false;
     }
     if (event.turnKey && event.turnKey !== turnKey) {
       this.applyTurnActivity(event.turnKey, kind, -1);
@@ -1683,6 +2132,7 @@ export class SessionImporter {
       .run();
     if (event.turnKey !== turnKey) this.applyTurnActivity(turnKey, kind, 1);
     this.touchTurn(turnKey, event.timestamp);
+    return true;
   }
 
   private attributeArchivedActivity(
@@ -1690,10 +2140,10 @@ export class SessionImporter {
     turnKey: string | null,
     kind: ActivityKind,
     timestamp: string,
-  ) {
-    this.database.$client.transaction(() => {
-      this.attributeArchivedActivityInTransaction(archived, turnKey, kind, timestamp);
-    })();
+  ): boolean {
+    return this.database.$client.transaction(() =>
+      this.attributeArchivedActivityInTransaction(archived, turnKey, kind, timestamp),
+    )();
   }
 
   private attributeArchivedActivityInTransaction(
@@ -1701,7 +2151,7 @@ export class SessionImporter {
     turnKey: string | null,
     kind: ActivityKind,
     timestamp: string,
-  ) {
+  ): boolean {
     if (!turnKey) {
       if (archived.turnAttributionVersion !== TURN_ATTRIBUTION_VERSION) {
         this.database
@@ -1710,15 +2160,15 @@ export class SessionImporter {
           .where(eq(archivedActivityEventIds.id, archived.id))
           .run();
       }
-      return;
+      return false;
     }
     if (
       archived.turnKey === turnKey &&
       archived.turnAttributionVersion === TURN_ATTRIBUTION_VERSION
     ) {
-      return;
+      return false;
     }
-    if (archived.turnKey && archived.turnKey !== turnKey) return;
+    if (archived.turnKey && archived.turnKey !== turnKey) return false;
     this.database
       .update(archivedActivityEventIds)
       .set({ turnAttributionVersion: TURN_ATTRIBUTION_VERSION, turnKey })
@@ -1726,6 +2176,7 @@ export class SessionImporter {
       .run();
     if (!archived.turnKey) this.applyTurnActivity(turnKey, kind, 1);
     this.touchTurn(turnKey, timestamp);
+    return true;
   }
 
   private applyTurnActivity(turnKey: string, kind: ActivityKind, direction: 1 | -1) {
@@ -1772,15 +2223,28 @@ export class SessionImporter {
     malformedLines: number,
     incompleteLine: boolean,
     lastError: string | null,
-  ) {
+  ): typeof importDiagnostics.$inferSelect {
+    const diagnostic = {
+      incompleteLine,
+      lastError,
+      malformedLines,
+      sourcePath,
+      updatedAt: Date.now(),
+    };
     this.database
       .insert(importDiagnostics)
-      .values({ incompleteLine, lastError, malformedLines, sourcePath, updatedAt: Date.now() })
+      .values(diagnostic)
       .onConflictDoUpdate({
         target: importDiagnostics.sourcePath,
-        set: { incompleteLine, lastError, malformedLines, updatedAt: Date.now() },
+        set: {
+          incompleteLine,
+          lastError,
+          malformedLines,
+          updatedAt: diagnostic.updatedAt,
+        },
       })
       .run();
+    return diagnostic;
   }
 
   private getRate(model: string): RateSnapshot | null {
@@ -1798,62 +2262,83 @@ export class SessionImporter {
     return snapshot;
   }
 
-  private captureTaskSummary(state: MutableImportState, message: string | null) {
-    if (!state.agentId || !state.sessionId || !message) return;
+  private captureTaskSummary(state: MutableImportState, message: string | null): boolean {
+    const agentId = state.agentId;
+    const sessionId = state.sessionId;
+    if (!agentId || !sessionId || !message) return false;
     const summary = summarizeTask(message);
-    if (!summary) return;
+    if (!summary) return false;
 
-    this.database
-      .update(sessionAgents)
-      .set({ taskSummary: summary })
-      .where(and(eq(sessionAgents.id, state.agentId), isNull(sessionAgents.taskSummary)))
-      .run();
+    return this.database.$client.transaction(() => {
+      const agentUpdate = this.database
+        .update(sessionAgents)
+        .set({ taskSummary: summary })
+        .where(and(eq(sessionAgents.id, agentId), isNull(sessionAgents.taskSummary)))
+        .run();
 
-    if (state.agentId !== state.sessionId) return;
-    this.database
-      .update(sessions)
-      .set({ title: summary })
-      .where(and(eq(sessions.id, state.sessionId), isNull(sessions.title)))
-      .run();
+      if (agentId !== sessionId) return agentUpdate.changes > 0;
+      const sessionUpdate = this.database
+        .update(sessions)
+        .set({ title: summary })
+        .where(and(eq(sessions.id, sessionId), isNull(sessions.title)))
+        .run();
+      return agentUpdate.changes > 0 || sessionUpdate.changes > 0;
+    })();
   }
 
-  private markSourceDeleted(sourcePath: string) {
+  private markSourceDeleted(sourcePath: string, changes: ImporterChanges) {
     if (!sourcePath.endsWith(".jsonl")) return;
-    this.database
+    const sessionsChanged = this.database
       .update(sessions)
       .set({ sourceDeleted: true })
-      .where(eq(sessions.sourcePath, sourcePath))
+      .where(and(eq(sessions.sourcePath, sourcePath), eq(sessions.sourceDeleted, false)))
       .run();
-    this.database
+    if (sessionsChanged.changes > 0) {
+      markSessionChanged(changes);
+      changes.scopes.add("data-health");
+    }
+    const agentsChanged = this.database
       .update(sessionAgents)
       .set({ sourceDeleted: true })
-      .where(eq(sessionAgents.sourcePath, sourcePath))
+      .where(and(eq(sessionAgents.sourcePath, sourcePath), eq(sessionAgents.sourceDeleted, false)))
       .run();
+    if (agentsChanged.changes > 0) {
+      markSessionChanged(changes);
+      changes.scopes.add("data-health");
+    }
   }
 
-  private refreshDeletedSources(availablePaths: Set<string>) {
+  private refreshDeletedSources(availablePaths: Set<string>, changes: ImporterChanges) {
     for (const session of this.database.select().from(sessions).all()) {
       const sourceDeleted = !availablePaths.has(session.sourcePath);
       if (sourceDeleted === session.sourceDeleted) continue;
-      this.database
+      const updated = this.database
         .update(sessions)
         .set({ sourceDeleted })
         .where(eq(sessions.id, session.id))
         .run();
+      if (updated.changes > 0) {
+        markSessionChanged(changes);
+        changes.scopes.add("data-health");
+      }
     }
 
     for (const agent of this.database.select().from(sessionAgents).all()) {
       const sourceDeleted = !availablePaths.has(agent.sourcePath);
       if (sourceDeleted === agent.sourceDeleted) continue;
-      this.database
+      const updated = this.database
         .update(sessionAgents)
         .set({ sourceDeleted })
         .where(eq(sessionAgents.id, agent.id))
         .run();
+      if (updated.changes > 0) {
+        markSessionChanged(changes);
+        changes.scopes.add("data-health");
+      }
     }
   }
 
-  private async refreshSessionTitles(forceFull: boolean) {
+  private async refreshSessionTitles(forceFull: boolean, changes: ImporterChanges) {
     const metadata = await readSourceFileMetadata(this.sessionIndexPath);
     if (!metadata) return;
 
@@ -1875,9 +2360,11 @@ export class SessionImporter {
     const titles = rebuild
       ? new Map<string, IndexedTitle>()
       : new Map<string, IndexedTitle>(this.sessionIndexTitles);
+    const changedIds = new Set<string>();
     const offset = rebuild ? 0 : this.sessionIndexOffset;
     const result = await readSessionIndexLines(this.sessionIndexPath, offset, (rawLine) => {
-      mergeIndexedSessionTitle(titles, rawLine);
+      const changedId = mergeIndexedSessionTitle(titles, rawLine);
+      if (changedId) changedIds.add(changedId);
     });
     const currentMetadata = await readSourceFileMetadata(this.sessionIndexPath);
     this.sessionIndexMetadata =
@@ -1887,15 +2374,63 @@ export class SessionImporter {
     this.sessionIndexOffset = result.lastCompleteOffset;
     this.sessionIndexTitles = titles;
 
-    for (const [id, value] of titles) {
-      this.database.update(sessions).set({ title: value.title }).where(eq(sessions.id, id)).run();
+    const idsToUpdate = rebuild ? titles.keys() : changedIds;
+    for (const id of idsToUpdate) {
+      const value = titles.get(id);
+      if (!value) continue;
+      const existing = this.database
+        .select({ title: sessions.title })
+        .from(sessions)
+        .where(eq(sessions.id, id))
+        .get();
+      if (!existing || existing.title === value.title) continue;
+      const updated = this.database
+        .update(sessions)
+        .set({ title: value.title })
+        .where(eq(sessions.id, id))
+        .run();
+      if (updated.changes > 0) markSessionChanged(changes);
     }
   }
 }
 
-async function findCanonicalBoundary(filePath: string): Promise<CanonicalBoundary> {
+async function findCanonicalBoundary(
+  filePath: string,
+  resolveForkSourcePath: (forkedFromId: string) => string | null,
+): Promise<CanonicalBoundary> {
+  const header = await readSessionSourceHeader(filePath);
+  if (!header) return { resolved: true, startLine: 0 };
+  if (!header.isSubagent) {
+    if (!header.forkedFromId) return { owner: header, resolved: true, startLine: 0 };
+    const fork = { forkedFromId: header.forkedFromId, sessionId: header.sessionId };
+    const parentSourcePath = resolveForkSourcePath(header.forkedFromId);
+    if (!parentSourcePath || parentSourcePath === filePath) {
+      return { fork, owner: header, resolved: false, startLine: Number.MAX_SAFE_INTEGER };
+    }
+    const parentMetadata = await readSourceFileMetadata(parentSourcePath);
+    if (!parentMetadata) {
+      return { fork, owner: header, resolved: false, startLine: Number.MAX_SAFE_INTEGER };
+    }
+    try {
+      return {
+        ...(await findRootForkCanonicalBoundary(filePath, parentSourcePath)),
+        fork,
+        owner: header,
+      };
+    } catch (error) {
+      if (isMissingSourceError(error)) {
+        return {
+          fork,
+          owner: header,
+          resolved: false,
+          startLine: Number.MAX_SAFE_INTEGER,
+        };
+      }
+      throw error;
+    }
+  }
+
   let lineIndex = 0;
-  let isSubagent = false;
   let sessionMetaCount = 0;
   let lastTaskStartLine = -1;
   let boundary: CanonicalBoundary | null = null;
@@ -1908,23 +2443,15 @@ async function findCanonicalBoundary(filePath: string): Promise<CanonicalBoundar
       const payload = asRecord(record?.["payload"]);
       if (record?.["type"] === "session_meta" && payload) {
         sessionMetaCount += 1;
-        if (sessionMetaCount === 1) {
-          isSubagent =
-            asString(payload["thread_source"]) === "subagent" ||
-            asString(payload["parent_thread_id"]) !== null;
-          if (!isSubagent) {
-            boundary = { resolved: true, startLine: 0 };
-            return false;
-          }
-        }
       }
-      if (record?.["type"] === "event_msg" && payload?.["type"] === "task_started" && isSubagent) {
+      if (record?.["type"] === "event_msg" && payload?.["type"] === "task_started") {
         lastTaskStartLine = lineIndex;
       }
-      if (record?.["type"] === "inter_agent_communication_metadata" && isSubagent) {
+      if (record?.["type"] === "inter_agent_communication_metadata") {
         boundary = {
+          owner: header,
           resolved: true,
-          startLine: sessionMetaCount > 1 && lastTaskStartLine >= 0 ? lastTaskStartLine : 0,
+          startLine: lastTaskStartLine >= 0 ? lastTaskStartLine : lineIndex,
         };
         return false;
       }
@@ -1937,28 +2464,245 @@ async function findCanonicalBoundary(filePath: string): Promise<CanonicalBoundar
 
   if (boundary) return boundary;
 
-  // Standalone subagent files contain one session_meta and are canonical from the start.
+  // A subagent file with no handoff marker is canonical when it contains one metadata header.
   // A multi-meta file without its handoff tail is conservatively ignored until a later rescan.
   return {
+    owner: header,
     resolved: sessionMetaCount <= 1,
     startLine: sessionMetaCount > 1 ? lineIndex : 0,
   };
 }
 
-function mergeIndexedSessionTitle(titles: Map<string, IndexedTitle>, rawLine: string) {
+async function readSessionSourceHeader(filePath: string): Promise<SessionSourceHeader | null> {
+  let header: SessionSourceHeader | null = null;
+  await readCompleteJsonLines(
+    filePath,
+    0,
+    (line) => {
+      const payload = asRecord(line.record?.["payload"]);
+      if (line.record?.["type"] !== "session_meta" || !payload) return true;
+      const sessionId = asString(payload["session_id"]) ?? asString(payload["id"]);
+      if (!sessionId) return true;
+      const agentId = asString(payload["id"]) ?? sessionId;
+      const parentThreadId = asString(payload["parent_thread_id"]);
+      header = {
+        agentId,
+        forkedFromId: asString(payload["forked_from_id"]),
+        isSubagent: asString(payload["thread_source"]) === "subagent" || parentThreadId !== null,
+        sessionId,
+      };
+      return false;
+    },
+    "boundary",
+  );
+  return header;
+}
+
+async function findRootForkCanonicalBoundary(
+  filePath: string,
+  parentSourcePath: string,
+): Promise<CanonicalBoundary> {
+  const childItems = iterateRolloutCopyLines(filePath);
+  const parentItems = iterateRolloutCopyLines(parentSourcePath);
+
+  try {
+    while (true) {
+      const [child, parent] = await Promise.all([childItems.next(), parentItems.next()]);
+      if (child.done) return { resolved: true, startLine: child.value };
+      if (parent.done) return { resolved: true, startLine: child.value.lineIndex };
+      if (!child.value.fingerprint || !parent.value.fingerprint) {
+        return { resolved: false, startLine: Number.MAX_SAFE_INTEGER };
+      }
+      if (child.value.fingerprint !== parent.value.fingerprint) {
+        return { resolved: true, startLine: child.value.lineIndex };
+      }
+    }
+  } finally {
+    await Promise.allSettled([childItems.return(0), parentItems.return(0)]);
+  }
+}
+
+async function* iterateRolloutCopyLines(
+  filePath: string,
+): AsyncGenerator<RolloutCopyLine, number, void> {
+  const stream = createReadStream(filePath);
+  let bufferedBytes = 0;
+  let bufferedSegments: Buffer[] = [];
+  let hash: ReturnType<typeof createHash> | null = null;
+  let comparable = true;
+  let lineIndex = 0;
+  let prefix = Buffer.alloc(0);
+
+  const append = (segment: Buffer) => {
+    if (hash) {
+      hash.update(segment);
+      return;
+    }
+    bufferedSegments.push(segment);
+    bufferedBytes += segment.length;
+    if (bufferedBytes < JSON_LINE_PROJECTION_BYTES) return;
+    const initial = Buffer.concat(bufferedSegments, bufferedBytes);
+    prefix = initial.subarray(0, JSON_LINE_PREFIX_BYTES);
+    const normalized = normalizeLargeRolloutCopyPrefix(initial);
+    hash = createHash("sha256");
+    if (normalized) hash.update(normalized);
+    else {
+      comparable = false;
+      hash.update(initial);
+    }
+    bufferedSegments = [];
+    bufferedBytes = 0;
+  };
+
+  const finish = (): RolloutCopyLine | null => {
+    let result: RolloutCopyLine | null = null;
+    if (hash) {
+      const fingerprint = hash.digest("hex");
+      result = {
+        fingerprint: comparable ? fingerprint : null,
+        lineIndex,
+        recordType: readRolloutRecordType(prefix.toString("utf8")),
+      };
+    } else if (bufferedBytes > 0) {
+      const raw = Buffer.concat(bufferedSegments, bufferedBytes)
+        .toString("utf8")
+        .replace(/\r$/, "");
+      if (raw.trim()) result = { ...fingerprintSmallRolloutLine(raw), lineIndex };
+    }
+    bufferedBytes = 0;
+    bufferedSegments = [];
+    hash = null;
+    comparable = true;
+    prefix = Buffer.alloc(0);
+    lineIndex += 1;
+    return result;
+  };
+
+  const chunks: AsyncIterable<unknown> = stream;
+  try {
+    for await (const chunkValue of chunks) {
+      if (!Buffer.isBuffer(chunkValue)) throw new TypeError("Expected a binary rollout chunk");
+      let cursor = 0;
+      let newlineIndex = chunkValue.indexOf(0x0a, cursor);
+      while (newlineIndex !== -1) {
+        append(chunkValue.subarray(cursor, newlineIndex));
+        const line = finish();
+        if (line && line.recordType !== "session_meta") yield line;
+        cursor = newlineIndex + 1;
+        newlineIndex = chunkValue.indexOf(0x0a, cursor);
+      }
+      const tail = chunkValue.subarray(cursor);
+      if (tail.length > 0) append(tail);
+    }
+  } finally {
+    stream.destroy();
+  }
+
+  return lineIndex;
+}
+
+function fingerprintSmallRolloutLine(
+  rawLine: string,
+): Pick<RolloutCopyLine, "fingerprint" | "recordType"> {
+  try {
+    const parsed: unknown = JSON.parse(rawLine);
+    if (!isRecord(parsed)) throw new TypeError("Rollout line must be an object");
+    const { timestamp: _timestamp, ...item } = parsed;
+    void _timestamp;
+    const payload = asRecord(item["payload"]);
+    const normalized =
+      item["type"] === "response_item" && payload
+        ? { ...item, payload: omitCopyVariantId(payload) }
+        : item;
+    return {
+      fingerprint: createHash("sha256").update(JSON.stringify(normalized)).digest("hex"),
+      recordType: asString(item["type"]),
+    };
+  } catch {
+    return {
+      fingerprint: null,
+      recordType: readRolloutRecordType(rawLine.slice(0, JSON_LINE_PREFIX_BYTES)),
+    };
+  }
+}
+
+function omitCopyVariantId(payload: JsonRecord): JsonRecord {
+  const { id: _id, ...value } = payload;
+  void _id;
+  return value;
+}
+
+function normalizeLargeRolloutCopyPrefix(value: Buffer): Buffer | null {
+  const prefix = value.subarray(0, JSON_LINE_PREFIX_BYTES).toString("utf8");
+  const timestampRange = findJsonStringMemberRange(prefix, "timestamp");
+  if (!timestampRange) return null;
+  const ranges = [timestampRange];
+  if (readRolloutRecordType(prefix) === "response_item") {
+    const idRange = findJsonStringMemberRange(prefix, "id", timestampRange.end);
+    if (idRange) ranges.push(idRange);
+  }
+  ranges.sort((left, right) => right.start - left.start);
+  let normalized = value;
+  for (const range of ranges) {
+    normalized = Buffer.concat([
+      normalized.subarray(0, range.start),
+      normalized.subarray(range.end),
+    ]);
+  }
+  return normalized;
+}
+
+function findJsonStringMemberRange(
+  value: string,
+  key: "id" | "timestamp",
+  from = 0,
+): { end: number; start: number } | null {
+  const pattern =
+    key === "timestamp"
+      ? /"timestamp"\s*:\s*"(?:[^"\\]|\\.)*"\s*/gu
+      : /"id"\s*:\s*"(?:[^"\\]|\\.)*"\s*/gu;
+  pattern.lastIndex = from;
+  const match = pattern.exec(value);
+  if (!match) return null;
+  let start = match.index;
+  let end = match.index + match[0].length;
+  let cursor = end;
+  while (/\s/u.test(value.charAt(cursor))) cursor += 1;
+  if (value.charAt(cursor) === ",") {
+    end = cursor + 1;
+  } else {
+    cursor = start - 1;
+    while (cursor >= 0 && /\s/u.test(value.charAt(cursor))) cursor -= 1;
+    if (value.charAt(cursor) === ",") start = cursor;
+  }
+  return { end, start };
+}
+
+function readRolloutRecordType(prefix: string): string | null {
+  const match = /"type"\s*:\s*"([^"\\]+)"/u.exec(prefix);
+  return match?.[1] ?? null;
+}
+
+function mergeIndexedSessionTitle(
+  titles: Map<string, IndexedTitle>,
+  rawLine: string,
+): string | null {
   let record: unknown;
   try {
     record = JSON.parse(rawLine);
   } catch {
-    return;
+    return null;
   }
-  if (!isRecord(record)) return;
+  if (!isRecord(record)) return null;
   const id = asString(record["id"]);
   const title = asString(record["thread_name"])?.trim();
-  if (!id || !title) return;
+  if (!id || !title) return null;
   const updatedAt = Date.parse(asString(record["updated_at"]) ?? "") || 0;
   const previous = titles.get(id);
-  if (!previous || updatedAt >= previous.updatedAt) titles.set(id, { title, updatedAt });
+  if (previous && updatedAt < previous.updatedAt) return null;
+  if (previous?.title === title && previous.updatedAt === updatedAt) return null;
+  titles.set(id, { title, updatedAt });
+  return id;
 }
 
 async function readSessionIndexLines(
@@ -2773,6 +3517,16 @@ function summarizeTask(message: string): string | null {
 
 function createUsageFingerprint(
   rawLine: string,
+  cumulativeUsage: TokenUsage | null,
+  agentId: string,
+): string {
+  const observation = cumulativeUsage ?? rawLine;
+  const value = JSON.stringify({ agentId, observation });
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function createPreviousUsageFingerprint(
+  rawLine: string,
   lastUsage: TokenUsage,
   cumulativeUsage: TokenUsage | null,
   agentId: string,
@@ -2811,6 +3565,49 @@ function turnUsageInputFromEvent(event: typeof usageEvents.$inferSelect): TurnUs
     timestamp: event.timestamp,
     totalTokens: event.totalTokens,
   };
+}
+
+function compareUsageEventOrder(left: UsageEventRow, right: UsageEventRow): number {
+  const timestampOrder = left.timestamp.localeCompare(right.timestamp);
+  if (timestampOrder !== 0) return timestampOrder;
+  const creationOrder = left.createdAt - right.createdAt;
+  return creationOrder !== 0 ? creationOrder : left.id.localeCompare(right.id);
+}
+
+function sameUsageObservation(left: UsageEventRow, right: UsageEventRow): boolean {
+  return (
+    left.cachedInputTokens === right.cachedInputTokens &&
+    left.inputTokens === right.inputTokens &&
+    left.model === right.model &&
+    left.outputTokens === right.outputTokens &&
+    left.reasoningOutputTokens === right.reasoningOutputTokens &&
+    left.timestamp === right.timestamp &&
+    left.totalTokens === right.totalTokens
+  );
+}
+
+function sameUsageEventForRepair(left: UsageEventRow, right: UsageEventRow): boolean {
+  return (
+    left.agentId === right.agentId &&
+    left.cachedInputRate === right.cachedInputRate &&
+    left.cachedInputTokens === right.cachedInputTokens &&
+    left.costUsd === right.costUsd &&
+    left.createdAt === right.createdAt &&
+    left.id === right.id &&
+    left.inputRate === right.inputRate &&
+    left.inputTokens === right.inputTokens &&
+    left.localDate === right.localDate &&
+    left.model === right.model &&
+    left.outputRate === right.outputRate &&
+    left.outputTokens === right.outputTokens &&
+    left.reasoningOutputTokens === right.reasoningOutputTokens &&
+    left.sessionId === right.sessionId &&
+    left.sourceHash === right.sourceHash &&
+    left.timestamp === right.timestamp &&
+    left.totalTokens === right.totalTokens &&
+    left.turnAttributionVersion === right.turnAttributionVersion &&
+    left.turnKey === right.turnKey
+  );
 }
 
 function durationBetween(start: string | null, end: string | null): number | null {
@@ -2877,6 +3674,33 @@ function toNonNegativeInteger(value: unknown): number | null {
 
 function toNonNegativeNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  map: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Map<number, R>();
+  const pending = values.entries();
+  const workers = Array.from(
+    { length: Math.min(values.length, Math.max(1, concurrency)) },
+    async () => {
+      for (let next = pending.next(); !next.done; next = pending.next()) {
+        const [index, value] = next.value;
+        results.set(index, await map(value));
+      }
+    },
+  );
+  await Promise.all(workers);
+  return values.map((_value, index) => {
+    if (!results.has(index)) throw new Error("Concurrent map result is missing");
+    return results.get(index)!;
+  });
+}
+
+function isMissingSourceError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
 function errorMessage(error: unknown): string {

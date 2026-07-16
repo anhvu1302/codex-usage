@@ -21,6 +21,7 @@ import {
   usageRollupSessionMemberships,
 } from "@/server/db/schema";
 import type {
+  AppRevisionScope,
   DashboardFilters,
   RetentionCoverage,
   SessionCoverage,
@@ -49,6 +50,8 @@ export class RetentionService {
     sessionsDirectory: string,
     private readonly now: () => Date = () => new Date(),
     private readonly sourceInventory: SourceInventory = new SourceInventory(sessionsDirectory, now),
+    private readonly onRevision: (scopes?: readonly AppRevisionScope[]) => void = () => undefined,
+    private readonly onDataChanged: () => void = () => undefined,
   ) {}
 
   start() {
@@ -65,11 +68,14 @@ export class RetentionService {
     if (this.isCompacting) return this.getStatus();
     this.isCompacting = true;
     const startedAt = this.now();
+    let dataChanged = false;
     await Promise.resolve();
 
     try {
       const result = compactUsage(this.database, startedAt);
       this.saveState(startedAt, result, null);
+      dataChanged =
+        result.hourlyRowsDeleted > 0 || result.rawEventsDeleted > 0 || result.rollupRowsWritten > 0;
       try {
         reclaimDatabaseSpace(this.database);
       } catch (error) {
@@ -79,6 +85,20 @@ export class RetentionService {
       this.saveState(startedAt, emptyResult(), errorMessage(error));
     } finally {
       this.isCompacting = false;
+    }
+
+    if (dataChanged) {
+      try {
+        this.onDataChanged();
+      } catch (error) {
+        console.warn("Could not publish retention data change", error);
+      }
+    }
+
+    try {
+      this.onRevision(dataChanged ? undefined : ["data-health", "storage"]);
+    } catch (error) {
+      console.warn("Could not publish retention revision", error);
     }
 
     return this.getStatus();

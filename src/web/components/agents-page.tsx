@@ -1,21 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
-import { Bot, Database, GitBranch, Sparkles } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Bot, Database, GitBranch } from "lucide-react";
+import { lazy, Suspense, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import {
-  CartesianGrid,
-  Cell,
-  Line,
-  LineChart,
-  Pie,
-  PieChart,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
 
 import { ProductFilterBar } from "@/web/components/product-filter-bar";
-import { ExportActions } from "@/web/components/product-tools";
+import { ExportActions } from "@/web/components/export-actions";
 import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
 import {
@@ -25,7 +14,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/web/components/ui/card";
-import { ChartContainer, type ChartConfig } from "@/web/components/ui/chart";
 import { Skeleton } from "@/web/components/ui/skeleton";
 import {
   Table,
@@ -38,30 +26,31 @@ import {
 import { fetchModels } from "@/web/lib/api";
 import {
   compactTokens,
-  fetchAgents,
-  fetchProjects,
+  fetchAgentsPage,
+  fetchAgentsSummary,
+  fetchProjectOptions,
   filtersFromSearch,
   formatPercent,
   formatTokens,
   formatUsd,
   updateFilterSearch,
 } from "@/web/lib/product-api";
-import type {
-  AgentFilters,
-  AgentUsageSummary,
-  AgentsResponse,
-  DashboardKpis,
-} from "@/shared/types";
+import { useMediaQuery } from "@/web/lib/use-media-query";
+import type { AgentFilters, AgentLeaderboardItem, AgentLeaderboardMetric } from "@/shared/types";
 
-type LeaderboardMetric = "cache" | "cost" | "output" | "requests" | "tokens";
+type LeaderboardMetric = AgentLeaderboardMetric;
 type TrendMetric = "cost" | "tokens";
+const AGENT_PAGE_SIZE = 50;
 
-const trendConfig = {
-  main: { color: "var(--chart-1)", label: "Main agent" },
-  subagent: { color: "var(--chart-4)", label: "Subagent" },
-} satisfies ChartConfig;
+const AgentDonut = lazy(async () => ({
+  default: (await import("@/web/components/agent-charts")).AgentDonut,
+}));
+const AgentTrend = lazy(async () => ({
+  default: (await import("@/web/components/agent-charts")).AgentTrend,
+}));
 
 export function AgentsPage() {
+  const desktopLeaderboard = useMediaQuery("(min-width: 768px)");
   const [search, setSearch] = useSearchParams();
   const filters = useMemo<AgentFilters>(() => {
     const base: AgentFilters = filtersFromSearch(search);
@@ -71,29 +60,41 @@ export function AgentsPage() {
     if (depthText && /^\d+$/.test(depthText)) base.depth = Number(depthText);
     return base;
   }, [search]);
-  const [metric, setMetric] = useState<LeaderboardMetric>("tokens");
+  const metric = parseLeaderboardMetric(search.get("agentSort"));
+  const page = positiveInteger(search.get("agentPage")) ?? 1;
   const [trendMetric, setTrendMetric] = useState<TrendMetric>("tokens");
-  const models = useQuery({ queryKey: ["models"], queryFn: fetchModels });
+  const models = useQuery({
+    queryKey: ["models"],
+    queryFn: ({ signal }) => fetchModels(signal),
+    staleTime: 5 * 60_000,
+  });
   const projectFilter = useMemo(() => {
-    const value = { ...filters };
-    delete value.projectId;
+    const value: AgentFilters = { from: filters.from, to: filters.to };
+    if (filters.agentKind) value.agentKind = filters.agentKind;
+    if (filters.model) value.model = filters.model;
+    if (filters.models) value.models = filters.models;
     return value;
-  }, [filters]);
+  }, [filters.agentKind, filters.from, filters.model, filters.models, filters.to]);
   const projects = useQuery({
-    queryKey: ["projects", "agent-options", projectFilter],
-    queryFn: () => fetchProjects(projectFilter),
+    queryKey: ["projects", "options", projectFilter],
+    queryFn: ({ signal }) => fetchProjectOptions(projectFilter, signal),
+    staleTime: 5 * 60_000,
   });
-  const agents = useQuery({
-    queryKey: ["agents", filters],
-    queryFn: () => fetchAgents(filters),
+  const agentSummary = useQuery({
+    queryKey: ["agents", "summary", filters],
+    queryFn: ({ signal }) => fetchAgentsSummary(filters, signal),
+    staleTime: 30_000,
   });
-  const sortedAgents = useMemo(
-    () =>
-      [...(agents.data?.agents ?? [])].sort(
-        (left, right) => metricValue(right, metric) - metricValue(left, metric),
-      ),
-    [agents.data?.agents, metric],
+  const agentPageFilters = useMemo(
+    () => ({ ...filters, order: "desc" as const, page, pageSize: AGENT_PAGE_SIZE, sort: metric }),
+    [filters, metric, page],
   );
+  const agents = useQuery({
+    queryKey: ["agents", "page", agentPageFilters],
+    queryFn: ({ signal }) => fetchAgentsPage(agentPageFilters, signal),
+    staleTime: 30_000,
+  });
+  const pageCount = Math.max(1, Math.ceil((agents.data?.total ?? 0) / AGENT_PAGE_SIZE));
 
   function applyFilters(next: AgentFilters) {
     const updated = updateFilterSearch(search, next);
@@ -101,6 +102,21 @@ export function AgentsPage() {
     else updated.delete("role");
     if (next.depth !== undefined) updated.set("depth", String(next.depth));
     else updated.delete("depth");
+    updated.delete("agentPage");
+    setSearch(updated);
+  }
+
+  function selectMetric(next: LeaderboardMetric) {
+    const updated = new URLSearchParams(search);
+    updated.set("agentSort", next);
+    updated.delete("agentPage");
+    setSearch(updated);
+  }
+
+  function selectPage(next: number) {
+    const updated = new URLSearchParams(search);
+    if (next <= 1) updated.delete("agentPage");
+    else updated.set("agentPage", String(next));
     setSearch(updated);
   }
 
@@ -126,7 +142,7 @@ export function AgentsPage() {
             quả chủ quan.
           </p>
         </div>
-        <Badge variant="outline">{agents.data?.agents.length ?? 0} agent</Badge>
+        <Badge variant="outline">{agentSummary.data?.totalAgents ?? 0} agent</Badge>
       </header>
 
       <ProductFilterBar
@@ -141,8 +157,9 @@ export function AgentsPage() {
         showProject
       />
 
+      {agentSummary.isError ? <ErrorCard message={agentSummary.error.message} /> : null}
       {agents.isError ? <ErrorCard message={agents.error.message} /> : null}
-      {agents.data?.coverage.status !== "full" ? (
+      {agentSummary.data && agentSummary.data.coverage.status !== "full" ? (
         <Card className="border-amber-500/40 bg-amber-500/5">
           <CardContent className="flex gap-3 pt-6 text-sm">
             <Database className="mt-0.5 size-4 shrink-0 text-amber-600" />
@@ -163,10 +180,12 @@ export function AgentsPage() {
             <CardDescription>Tỷ trọng token và cost của range hiện tại.</CardDescription>
           </CardHeader>
           <CardContent>
-            {agents.isLoading ? (
+            {agentSummary.isLoading ? (
               <Skeleton className="h-72" />
             ) : (
-              <AgentDonut main={agents.data?.main} subagent={agents.data?.subagent} />
+              <Suspense fallback={<Skeleton className="h-72" />}>
+                <AgentDonut main={agentSummary.data?.main} subagent={agentSummary.data?.subagent} />
+              </Suspense>
             )}
           </CardContent>
         </Card>
@@ -193,16 +212,18 @@ export function AgentsPage() {
             </div>
           </CardHeader>
           <CardContent>
-            {agents.isLoading ? (
+            {agentSummary.isLoading ? (
               <Skeleton className="h-72" />
             ) : (
-              <AgentTrend data={agents.data?.daily ?? []} metric={trendMetric} />
+              <Suspense fallback={<Skeleton className="h-72" />}>
+                <AgentTrend data={agentSummary.data?.daily ?? []} metric={trendMetric} />
+              </Suspense>
             )}
           </CardContent>
         </Card>
       </section>
 
-      <Card className="overflow-hidden">
+      <Card className="deferred-section overflow-hidden">
         <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 space-y-0">
           <div>
             <CardTitle>Agent leaderboard</CardTitle>
@@ -220,7 +241,7 @@ export function AgentsPage() {
                 aria-pressed={metric === item.id}
                 size="sm"
                 variant={metric === item.id ? "secondary" : "ghost"}
-                onClick={() => setMetric(item.id)}
+                onClick={() => selectMetric(item.id)}
               >
                 {item.label}
               </Button>
@@ -235,97 +256,129 @@ export function AgentsPage() {
               ))}
             </div>
           ) : null}
-          <div className="grid gap-3 p-4 md:hidden">
-            {sortedAgents.map((agent, index) => (
-              <AgentCard
-                key={agent.agentId}
-                agent={agent}
-                rank={index + 1}
-                turnTarget={turnTarget(agent.agentId)}
-              />
-            ))}
-          </div>
-          <div className="hidden overflow-x-auto md:block">
-            <Table className="min-w-[1100px]">
-              <TableHeader className="bg-card sticky top-0 z-10">
-                <TableRow>
-                  <TableHead>#</TableHead>
-                  <TableHead>Agent</TableHead>
-                  <TableHead>Loại</TableHead>
-                  <TableHead>Model</TableHead>
-                  <TableHead>Token</TableHead>
-                  <TableHead>Cost</TableHead>
-                  <TableHead>Yêu cầu</TableHead>
-                  <TableHead>Cache rate</TableHead>
-                  <TableHead>Output</TableHead>
-                  <TableHead>Phiên</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {sortedAgents.map((agent, index) => (
-                  <TableRow key={agent.agentId}>
-                    <TableCell className="text-muted-foreground tabular-nums">
-                      {index + 1}
-                    </TableCell>
-                    <TableCell className="max-w-72">
-                      <Link
-                        aria-label={`Xem turns của ${agentLabel(agent)}`}
-                        className="focus-visible:ring-ring block rounded-sm outline-none focus-visible:ring-2"
-                        to={turnTarget(agent.agentId)}
-                      >
-                        <span className="block truncate font-medium">{agentLabel(agent)}</span>
-                        <span className="text-muted-foreground block truncate font-mono text-xs">
-                          {shortId(agent.agentId)} · depth {agent.depth}
-                        </span>
-                      </Link>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={agent.isSubagent ? "secondary" : "outline"}>
-                        {agent.isSubagent ? "Subagent" : "Main"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex max-w-52 flex-wrap gap-1">
-                        {agent.models.slice(0, 2).map((model) => (
-                          <Badge key={model} variant="outline">
-                            {model}
-                          </Badge>
-                        ))}
-                        {agent.models.length > 2 ? (
-                          <Badge variant="secondary">+{agent.models.length - 2}</Badge>
-                        ) : null}
-                      </div>
-                    </TableCell>
-                    <TableCell className="font-semibold tabular-nums">
-                      {formatTokens(agent.totalTokens)}
-                    </TableCell>
-                    <TableCell className="tabular-nums">
-                      {formatUsd(agent.estimatedCostUsd)}
-                    </TableCell>
-                    <TableCell className="tabular-nums">
-                      {formatTokens(agent.requestCount)}
-                    </TableCell>
-                    <TableCell>
-                      {formatPercent(safeRatio(agent.cachedInputTokens, agent.inputTokens) * 100)}
-                    </TableCell>
-                    <TableCell className="tabular-nums">
-                      {formatTokens(agent.outputTokens)}
-                    </TableCell>
-                    <TableCell className="tabular-nums">
-                      {formatTokens(agent.sessionCount)}
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {!agents.isLoading && sortedAgents.length === 0 ? (
+          {desktopLeaderboard ? (
+            <div className="overflow-x-auto" data-testid="agent-table">
+              <Table className="min-w-[1100px]">
+                <TableHeader className="bg-card sticky top-0 z-10">
                   <TableRow>
-                    <TableCell className="text-muted-foreground h-28 text-center" colSpan={10}>
-                      Không có agent khớp filter.
-                    </TableCell>
+                    <TableHead>#</TableHead>
+                    <TableHead>Agent</TableHead>
+                    <TableHead>Loại</TableHead>
+                    <TableHead>Model</TableHead>
+                    <TableHead>Token</TableHead>
+                    <TableHead>Cost</TableHead>
+                    <TableHead>Yêu cầu</TableHead>
+                    <TableHead>Cache rate</TableHead>
+                    <TableHead>Output</TableHead>
+                    <TableHead>Phiên</TableHead>
                   </TableRow>
-                ) : null}
-              </TableBody>
-            </Table>
-          </div>
+                </TableHeader>
+                <TableBody>
+                  {(agents.data?.agents ?? []).map((agent, index) => (
+                    <TableRow key={agent.agentId}>
+                      <TableCell className="text-muted-foreground tabular-nums">
+                        {(page - 1) * AGENT_PAGE_SIZE + index + 1}
+                      </TableCell>
+                      <TableCell className="max-w-72">
+                        <Link
+                          aria-label={`Xem turns của ${agentLabel(agent)}`}
+                          className="focus-visible:ring-ring block rounded-sm outline-none focus-visible:ring-2"
+                          to={turnTarget(agent.agentId)}
+                        >
+                          <span className="block truncate font-medium">{agentLabel(agent)}</span>
+                          <span className="text-muted-foreground block truncate font-mono text-xs">
+                            {shortId(agent.agentId)} · depth {agent.depth}
+                          </span>
+                        </Link>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={agent.isSubagent ? "secondary" : "outline"}>
+                          {agent.isSubagent ? "Subagent" : "Main"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex max-w-52 flex-wrap gap-1">
+                          {agent.topModels.map((model) => (
+                            <Badge key={model} variant="outline">
+                              {model}
+                            </Badge>
+                          ))}
+                          {agent.modelCount > agent.topModels.length ? (
+                            <Badge variant="secondary">
+                              +{agent.modelCount - agent.topModels.length}
+                            </Badge>
+                          ) : null}
+                        </div>
+                      </TableCell>
+                      <TableCell className="font-semibold tabular-nums">
+                        {formatTokens(agent.totalTokens)}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatUsd(agent.estimatedCostUsd)}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatTokens(agent.requestCount)}
+                      </TableCell>
+                      <TableCell>
+                        {formatPercent(safeRatio(agent.cachedInputTokens, agent.inputTokens) * 100)}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatTokens(agent.outputTokens)}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatTokens(agent.sessionCount)}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {!agents.isLoading && agents.data?.agents.length === 0 ? (
+                    <TableRow>
+                      <TableCell className="text-muted-foreground h-28 text-center" colSpan={10}>
+                        Không có agent khớp filter.
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </TableBody>
+              </Table>
+            </div>
+          ) : (
+            <div className="grid gap-3 p-4" data-testid="agent-cards">
+              {(agents.data?.agents ?? []).map((agent, index) => (
+                <AgentCard
+                  key={agent.agentId}
+                  agent={agent}
+                  rank={(page - 1) * AGENT_PAGE_SIZE + index + 1}
+                  turnTarget={turnTarget(agent.agentId)}
+                />
+              ))}
+            </div>
+          )}
+          {agents.data && agents.data.total > AGENT_PAGE_SIZE ? (
+            <div className="flex items-center justify-between gap-3 border-t p-4">
+              <p className="text-muted-foreground text-sm">
+                Trang {page} / {pageCount} · {formatTokens(agents.data.total)} agent
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  aria-label="Trang agent trước"
+                  disabled={page <= 1 || agents.isFetching}
+                  size="sm"
+                  variant="outline"
+                  onClick={() => selectPage(page - 1)}
+                >
+                  Trước
+                </Button>
+                <Button
+                  aria-label="Trang agent tiếp theo"
+                  disabled={page >= pageCount || agents.isFetching}
+                  size="sm"
+                  variant="outline"
+                  onClick={() => selectPage(page + 1)}
+                >
+                  Sau
+                </Button>
+              </div>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -342,166 +395,12 @@ const leaderboardMetrics: { id: LeaderboardMetric; label: string }[] = [
   { id: "output", label: "Output" },
 ];
 
-function AgentDonut({
-  main,
-  subagent,
-}: {
-  main: DashboardKpis | undefined;
-  subagent: DashboardKpis | undefined;
-}) {
-  const data = [
-    { name: "Main agent", value: main?.totalTokens ?? 0, cost: main?.estimatedCostUsd ?? 0 },
-    { name: "Subagent", value: subagent?.totalTokens ?? 0, cost: subagent?.estimatedCostUsd ?? 0 },
-  ];
-  const total = data.reduce((sum, item) => sum + item.value, 0);
-  if (total === 0) return <EmptyChart />;
-  return (
-    <div className="grid items-center gap-3 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
-      <ChartContainer
-        className="mx-auto h-56 w-full"
-        config={trendConfig}
-        role="img"
-        aria-label="Biểu đồ tỷ trọng token main agent và subagent"
-      >
-        <PieChart>
-          <Pie
-            data={data}
-            dataKey="value"
-            innerRadius={58}
-            nameKey="name"
-            outerRadius={88}
-            paddingAngle={2}
-          >
-            {data.map((item, index) => (
-              <Cell key={item.name} fill={index === 0 ? "var(--chart-1)" : "var(--chart-4)"} />
-            ))}
-          </Pie>
-          <Tooltip formatter={(value) => formatTokens(Number(value))} />
-        </PieChart>
-      </ChartContainer>
-      <div className="space-y-3">
-        {data.map((item, index) => (
-          <div key={item.name} className="flex items-center justify-between gap-4 text-sm">
-            <span className="flex items-center gap-2">
-              <span
-                className="size-2.5 rounded-full"
-                style={{ backgroundColor: index === 0 ? "var(--chart-1)" : "var(--chart-4)" }}
-              />
-              {item.name}
-            </span>
-            <span className="text-right">
-              <strong className="block">{formatPercent(safeRatio(item.value, total) * 100)}</strong>
-              <span className="text-muted-foreground text-xs">
-                {compactTokens(item.value)} · {formatUsd(item.cost)}
-              </span>
-            </span>
-          </div>
-        ))}
-      </div>
-      <table className="sr-only">
-        <caption>Phân bổ token theo loại agent</caption>
-        <tbody>
-          {data.map((item) => (
-            <tr key={item.name}>
-              <th>{item.name}</th>
-              <td>{item.value}</td>
-              <td>{item.cost}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function AgentTrend({
-  data: source,
-  metric,
-}: {
-  data: AgentsResponse["daily"];
-  metric: TrendMetric;
-}) {
-  const data = source.map((item) => ({
-    date: item.date,
-    main: metric === "tokens" ? item.main.totalTokens : item.main.estimatedCostUsd,
-    subagent: metric === "tokens" ? item.subagent.totalTokens : item.subagent.estimatedCostUsd,
-  }));
-  if (data.length === 0) return <EmptyChart />;
-  return (
-    <>
-      <ChartContainer
-        config={trendConfig}
-        role="img"
-        aria-label={`Xu hướng ${metric === "tokens" ? "token" : "cost"} main agent và subagent`}
-      >
-        <LineChart data={data} margin={{ left: 5, right: 5, top: 8 }}>
-          <CartesianGrid strokeDasharray="3 3" vertical={false} />
-          <XAxis
-            dataKey="date"
-            tickFormatter={(value: string) => value.slice(5)}
-            tickLine={false}
-            axisLine={false}
-          />
-          <YAxis
-            tickFormatter={
-              metric === "tokens" ? compactTokens : (value: number) => `$${value.toFixed(0)}`
-            }
-            tickLine={false}
-            axisLine={false}
-            width={48}
-          />
-          <Tooltip
-            formatter={(value) =>
-              metric === "tokens" ? formatTokens(Number(value)) : formatUsd(Number(value))
-            }
-          />
-          <Line
-            dataKey="main"
-            dot={false}
-            name="Main agent"
-            stroke="var(--chart-1)"
-            strokeWidth={2}
-            type="monotone"
-          />
-          <Line
-            dataKey="subagent"
-            dot={false}
-            name="Subagent"
-            stroke="var(--chart-4)"
-            strokeWidth={2}
-            type="monotone"
-          />
-        </LineChart>
-      </ChartContainer>
-      <table className="sr-only">
-        <caption>Xu hướng agent theo ngày</caption>
-        <thead>
-          <tr>
-            <th>Ngày</th>
-            <th>Main</th>
-            <th>Subagent</th>
-          </tr>
-        </thead>
-        <tbody>
-          {data.map((item) => (
-            <tr key={item.date}>
-              <td>{item.date}</td>
-              <td>{item.main}</td>
-              <td>{item.subagent}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </>
-  );
-}
-
 function AgentCard({
   agent,
   rank,
   turnTarget,
 }: {
-  agent: AgentUsageSummary;
+  agent: AgentLeaderboardItem;
   rank: number;
   turnTarget: { pathname: string; search: string };
 }) {
@@ -544,13 +443,6 @@ function Stat({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
-function EmptyChart() {
-  return (
-    <div className="text-muted-foreground flex h-64 items-center justify-center rounded-lg border border-dashed text-sm">
-      <Sparkles className="mr-2 size-4" /> Chưa có dữ liệu.
-    </div>
-  );
-}
 function ErrorCard({ message }: { message: string }) {
   return (
     <Card className="border-destructive">
@@ -558,7 +450,7 @@ function ErrorCard({ message }: { message: string }) {
     </Card>
   );
 }
-function agentLabel(agent: AgentUsageSummary) {
+function agentLabel(agent: AgentLeaderboardItem) {
   return agent.name ?? agent.role ?? (agent.isSubagent ? "Subagent chưa đặt tên" : "Main agent");
 }
 function shortId(value: string) {
@@ -567,17 +459,16 @@ function shortId(value: string) {
 function safeRatio(value: number, total: number) {
   return total > 0 ? value / total : 0;
 }
-function metricValue(agent: AgentUsageSummary, metric: LeaderboardMetric) {
-  switch (metric) {
-    case "cache":
-      return safeRatio(agent.cachedInputTokens, agent.inputTokens);
-    case "cost":
-      return agent.estimatedCostUsd;
-    case "output":
-      return agent.outputTokens;
-    case "requests":
-      return agent.requestCount;
-    case "tokens":
-      return agent.totalTokens;
-  }
+function parseLeaderboardMetric(value: string | null): LeaderboardMetric {
+  return value === "cache" ||
+    value === "cost" ||
+    value === "output" ||
+    value === "requests" ||
+    value === "tokens"
+    ? value
+    : "tokens";
+}
+function positiveInteger(value: string | null): number | null {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }

@@ -1,32 +1,24 @@
-import type {
-  TurnComparisonResponse,
-  TurnDetailResponse,
-  TurnFilters,
-  TurnsResponse,
-} from "@/shared/types";
+import type { TurnFilters, TurnQuery } from "@/shared/types";
 import { filtersFromSearch, updateFilterSearch } from "@/web/lib/product-api";
+import { apiClient, rpcJson, rpcOptions, toDashboardQuery } from "@/web/lib/rpc-client";
 
-async function request<T>(path: string): Promise<T> {
-  const response = await fetch(path, { headers: { "content-type": "application/json" } });
-  if (!response.ok) {
-    const body: unknown = await response.json().catch(() => null);
-    const message = isErrorPayload(body) ? body.error : null;
-    throw new Error(typeof message === "string" ? message : `Request failed (${response.status})`);
-  }
-  return response.json() as Promise<T>;
+export function fetchTurns(filters: TurnFilters, signal?: AbortSignal) {
+  return rpcJson(apiClient.api.turns.$get({ query: turnQuery(filters) }, rpcOptions(signal)));
 }
 
-export function fetchTurns(filters: TurnFilters) {
-  return request<TurnsResponse>(`/api/turns?${turnQuery(filters)}`);
+export function fetchTurnDetail(turnKey: string, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.turns[":turnKey"].$get(
+      { param: { turnKey: encodeURIComponent(turnKey) } },
+      rpcOptions(signal),
+    ),
+  );
 }
 
-export function fetchTurnDetail(turnKey: string) {
-  return request<TurnDetailResponse>(`/api/turns/${encodeURIComponent(turnKey)}`);
-}
-
-export function fetchTurnComparison(ids: string[]) {
-  const values = new URLSearchParams({ ids: ids.join(",") });
-  return request<TurnComparisonResponse>(`/api/turns/compare?${values.toString()}`);
+export function fetchTurnComparison(ids: string[], signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.turns.compare.$get({ query: { ids: ids.join(",") } }, rpcOptions(signal)),
+  );
 }
 
 export function turnFiltersFromSearch(search: URLSearchParams): TurnFilters {
@@ -82,8 +74,20 @@ export function updateTurnSearch(current: URLSearchParams, filters: TurnFilters)
   return next;
 }
 
-function turnQuery(filters: TurnFilters): string {
-  return updateTurnSearch(new URLSearchParams(), filters).toString();
+function turnQuery(filters: TurnFilters): TurnQuery {
+  return {
+    ...toDashboardQuery(filters),
+    ...(filters.agentId ? { agent: filters.agentId } : {}),
+    ...(filters.effort ? { effort: filters.effort } : {}),
+    order: filters.order ?? "desc",
+    page: String(filters.page ?? 1),
+    pageSize: String(filters.pageSize ?? 25),
+    ...(filters.pressure ? { pressure: filters.pressure } : {}),
+    ...(filters.query ? { q: filters.query } : {}),
+    ...(filters.sessionId ? { session: filters.sessionId } : {}),
+    sort: filters.sort ?? "lastActivity",
+    ...(filters.status ? { status: filters.status } : {}),
+  };
 }
 
 function setOptional(values: URLSearchParams, key: string, value: string | undefined) {
@@ -104,8 +108,4 @@ function turnSort(value: string | null): NonNullable<TurnFilters["sort"]> {
     value === "ttft"
     ? value
     : "lastActivity";
-}
-
-function isErrorPayload(value: unknown): value is { error: unknown } {
-  return typeof value === "object" && value !== null && "error" in value;
 }

@@ -55,6 +55,8 @@ test("hiển thị card mobile và không có lỗi accessibility", async ({ pag
 
   await expect(page.getByRole("heading", { level: 1, name: "Turns" })).toBeVisible();
   await expect(page.getByRole("region", { name: "Danh sách turns" })).toHaveCount(0);
+  await expect(page.getByTestId("turn-table")).toHaveCount(0);
+  await expect(page.getByTestId("turn-cards")).toHaveCount(1);
   await expect(
     page.locator("article").filter({ hasText: "E2E dashboard task" }).first(),
   ).toBeVisible();
@@ -93,8 +95,7 @@ test("dark mode reveal lan tròn và tôn trọng reduced motion", async ({ page
   });
   await page.goto("/");
 
-  await page.getByRole("combobox", { name: "Giao diện" }).click();
-  await page.getByRole("option", { name: "Tối" }).click();
+  await page.getByRole("combobox", { name: "Giao diện" }).selectOption("dark");
   await expect(page.locator("html")).toHaveClass(/dark/);
   await expect
     .poll(() =>
@@ -128,8 +129,7 @@ test("dark mode reveal lan tròn và tôn trọng reduced motion", async ({ page
     });
 
   await page.emulateMedia({ reducedMotion: "reduce" });
-  await page.getByRole("combobox", { name: "Giao diện" }).click();
-  await page.getByRole("option", { name: "Sáng" }).click();
+  await page.getByRole("combobox", { name: "Giao diện" }).selectOption("light");
   await expect(page.locator("html")).not.toHaveClass(/dark/);
   await expect
     .poll(() =>
@@ -172,4 +172,23 @@ test("favicon và manifest production được phục vụ đầy đủ", async 
     ]),
   );
   expect(await page.locator('link[rel="manifest"]').getAttribute("href")).toBe("/site.webmanifest");
+
+  const index = await page.request.get("/");
+  expect(index.headers()["cache-control"]).toBe("no-cache");
+  expect(index.headers()["etag"]).toBeTruthy();
+  const deepLink = await page.request.get("/activity");
+  expect(deepLink.headers()["cache-control"]).toBe("no-cache");
+  const conditional = await page.request.get("/", {
+    headers: { "if-none-match": index.headers()["etag"] ?? "" },
+  });
+  expect(conditional.status()).toBe(304);
+  const manifestResponse = await page.request.get("/site.webmanifest");
+  expect(manifestResponse.headers()["cache-control"]).toBe("public, max-age=86400");
+  const assetPath = await page.locator('script[type="module"]').getAttribute("src");
+  expect(assetPath).toBeTruthy();
+  if (!assetPath) throw new Error("Missing production entry asset");
+  expect((await page.request.get(assetPath)).headers()["cache-control"]).toBe(
+    "public, max-age=31536000, immutable",
+  );
+  expect((await page.request.get("/api/status")).headers()["cache-control"]).toBe("no-store");
 });

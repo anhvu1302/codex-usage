@@ -1,0 +1,1 @@
+CREATE INDEX `activity_events_timestamp_id_index` ON `activity_events` (`timestamp`,`id`);

@@ -3,6 +3,23 @@ import { expect, test } from "@playwright/test";
 
 import type { DataHealthResponse } from "../src/shared/types";
 
+test("timeline và data health không tải chart graph", async ({ page }) => {
+  const scripts: string[] = [];
+  page.on("request", (request) => {
+    if (request.resourceType() === "script") scripts.push(new URL(request.url()).pathname);
+  });
+
+  await page.goto("/activity?from=2026-07-12&to=2026-07-12&tab=health");
+  await expect(page.getByRole("heading", { name: "Trung tâm sức khoẻ dữ liệu" })).toBeVisible();
+  expect(scripts.some((path) => /charts-.+\.js$/.test(path))).toBe(false);
+  expect(scripts.some((path) => path.includes("activity-trend-chart"))).toBe(false);
+
+  await page.getByRole("tab", { name: "Timeline" }).click();
+  await expect(page.getByRole("heading", { name: /Session timeline/ })).toBeVisible();
+  expect(scripts.some((path) => /charts-.+\.js$/.test(path))).toBe(false);
+  expect(scripts.some((path) => path.includes("activity-trend-chart"))).toBe(false);
+});
+
 test("filter hoạt động, agent timeline và sức khỏe dữ liệu", async ({ page }) => {
   await page.goto("/activity?from=2026-07-12&to=2026-07-12");
 
@@ -31,6 +48,7 @@ test("filter hoạt động, agent timeline và sức khỏe dữ liệu", async
   await expect(page.getByRole("button", { name: "Sync ngay" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Kiểm chứng sâu" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Compact ngay" })).toBeVisible();
+  await expect(page.getByText("Đang nhận cập nhật trực tiếp.")).toBeVisible();
 
   await page.goBack();
   await expect(page).toHaveURL(/tab=timeline/);
@@ -47,6 +65,7 @@ test("filter hoạt động, agent timeline và sức khỏe dữ liệu", async
 });
 
 test("kiểm chứng sâu có dialog bàn phím, polling tiến độ và phục hồi lỗi", async ({ page }) => {
+  await page.route("**/api/events", (route) => route.abort());
   const baselineResponse = await page.request.get("/api/data-health");
   expect(baselineResponse.ok()).toBe(true);
   const baseline = (await baselineResponse.json()) as DataHealthResponse;
@@ -126,7 +145,9 @@ test("kiểm chứng sâu có dialog bàn phím, polling tiến độ và phục
   await confirm.focus();
   await page.keyboard.press("Enter");
   await expect(page.getByText("Đang chờ kiểm chứng sâu", { exact: true }).first()).toBeVisible();
-  await expect(page.getByText(/Kiểm chứng sâu · đang đọc JSONL/)).toBeVisible({ timeout: 4_000 });
+  await page.waitForTimeout(2_500);
+  expect(deepPolls).toBe(0);
+  await expect(page.getByText(/Kiểm chứng sâu · đang đọc JSONL/)).toBeVisible({ timeout: 12_000 });
   await expect(page.getByText("Deep · 4.0 giây", { exact: true })).toBeVisible({ timeout: 5_000 });
 
   const accessibility = await new AxeBuilder({ page }).analyze();

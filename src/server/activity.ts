@@ -1,4 +1,6 @@
-import { and, desc, eq, gte, inArray, isNull, lte, sql, type SQL } from "drizzle-orm";
+import { createHash } from "node:crypto";
+
+import { and, desc, eq, gte, inArray, isNull, lt, lte, or, sql, type SQL } from "drizzle-orm";
 
 import type { AppDatabase } from "@/server/db/client";
 import {
@@ -17,14 +19,38 @@ import type {
   ActivityFilters,
   ActivityKind,
   ActivityResponse,
+  ActivitySummaryResponse,
   ActivitySummary,
+  ActivityTimelineResponse,
   ActivityTimelineItem,
   DataHealthResponse,
 } from "@/shared/types";
 
 const ACTIVITY_TIMELINE_LIMIT = 2_000;
+const ACTIVITY_PAGE_LIMIT = 200;
+
+export class InvalidActivityCursorError extends Error {
+  constructor() {
+    super("Invalid activity timeline cursor");
+    this.name = "InvalidActivityCursorError";
+  }
+}
 
 export function getActivity(database: AppDatabase, filters: ActivityFilters): ActivityResponse {
+  const summary = getActivitySummary(database, filters);
+  const timeline = readActivityTimeline(database, filters, ACTIVITY_TIMELINE_LIMIT, null);
+  return {
+    daily: summary.daily,
+    timeline: timeline.items,
+    timelineCoverage: summary.timelineCoverage,
+    timelineTruncated: timeline.hasMore,
+  };
+}
+
+export function getActivitySummary(
+  database: AppDatabase,
+  filters: ActivityFilters,
+): ActivitySummaryResponse {
   const rawConditions = activityConditions(activityEvents, filters);
   if (filters.sessionId) rawConditions.push(eq(activityEvents.sessionId, filters.sessionId));
 
@@ -60,7 +86,49 @@ export function getActivity(database: AppDatabase, filters: ActivityFilters): Ac
         .where(and(...activityConditions(activityDailyRollups, filters)))
         .all();
 
-  const timelineRows = database
+  const total = database
+    .select({ count: sql<number>`count(*)` })
+    .from(activityEvents)
+    .where(and(...rawConditions))
+    .get();
+
+  return {
+    daily: mergeDailyActivity([...archivedDaily, ...rawDaily]),
+    timelineCoverage: activityTimelineCoverage(filters),
+    timelineTotal: toNumber(total?.count),
+  };
+}
+
+export function getActivityTimeline(
+  database: AppDatabase,
+  filters: ActivityFilters,
+  options: { cursor?: string | undefined; limit?: number | undefined } = {},
+): ActivityTimelineResponse {
+  const limit = options.limit ?? ACTIVITY_PAGE_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > ACTIVITY_PAGE_LIMIT) {
+    throw new RangeError("Activity timeline limit must be between 1 and 200");
+  }
+  const cursor = options.cursor ? decodeActivityCursor(options.cursor, filters) : null;
+  return readActivityTimeline(database, filters, limit, cursor);
+}
+
+function readActivityTimeline(
+  database: AppDatabase,
+  filters: ActivityFilters,
+  limit: number,
+  cursor: ActivityCursor | null,
+): ActivityTimelineResponse {
+  const conditions = activityConditions(activityEvents, filters);
+  if (filters.sessionId) conditions.push(eq(activityEvents.sessionId, filters.sessionId));
+  if (cursor) {
+    conditions.push(
+      or(
+        lt(activityEvents.timestamp, cursor.timestamp),
+        and(eq(activityEvents.timestamp, cursor.timestamp), lt(activityEvents.id, cursor.id)),
+      )!,
+    );
+  }
+  const rows = database
     .select({
       agentId: activityEvents.agentId,
       agentKind: activityEvents.agentKind,
@@ -77,18 +145,78 @@ export function getActivity(database: AppDatabase, filters: ActivityFilters): Ac
     })
     .from(activityEvents)
     .leftJoin(sessionAgents, eq(sessionAgents.id, activityEvents.agentId))
-    .where(and(...rawConditions))
-    .orderBy(desc(activityEvents.timestamp))
-    .limit(ACTIVITY_TIMELINE_LIMIT + 1)
+    .where(and(...conditions))
+    .orderBy(desc(activityEvents.timestamp), desc(activityEvents.id))
+    .limit(limit + 1)
     .all();
-  const timeline = timelineRows.slice(0, ACTIVITY_TIMELINE_LIMIT).map(toTimelineItem);
-
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit).map(toTimelineItem);
+  const last = items.at(-1);
   return {
-    daily: mergeDailyActivity([...archivedDaily, ...rawDaily]),
-    timeline,
-    timelineCoverage: activityTimelineCoverage(filters),
-    timelineTruncated: timelineRows.length > ACTIVITY_TIMELINE_LIMIT,
+    hasMore,
+    items,
+    nextCursor:
+      hasMore && last
+        ? encodeActivityCursor({ id: last.id, timestamp: last.timestamp }, filters)
+        : null,
   };
+}
+
+type ActivityCursor = { id: string; timestamp: string };
+
+function encodeActivityCursor(cursor: ActivityCursor, filters: ActivityFilters): string {
+  return Buffer.from(
+    JSON.stringify({
+      f: activityFilterFingerprint(filters),
+      i: cursor.id,
+      t: cursor.timestamp,
+      v: 1,
+    }),
+  ).toString("base64url");
+}
+
+function decodeActivityCursor(value: string, filters: ActivityFilters): ActivityCursor {
+  if (value.length > 2_048 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new InvalidActivityCursorError();
+  }
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !("v" in parsed) ||
+      parsed.v !== 1 ||
+      !("f" in parsed) ||
+      parsed.f !== activityFilterFingerprint(filters) ||
+      !("i" in parsed) ||
+      typeof parsed.i !== "string" ||
+      parsed.i.length === 0 ||
+      !("t" in parsed) ||
+      typeof parsed.t !== "string" ||
+      parsed.t.length === 0
+    ) {
+      throw new InvalidActivityCursorError();
+    }
+    return { id: parsed.i, timestamp: parsed.t };
+  } catch (error) {
+    if (error instanceof InvalidActivityCursorError) throw error;
+    throw new InvalidActivityCursorError();
+  }
+}
+
+function activityFilterFingerprint(filters: ActivityFilters): string {
+  const canonical = JSON.stringify({
+    agentKind: filters.agentKind ?? "all",
+    from: filters.from,
+    kinds: [...(filters.kinds ?? [])].sort(),
+    models: [
+      ...new Set(filters.models?.length ? filters.models : filters.model ? [filters.model] : []),
+    ].sort(),
+    projectId: filters.projectId ?? null,
+    sessionId: filters.sessionId ?? null,
+    to: filters.to,
+  });
+  return createHash("sha256").update(canonical).digest("base64url");
 }
 
 export async function getDataHealth(

@@ -42,18 +42,37 @@ import {
   syncActivitySources,
 } from "@/web/lib/activity-api";
 import { formatTokens } from "@/web/lib/product-api";
+import {
+  IMPORT_MUTATION_SCOPES,
+  queueLiveMutationScopes,
+  useLiveEventsConnectionState,
+} from "@/web/lib/live-events";
 import { cn } from "@/web/lib/utils";
 import type { DataHealthResponse } from "@/shared/types";
 
+const DATE_FORMATTER = new Intl.DateTimeFormat("vi-VN", {
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+});
+const DATE_TIME_FORMATTER = new Intl.DateTimeFormat("vi-VN", {
+  dateStyle: "medium",
+  timeStyle: "short",
+  timeZone: "Asia/Ho_Chi_Minh",
+});
+
 export function DataHealthCenter({ className }: { className?: string }) {
+  const liveEventsConnectionState = useLiveEventsConnectionState();
+  const liveEventsFallbackActive = liveEventsConnectionState === "degraded";
   const [deepDialogOpen, setDeepDialogOpen] = useState(false);
   const queryClient = useQueryClient();
   const health = useQuery({
     queryKey: ["data-health"],
-    queryFn: fetchDataHealth,
+    queryFn: ({ signal }) => fetchDataHealth(signal),
     refetchInterval: (query) => {
+      if (!liveEventsFallbackActive) return false;
       const scan = query.state.data?.sourceScan;
-      return scan?.deepQueued || scan?.current?.mode === "deep" ? 2_000 : 30_000;
+      return scan?.deepQueued || scan?.current ? 2_000 : 30_000;
     },
   });
   const deepVerify = useMutation({
@@ -62,7 +81,15 @@ export function DataHealthCenter({ className }: { className?: string }) {
     onSuccess: () => {
       setDeepDialogOpen(false);
       toast.success("Đã xếp hàng kiểm chứng sâu. Tiến độ sẽ tự động cập nhật.");
-      void invalidateHealth(queryClient);
+      queryClient.setQueryData<DataHealthResponse>(["data-health"], (current) =>
+        current
+          ? {
+              ...current,
+              sourceScan: { ...current.sourceScan, deepQueued: true },
+            }
+          : current,
+      );
+      queueLiveMutationScopes(queryClient, ["data-health"]);
     },
   });
   const sync = useMutation({
@@ -72,7 +99,8 @@ export function DataHealthCenter({ className }: { className?: string }) {
       toast.success(
         `Đã sync ${formatTokens(result.filesProcessed)} file, thêm ${formatTokens(result.recordsInserted)} usage event.`,
       );
-      void invalidateHealth(queryClient);
+      queryClient.setQueryData(["status"], result);
+      queueLiveMutationScopes(queryClient, IMPORT_MUTATION_SCOPES);
     },
   });
   const compact = useMutation({
@@ -82,7 +110,17 @@ export function DataHealthCenter({ className }: { className?: string }) {
       toast.success(
         `Đã compact ${formatTokens(result.lastRawEventsDeleted)} raw event và ghi ${formatTokens(result.lastRollupRowsWritten)} rollup.`,
       );
-      void invalidateHealth(queryClient);
+      queryClient.setQueryData(["storage"], result);
+      const changed =
+        result.lastHourlyRowsDeleted > 0 ||
+        result.lastRawEventsDeleted > 0 ||
+        result.lastRollupRowsWritten > 0;
+      queueLiveMutationScopes(
+        queryClient,
+        changed
+          ? ["activity", "dashboard", "data-health", "sessions", "storage", "turns"]
+          : ["data-health", "storage"],
+      );
     },
   });
 
@@ -122,7 +160,11 @@ export function DataHealthCenter({ className }: { className?: string }) {
             </Badge>
           </div>
           <p className="text-muted-foreground mt-1 text-sm">
-            Chẩn đoán được cập nhật tự động mỗi {deepBusy ? "2" : "30"} giây.
+            {liveEventsConnectionState === "connected"
+              ? "Đang nhận cập nhật trực tiếp."
+              : liveEventsFallbackActive
+                ? `Chẩn đoán được cập nhật tự động mỗi ${deepBusy ? "2" : "30"} giây.`
+                : "Đang kết nối lại luồng cập nhật trực tiếp."}
           </p>
         </div>
         <div className="flex flex-wrap gap-2" aria-live="polite">
@@ -536,20 +578,12 @@ function countIssues(data: DataHealthResponse): number {
 }
 
 function formatDate(value: string): string {
-  return new Intl.DateTimeFormat("vi-VN", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-  }).format(new Date(`${value}T12:00:00`));
+  return DATE_FORMATTER.format(new Date(`${value}T12:00:00`));
 }
 
 function formatDateTime(value: string | null): string {
   if (!value) return "Chưa chạy";
-  return new Intl.DateTimeFormat("vi-VN", {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone: "Asia/Ho_Chi_Minh",
-  }).format(new Date(value));
+  return DATE_TIME_FORMATTER.format(new Date(value));
 }
 
 function formatScanPhase(phase: NonNullable<DataHealthResponse["sourceScan"]["current"]>["phase"]) {
@@ -577,14 +611,4 @@ function formatBytes(bytes: number): string {
     unit = candidate;
   }
   return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${unit}`;
-}
-
-async function invalidateHealth(queryClient: ReturnType<typeof useQueryClient>) {
-  await Promise.all([
-    queryClient.invalidateQueries({ queryKey: ["activity"] }),
-    queryClient.invalidateQueries({ queryKey: ["data-health"] }),
-    queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
-    queryClient.invalidateQueries({ queryKey: ["status"] }),
-    queryClient.invalidateQueries({ queryKey: ["storage"] }),
-  ]);
 }

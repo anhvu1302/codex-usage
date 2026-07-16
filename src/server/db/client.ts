@@ -9,9 +9,12 @@ import * as schema from "@/server/db/schema";
 
 export type AppDatabase = ReturnType<typeof createDatabase>;
 
-export function createDatabase(filePath: string) {
+export function createDatabase(
+  filePath: string,
+  options: { onStatement?: (statement: unknown) => void } = {},
+) {
   mkdirSync(dirname(filePath), { recursive: true });
-  const client = new BetterSqlite3(filePath);
+  const client = new BetterSqlite3(filePath, { verbose: options.onStatement });
   client.pragma("journal_mode = WAL");
   client.pragma("foreign_keys = ON");
   client.pragma("busy_timeout = 5000");

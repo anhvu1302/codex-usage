@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, lte, sql } from "drizzle-orm";
 
 import type { AppDatabase } from "@/server/db/client";
 import {
@@ -21,8 +21,18 @@ import type {
   ModelRate,
   SessionAgentUsage,
   SessionFilters,
+  SessionSummariesResponse,
+  SessionSummary,
+  SessionUsage,
   SessionsResponse,
 } from "@/shared/types";
+
+export type SessionAnomalyRow = {
+  estimatedCostUsd: number;
+  sessionId: string;
+  title: string | null;
+  totalTokens: number;
+};
 
 export function getDashboard(
   database: AppDatabase,
@@ -147,11 +157,104 @@ export function getSessions(
   filters: SessionFilters,
   now = new Date(),
 ): SessionsResponse {
+  const result = readSessionPage(database, filters, now);
+  const agentsBySession = new Map<string, SessionAgentUsage[]>();
+  for (const agent of getSessionAgents(
+    database,
+    result.effectiveFilters,
+    result.rows.map((row) => row.sessionId),
+  )) {
+    const agents = agentsBySession.get(agent.sessionId) ?? [];
+    agents.push(agent);
+    agentsBySession.set(agent.sessionId, agents);
+  }
+  return {
+    coverage: result.coverage,
+    page: result.page,
+    pageSize: result.pageSize,
+    sessions: result.rows.map((row) => ({
+      ...toSessionUsage(row),
+      agents: agentsBySession.get(row.sessionId) ?? [],
+    })),
+    total: result.total,
+  };
+}
+
+export function getSessionSummaries(
+  database: AppDatabase,
+  filters: SessionFilters,
+  now = new Date(),
+): SessionSummariesResponse {
+  const result = readSessionPage(database, filters, now);
+  const names = getSubagentNames(
+    database,
+    result.rows.map((row) => row.sessionId),
+  );
+  return {
+    coverage: result.coverage,
+    page: result.page,
+    pageSize: result.pageSize,
+    sessions: result.rows.map<SessionSummary>((row) => ({
+      ...toSessionUsage(row),
+      agentCount: toNumber(row.agentCount),
+      subagentCount: toNumber(row.subagentCount),
+      subagentNames: names.get(row.sessionId) ?? [],
+    })),
+    total: result.total,
+  };
+}
+
+export function getSessionDetail(
+  database: AppDatabase,
+  sessionId: string,
+  filters: DashboardFilters,
+  now = new Date(),
+): SessionUsage | null {
+  const result = readSessionPage(database, { ...filters, page: 1, pageSize: 1 }, now, sessionId);
+  const row = result.rows[0];
+  if (!row) return null;
+  const agents = getSessionAgents(database, result.effectiveFilters, [sessionId]).map(
+    ({ sessionId: importedSessionId, ...agent }) => {
+      void importedSessionId;
+      return agent;
+    },
+  );
+  return { ...toSessionUsage(row), agents };
+}
+
+export function getSessionAnomalyRows(
+  database: AppDatabase,
+  filters: DashboardFilters,
+  now = new Date(),
+): SessionAnomalyRow[] {
+  const scope = buildRawSessionScope(filters, now);
+  if (!scope) return [];
+  return database.$client
+    .prepare(
+      `select
+        e.session_id as sessionId,
+        s.title as title,
+        coalesce(sum(e.total_tokens), 0) as totalTokens,
+        coalesce(sum(e.cost_usd), 0) as estimatedCostUsd
+      from usage_events e
+      join sessions s on s.id = e.session_id
+      where ${scope.usageConditions.join(" and ")}
+      group by e.session_id, s.title
+      order by max(e.timestamp) desc, e.session_id desc`,
+    )
+    .all(...scope.parameters) as SessionAnomalyRow[];
+}
+
+export function getTopSessionsByProject(
+  database: AppDatabase,
+  filters: DashboardFilters,
+  limit = 5,
+  now = new Date(),
+): Map<string, SessionUsage[]> {
+  const result = new Map<string, SessionUsage[]>();
   const coverage = getSessionCoverage(filters, now);
-  const page = filters.page ?? 1;
-  const pageSize = filters.pageSize ?? 25;
-  if (!coverage.from || !coverage.to) return { coverage, page, pageSize, sessions: [], total: 0 };
-  const effectiveFilters = {
+  if (!coverage.from || !coverage.to || limit < 1) return result;
+  const effectiveFilters: DashboardFilters = {
     ...(filters.agentKind ? { agentKind: filters.agentKind } : {}),
     from: coverage.from,
     ...(filters.model ? { model: filters.model } : {}),
@@ -159,90 +262,321 @@ export function getSessions(
     ...(filters.projectId ? { projectId: filters.projectId } : {}),
     to: coverage.to,
   };
-  const where = usageWhere(effectiveFilters);
-  const rows = database
-    .select({
-      cwd: sessions.cwd,
-      firstEventAt: sql<string>`min(${usageEvents.timestamp})`,
-      lastEventAt: sql<string>`max(${usageEvents.timestamp})`,
-      models: sql<string>`group_concat(distinct ${usageEvents.model})`,
-      projectId: sessions.projectId,
-      sessionId: usageEvents.sessionId,
-      sourceDeleted: sessions.sourceDeleted,
-      title: sessions.title,
-      ...aggregateFields,
-    })
-    .from(usageEvents)
-    .leftJoin(sessions, eq(usageEvents.sessionId, sessions.id))
-    .where(where)
-    .groupBy(
-      usageEvents.sessionId,
-      sessions.cwd,
-      sessions.projectId,
-      sessions.sourceDeleted,
-      sessions.title,
+  const conditions = ["e.local_date >= ?", "e.local_date <= ?", "s.project_id is not null"];
+  const parameters: (number | string)[] = [coverage.from, coverage.to];
+  const models = selectedModels(effectiveFilters);
+  if (models.length > 0) {
+    conditions.push(`e.model in (${models.map(() => "?").join(", ")})`);
+    parameters.push(...models);
+  }
+  if (effectiveFilters.agentKind && effectiveFilters.agentKind !== "all") {
+    conditions.push(
+      `exists (
+        select 1 from session_agents agent_filter
+        where agent_filter.id = e.agent_id
+          and agent_filter.thread_source ${effectiveFilters.agentKind === "subagent" ? "=" : "!="} 'subagent'
+      )`,
+    );
+  }
+  if (effectiveFilters.projectId) {
+    conditions.push("s.project_id = ?");
+    parameters.push(effectiveFilters.projectId);
+  }
+
+  const rows = database.$client
+    .prepare(
+      `with aggregated as (
+        select
+          e.session_id as sessionId,
+          s.project_id as projectId,
+          min(e.timestamp) as firstEventAt,
+          max(e.timestamp) as lastEventAt,
+          group_concat(distinct e.model) as models,
+          coalesce(sum(e.input_tokens), 0) as inputTokens,
+          coalesce(sum(e.cached_input_tokens), 0) as cachedInputTokens,
+          coalesce(sum(e.output_tokens), 0) as outputTokens,
+          coalesce(sum(e.reasoning_output_tokens), 0) as reasoningOutputTokens,
+          coalesce(sum(e.total_tokens), 0) as totalTokens,
+          count(e.id) as requestCount,
+          coalesce(sum(e.cost_usd), 0) as estimatedCostUsd,
+          coalesce(sum(case when e.cost_usd is null then 1 else 0 end), 0) as unpricedUsageCount
+        from usage_events e
+        join sessions s on s.id = e.session_id
+        where ${conditions.join(" and ")}
+        group by e.session_id, s.project_id
+      ), session_rows as (
+        select
+          a.*,
+          s.cwd as cwd,
+          s.source_deleted as sourceDeleted,
+          s.title as title,
+          1 as sessionCount,
+          (select count(*) from session_agents counts where counts.session_id = a.sessionId) as agentCount,
+          (select count(*) from session_agents counts where counts.session_id = a.sessionId and counts.thread_source = 'subagent') as subagentCount
+        from aggregated a
+        join sessions s on s.id = a.sessionId
+      ), ranked as (
+        select *, row_number() over (
+          partition by projectId
+          order by estimatedCostUsd desc, sessionId desc
+        ) as projectRank
+        from session_rows
+      )
+      select * from ranked
+      where projectRank <= ?
+      order by projectId, projectRank`,
     )
-    .orderBy(desc(sql`max(${usageEvents.timestamp})`))
-    .all();
+    .all(...parameters, limit) as (SessionPageRow & { projectRank: number })[];
 
   const agentsBySession = new Map<string, SessionAgentUsage[]>();
-  for (const agent of getSessionAgents(database, effectiveFilters)) {
+  for (const agent of getSessionAgents(
+    database,
+    effectiveFilters,
+    rows.map((row) => row.sessionId),
+  )) {
     const agents = agentsBySession.get(agent.sessionId) ?? [];
     agents.push(agent);
     agentsBySession.set(agent.sessionId, agents);
   }
+  for (const row of rows) {
+    if (!row.projectId) continue;
+    const sessions = result.get(row.projectId) ?? [];
+    sessions.push({
+      ...toSessionUsage(row),
+      agents: agentsBySession.get(row.sessionId) ?? [],
+    });
+    result.set(row.projectId, sessions);
+  }
+  return result;
+}
 
-  let values = rows.map((row) => ({
-    agents: agentsBySession.get(row.sessionId) ?? [],
+type SessionPageRow = {
+  agentCount: number;
+  cachedInputTokens: number;
+  cwd: string | null;
+  estimatedCostUsd: number;
+  firstEventAt: string;
+  inputTokens: number;
+  lastEventAt: string;
+  models: string;
+  outputTokens: number;
+  projectId: string | null;
+  reasoningOutputTokens: number;
+  requestCount: number;
+  sessionCount: number;
+  sessionId: string;
+  sourceDeleted: number | boolean;
+  subagentCount: number;
+  title: string | null;
+  totalTokens: number;
+  unpricedUsageCount: number;
+};
+
+type SessionPageRowWithTotal = SessionPageRow & { totalCount: number };
+
+function readSessionPage(
+  database: AppDatabase,
+  filters: SessionFilters,
+  now: Date,
+  onlySessionId?: string,
+) {
+  const coverage = getSessionCoverage(filters, now);
+  const page = filters.page ?? 1;
+  const pageSize = filters.pageSize ?? 25;
+  const empty = {
+    coverage,
+    effectiveFilters: { from: filters.from, to: filters.to } satisfies DashboardFilters,
+    page,
+    pageSize,
+    rows: [] as SessionPageRow[],
+    total: 0,
+  };
+  const scope = buildRawSessionScope(filters, now);
+  if (!scope) return empty;
+  const { effectiveFilters, parameters, usageConditions } = scope;
+
+  const sessionConditions: string[] = [];
+  if (onlySessionId) {
+    sessionConditions.push("sessionId = ?");
+    parameters.push(onlySessionId);
+  }
+  const query = filters.query?.trim().toLocaleLowerCase();
+  if (query) {
+    sessionConditions.push(`(
+      instr(lower(coalesce(title, '')), ?) > 0
+      or instr(lower(sessionId), ?) > 0
+      or instr(lower(coalesce(cwd, '')), ?) > 0
+      or exists (
+        select 1 from session_agents search_agent
+        where search_agent.session_id = sessionId
+          and (
+            instr(lower(coalesce(search_agent.name, '')), ?) > 0
+            or instr(lower(coalesce(search_agent.role, '')), ?) > 0
+          )
+      )
+    )`);
+    parameters.push(query, query, query, query, query);
+  }
+  if (filters.hasSubagents !== undefined) {
+    sessionConditions.push(filters.hasSubagents ? "subagentCount > 0" : "subagentCount = 0");
+  }
+  const filteredWhere =
+    sessionConditions.length > 0 ? `where ${sessionConditions.join(" and ")}` : "";
+  const commonTableExpression = `with aggregated as (
+    select
+      e.session_id as sessionId,
+      min(e.timestamp) as firstEventAt,
+      max(e.timestamp) as lastEventAt,
+      group_concat(distinct e.model) as models,
+      coalesce(sum(e.input_tokens), 0) as inputTokens,
+      coalesce(sum(e.cached_input_tokens), 0) as cachedInputTokens,
+      coalesce(sum(e.output_tokens), 0) as outputTokens,
+      coalesce(sum(e.reasoning_output_tokens), 0) as reasoningOutputTokens,
+      coalesce(sum(e.total_tokens), 0) as totalTokens,
+      count(e.id) as requestCount,
+      coalesce(sum(e.cost_usd), 0) as estimatedCostUsd,
+      coalesce(sum(case when e.cost_usd is null then 1 else 0 end), 0) as unpricedUsageCount
+    from usage_events e
+    join sessions s on s.id = e.session_id
+    where ${usageConditions.join(" and ")}
+    group by e.session_id
+  ), session_rows as (
+    select
+      a.*,
+      s.cwd as cwd,
+      s.project_id as projectId,
+      s.source_deleted as sourceDeleted,
+      s.title as title,
+      1 as sessionCount,
+      (select count(*) from session_agents counts where counts.session_id = a.sessionId) as agentCount,
+      (select count(*) from session_agents counts where counts.session_id = a.sessionId and counts.thread_source = 'subagent') as subagentCount
+    from aggregated a
+    join sessions s on s.id = a.sessionId
+  ), filtered_sessions as (
+    select * from session_rows ${filteredWhere}
+  )`;
+  const direction = filters.order === "asc" ? "asc" : "desc";
+  const sortColumn =
+    filters.sort === "tokens"
+      ? "totalTokens"
+      : filters.sort === "cost"
+        ? "estimatedCostUsd"
+        : "lastEventAt";
+  const rows = database.$client
+    .prepare(
+      `${commonTableExpression}
+       select *, count(*) over() as totalCount from filtered_sessions
+       order by ${sortColumn} ${direction}, sessionId ${direction}
+       limit ? offset ?`,
+    )
+    .all(...parameters, pageSize, (page - 1) * pageSize) as SessionPageRowWithTotal[];
+  let total = toNumber(rows[0]?.totalCount);
+  if (rows.length === 0 && page > 1) {
+    const totalRow = database.$client
+      .prepare(`${commonTableExpression} select count(*) as count from filtered_sessions`)
+      .get(...parameters) as { count: number } | undefined;
+    total = toNumber(totalRow?.count);
+  }
+  return {
+    coverage,
+    effectiveFilters,
+    page,
+    pageSize,
+    rows,
+    total,
+  };
+}
+
+function buildRawSessionScope(
+  filters: DashboardFilters,
+  now: Date,
+): {
+  coverage: ReturnType<typeof getSessionCoverage>;
+  effectiveFilters: DashboardFilters;
+  parameters: (number | string)[];
+  usageConditions: string[];
+} | null {
+  const coverage = getSessionCoverage(filters, now);
+  if (!coverage.from || !coverage.to) return null;
+  const effectiveFilters: DashboardFilters = {
+    ...(filters.agentKind ? { agentKind: filters.agentKind } : {}),
+    from: coverage.from,
+    ...(filters.model ? { model: filters.model } : {}),
+    ...(filters.models ? { models: filters.models } : {}),
+    ...(filters.projectId ? { projectId: filters.projectId } : {}),
+    to: coverage.to,
+  };
+  const usageConditions = ["e.local_date >= ?", "e.local_date <= ?"];
+  const parameters: (number | string)[] = [coverage.from, coverage.to];
+  const models = selectedModels(effectiveFilters);
+  if (models.length > 0) {
+    usageConditions.push(`e.model in (${models.map(() => "?").join(", ")})`);
+    parameters.push(...models);
+  }
+  if (effectiveFilters.agentKind && effectiveFilters.agentKind !== "all") {
+    usageConditions.push(
+      `exists (
+        select 1 from session_agents agent_filter
+        where agent_filter.id = e.agent_id
+          and agent_filter.thread_source ${effectiveFilters.agentKind === "subagent" ? "=" : "!="} 'subagent'
+      )`,
+    );
+  }
+  if (effectiveFilters.projectId) {
+    usageConditions.push("s.project_id = ?");
+    parameters.push(effectiveFilters.projectId);
+  }
+  return { coverage, effectiveFilters, parameters, usageConditions };
+}
+
+function toSessionUsage(row: SessionPageRow): Omit<SessionUsage, "agents"> {
+  return {
     cwd: row.cwd,
     firstEventAt: row.firstEventAt,
     lastEventAt: row.lastEventAt,
-    models: row.models.split(",").filter(Boolean),
+    models: row.models.split(",").filter(Boolean).sort(),
     projectId: row.projectId,
     sessionId: row.sessionId,
-    sourceDeleted: row.sourceDeleted ?? true,
+    sourceDeleted: Boolean(row.sourceDeleted),
     title: row.title,
     ...toKpis(row),
-  }));
-  const query = filters.query?.trim().toLocaleLowerCase();
-  if (query) {
-    values = values.filter((session) =>
-      [
-        session.title,
-        session.sessionId,
-        session.cwd,
-        ...session.agents.flatMap((agent) => [agent.name, agent.role]),
-      ].some((value) => value?.toLocaleLowerCase().includes(query)),
-    );
-  }
-  if (filters.hasSubagents !== undefined) {
-    values = values.filter(
-      (session) => session.agents.some((agent) => agent.isSubagent) === filters.hasSubagents,
-    );
-  }
-  const direction = filters.order === "asc" ? 1 : -1;
-  values.sort((left, right) => {
-    if (filters.sort === "tokens") return (left.totalTokens - right.totalTokens) * direction;
-    if (filters.sort === "cost")
-      return (left.estimatedCostUsd - right.estimatedCostUsd) * direction;
-    return left.lastEventAt.localeCompare(right.lastEventAt) * direction;
-  });
-  const total = values.length;
-  const start = (page - 1) * pageSize;
-
-  return {
-    coverage,
-    page,
-    pageSize,
-    sessions: values.slice(start, start + pageSize),
-    total,
   };
+}
+
+function getSubagentNames(database: AppDatabase, sessionIds: string[]): Map<string, string[]> {
+  const names = new Map<string, string[]>();
+  if (sessionIds.length === 0) return names;
+  const rows = database.$client
+    .prepare(
+      `with unique_names as (
+        select distinct session_id as sessionId, name
+        from session_agents
+        where thread_source = 'subagent'
+          and name is not null
+          and trim(name) != ''
+          and session_id in (${sessionIds.map(() => "?").join(", ")})
+      ), ranked as (
+        select sessionId, name,
+          row_number() over (partition by sessionId order by name collate nocase, name) as rank
+        from unique_names
+      )
+      select sessionId, name from ranked where rank <= 2 order by sessionId, rank`,
+    )
+    .all(...sessionIds) as { name: string; sessionId: string }[];
+  for (const row of rows) {
+    const values = names.get(row.sessionId) ?? [];
+    values.push(row.name);
+    names.set(row.sessionId, values);
+  }
+  return names;
 }
 
 function getSessionAgents(
   database: AppDatabase,
   filters: DashboardFilters,
+  sessionIds: string[],
 ): (SessionAgentUsage & { sessionId: string })[] {
+  if (sessionIds.length === 0) return [];
   const rows = database
     .select({
       agentId: sessionAgents.id,
@@ -261,6 +595,7 @@ function getSessionAgents(
     })
     .from(sessionAgents)
     .leftJoin(usageEvents, and(eq(usageEvents.agentId, sessionAgents.id), usageWhere(filters)))
+    .where(inArray(sessionAgents.sessionId, sessionIds))
     .groupBy(
       sessionAgents.id,
       sessionAgents.depth,
@@ -567,12 +902,21 @@ export function backfillUnpricedUsage(database: AppDatabase, model: string): num
   });
 }
 
-export function backfillAllUnpricedUsage(database: AppDatabase): number {
-  return database
+export function backfillAllUnpricedUsage(
+  database: AppDatabase,
+  onModelCommitted: (updated: number, model: string) => void = () => undefined,
+): number {
+  let total = 0;
+  for (const rate of database
     .select({ model: modelRates.model })
     .from(modelRates)
-    .all()
-    .reduce((total, rate) => total + backfillUnpricedUsage(database, rate.model), 0);
+    .orderBy(modelRates.model)
+    .all()) {
+    const updated = backfillUnpricedUsage(database, rate.model);
+    total += updated;
+    if (updated > 0) onModelCommitted(updated, rate.model);
+  }
+  return total;
 }
 
 export function reconcileUnknownModels(database: AppDatabase): number {

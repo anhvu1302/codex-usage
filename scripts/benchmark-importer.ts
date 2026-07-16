@@ -26,6 +26,7 @@ type PhaseResult = {
   rssBeforeBytes: number;
   rssDeltaBytes: number;
   rssPeakBytes: number;
+  sqliteStatements: number;
 };
 
 const options = parseOptions(process.argv.slice(2));
@@ -33,15 +34,17 @@ const root = await mkdtemp(join(tmpdir(), "codex-usage-benchmark-"));
 const sessionsDirectory = join(root, "sessions");
 const databasePath = join(root, "usage.db");
 const sourceDirectory = join(sessionsDirectory, "2026", "07", "15");
+const outputDirectory = join(process.cwd(), ".local", "benchmarks");
 let database: AppDatabase | null = null;
 let importer: SessionImporter | null = null;
+let sqliteStatements = 0;
 
 try {
   await mkdir(sourceDirectory, { recursive: true });
   const sources = await createFixtures(sourceDirectory, options.files);
   const coldLogicalBytes = sources.reduce((total, source) => total + source.bytes, 0);
 
-  database = createDatabase(databasePath);
+  database = createDatabase(databasePath, { onStatement: () => (sqliteStatements += 1) });
   migrateDatabase(database);
   const inventory = new SourceInventory(sessionsDirectory);
   importer = new SessionImporter(database, sessionsDirectory, {
@@ -56,8 +59,12 @@ try {
     inventory,
   );
 
-  const cold = await measureSync(importer, inventory, coldLogicalBytes);
-  const warm = await measureSync(importer, inventory, 0);
+  const statementCounter = {
+    read: () => sqliteStatements,
+    reset: () => (sqliteStatements = 0),
+  };
+  const cold = await measureSync(importer, inventory, coldLogicalBytes, statementCounter);
+  const warm = await measureSync(importer, inventory, 0, statementCounter);
 
   const changedCount = Math.min(
     options.files,
@@ -69,13 +76,18 @@ try {
     appendBytes += Buffer.byteLength(appended);
     await appendFile(source.path, appended);
   }
-  const append = await measureSync(importer, inventory, appendBytes);
+  const append = await measureSync(importer, inventory, appendBytes, statementCounter);
   const countsAfterAppend = readExactCounts(database);
   if (cold.contentFilesRead !== options.files) {
     throw new Error(`Cold import read ${cold.contentFilesRead}/${options.files} JSONL files`);
   }
   if (warm.contentFilesRead !== 0) {
     throw new Error(`Warm inventory unexpectedly read ${warm.contentFilesRead} JSONL files`);
+  }
+  if (warm.sqliteStatements > 10) {
+    throw new Error(
+      `Warm inventory executed ${warm.sqliteStatements} SQLite statements; expected bulk state/diagnostic reads`,
+    );
   }
   if (append.contentFilesRead !== changedCount) {
     throw new Error(
@@ -84,6 +96,7 @@ try {
   }
 
   const scansBeforeStatus = inventory.getScanCount();
+  statementCounter.reset();
   const statusStartedAt = performance.now();
   const statusMemory = startMemorySampler();
   for (let index = 0; index < 10; index += 1) await retention.getStatus();
@@ -94,6 +107,7 @@ try {
     directoryScans: inventory.getScanCount() - scansBeforeStatus,
     durationMs: round(performance.now() - statusStartedAt),
     filesSkipped: 0,
+    sqliteStatements: statementCounter.read(),
     ...statusMemoryResult,
   };
   if (statusRequests.directoryScans !== 0) {
@@ -101,6 +115,7 @@ try {
   }
 
   const deepStartedAt = performance.now();
+  statementCounter.reset();
   const deepMemory = startMemorySampler();
   const scansBeforeDeep = inventory.getScanCount();
   if (!importer.queueDeepSync()) throw new Error("Could not queue benchmark deep verification");
@@ -113,6 +128,7 @@ try {
     directoryScans: inventory.getScanCount() - scansBeforeDeep,
     durationMs: round(performance.now() - deepStartedAt),
     filesSkipped: deepStatus?.filesSkipped ?? 0,
+    sqliteStatements: statementCounter.read(),
     ...deepMemoryResult,
   };
   const countsAfterDeep = readExactCounts(database);
@@ -120,27 +136,28 @@ try {
     throw new Error("Deep verification totals differ from the incremental import totals");
   }
 
-  process.stdout.write(
-    `${JSON.stringify(
-      {
-        append,
-        cold,
-        configuration: {
-          changedFiles: changedCount,
-          changedPercent: options.changedPercent,
-          files: options.files,
-        },
-        deep,
-        exactCounts: countsAfterDeep,
-        measurementNote:
-          "contentBytesRead is logical JSONL data from import offsets; RSS/heap include the tsx benchmark harness and should be compared on the same machine.",
-        statusRequests,
-        warm,
-      },
-      null,
-      2,
-    )}\n`,
+  const result = {
+    append,
+    cold,
+    configuration: {
+      changedFiles: changedCount,
+      changedPercent: options.changedPercent,
+      files: options.files,
+    },
+    deep,
+    exactCounts: countsAfterDeep,
+    measurementNote:
+      "contentBytesRead is logical JSONL data from import offsets; RSS/heap include the tsx benchmark harness and should be compared on the same machine.",
+    statusRequests,
+    warm,
+  };
+  await mkdir(outputDirectory, { recursive: true });
+  const outputPath = join(
+    outputDirectory,
+    `importer-${new Date().toISOString().replaceAll(":", "-")}.json`,
   );
+  await writeFile(outputPath, `${JSON.stringify(result, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ outputPath, ...result }, null, 2)}\n`);
 } finally {
   await importer?.stop();
   database?.$client.close();
@@ -151,8 +168,10 @@ async function measureSync(
   importer: SessionImporter,
   inventory: SourceInventory,
   contentBytesRead: number,
+  statementCounter: { read: () => number; reset: () => void },
 ): Promise<PhaseResult> {
   const scansBefore = inventory.getScanCount();
+  statementCounter.reset();
   const memory = startMemorySampler();
   const startedAt = performance.now();
   const status = await importer.syncAll();
@@ -164,6 +183,7 @@ async function measureSync(
     directoryScans: inventory.getScanCount() - scansBefore,
     durationMs: round(performance.now() - startedAt),
     filesSkipped: scan.filesSkipped,
+    sqliteStatements: statementCounter.read(),
     ...memoryResult,
   };
 }

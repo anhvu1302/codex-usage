@@ -384,6 +384,7 @@ export const activityEvents = sqliteTable(
     index("activity_events_session_timestamp_index").on(table.sessionId, table.timestamp),
     index("activity_events_agent_date_index").on(table.agentId, table.localDate),
     index("activity_events_turn_timestamp_index").on(table.turnKey, table.timestamp),
+    index("activity_events_timestamp_id_index").on(table.timestamp, table.id),
   ],
 );
 

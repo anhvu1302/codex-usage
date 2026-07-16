@@ -61,7 +61,12 @@ import {
   SourceInventory,
   type SourceInventoryScanner,
 } from "@/server/source-inventory";
-import type { DataHealthResponse, ImportStatus, StorageStatus } from "@/shared/types";
+import type {
+  AppRevisionScope,
+  DataHealthResponse,
+  ImportStatus,
+  StorageStatus,
+} from "@/shared/types";
 
 const temporaryDirectories: string[] = [];
 
@@ -423,6 +428,273 @@ describe("session importer", () => {
     const repair = await harness.importer.syncAll();
     expect(repair.sourceScan.lastCompleted).toMatchObject({ filesRead: 2, filesSkipped: 0 });
     expect(harness.database.select().from(usageEvents).all()).toHaveLength(2);
+  });
+
+  it("publishes only storage and health freshness for an unchanged warm inventory", async () => {
+    const revisions: AppRevisionScope[][] = [];
+    const onDataChanged = vi.fn();
+    const harness = await createHarness({
+      onDataChanged,
+      onRevision: (scopes) => revisions.push([...scopes]),
+    });
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-warm-revision"),
+      turnContext("gpt-warm"),
+      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await harness.importer.syncAll();
+    revisions.length = 0;
+    onDataChanged.mockClear();
+
+    const warm = await harness.importer.syncAll();
+
+    expect(warm.sourceScan.lastCompleted).toMatchObject({ filesRead: 0, filesSkipped: 1 });
+    expect(revisions).toEqual([["data-health", "storage"]]);
+    expect(onDataChanged).not.toHaveBeenCalled();
+  });
+
+  it("separates activity-only revisions from usage analytics revisions", async () => {
+    const revisions: AppRevisionScope[][] = [];
+    const onDataChanged = vi.fn();
+    const harness = await createHarness({
+      onDataChanged,
+      onRevision: (scopes) => revisions.push([...scopes]),
+    });
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-scoped-revision"),
+      taskStarted("turn-scoped-revision", "2026-07-12T01:00:00.000Z"),
+      turnContext("gpt-scoped", "2026-07-12T01:00:01.000Z", "turn-scoped-revision"),
+    ]);
+    await harness.importer.syncAll();
+    revisions.length = 0;
+    onDataChanged.mockClear();
+
+    await appendFile(source, `${activityCall("call-scoped", "2026-07-12T01:00:02.000Z")}\n`);
+    await harness.importer.syncFile(source);
+    expect(revisions).toEqual([["activity", "data-health", "turns"]]);
+    expect(onDataChanged).not.toHaveBeenCalled();
+
+    revisions.length = 0;
+    await appendFile(
+      source,
+      `${tokenCount("2026-07-12T01:00:03.000Z", 100, 20, 10, 4, undefined, "turn-scoped-revision")}\n`,
+    );
+    await harness.importer.syncFile(source);
+    expect(revisions).toEqual([
+      ["agents", "catalog", "dashboard", "data-health", "projects", "sessions", "turns"],
+    ]);
+    expect(onDataChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not publish analytics for a partial or unchanged tail", async () => {
+    const revisions: AppRevisionScope[][] = [];
+    const onDataChanged = vi.fn();
+    const harness = await createHarness({
+      onDataChanged,
+      onRevision: (scopes) => revisions.push([...scopes]),
+    });
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-partial-revision"),
+      turnContext("gpt-partial-revision"),
+    ]);
+    await harness.importer.syncAll();
+    revisions.length = 0;
+    onDataChanged.mockClear();
+    const usageLine = tokenCount("2026-07-12T01:00:03.000Z", 100, 20, 10, 4);
+    const boundary = Math.floor(usageLine.length / 2);
+
+    await appendFile(source, usageLine.slice(0, boundary));
+    await harness.importer.syncFile(source);
+    expect(revisions).toEqual([["data-health"]]);
+    expect(onDataChanged).not.toHaveBeenCalled();
+
+    revisions.length = 0;
+    await harness.importer.syncFile(source);
+    expect(revisions).toEqual([]);
+
+    await appendFile(source, `${usageLine.slice(boundary)}\n`);
+    await harness.importer.syncFile(source);
+    expect(revisions).toEqual([
+      ["agents", "catalog", "dashboard", "data-health", "projects", "sessions", "turns"],
+    ]);
+    expect(onDataChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps data-health out of a usage revision when no turn attribution changes", async () => {
+    const revisions: AppRevisionScope[][] = [];
+    const harness = await createHarness({
+      onRevision: (scopes) => revisions.push([...scopes]),
+    });
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-usage-without-turn"),
+    ]);
+    await harness.importer.syncAll();
+    revisions.length = 0;
+
+    await appendFile(source, `${tokenCount("2026-07-12T01:00:03.000Z", 100, 20, 10, 4)}\n`);
+    await harness.importer.syncFile(source);
+
+    expect(revisions).toEqual([
+      ["agents", "catalog", "dashboard", "projects", "sessions", "turns"],
+    ]);
+  });
+
+  it("does not dirty alert analytics for lifecycle-only context changes", async () => {
+    const onDataChanged = vi.fn();
+    const revisions: AppRevisionScope[][] = [];
+    const harness = await createHarness({
+      onDataChanged,
+      onRevision: (scopes) => revisions.push([...scopes]),
+    });
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-lifecycle-only"),
+    ]);
+    await harness.importer.syncAll();
+    onDataChanged.mockClear();
+    revisions.length = 0;
+
+    await appendFile(
+      source,
+      `${JSON.stringify({
+        payload: {
+          model: "gpt-lifecycle",
+          model_context_window: 200_000,
+          turn_id: "turn-lifecycle-only",
+        },
+        timestamp: "2026-07-12T01:00:00.000Z",
+        type: "turn_context",
+      })}\n`,
+    );
+    await harness.importer.syncFile(source);
+
+    expect(revisions).toEqual([["activity", "data-health", "turns"]]);
+    expect(onDataChanged).not.toHaveBeenCalled();
+  });
+
+  it("publishes scopes for mutations committed before a later file import error", async () => {
+    const revisions: AppRevisionScope[][] = [];
+    const harness = await createHarness({
+      onRevision: (scopes) => revisions.push([...scopes]),
+    });
+    harness.database.$client.exec(`
+      create trigger fail_session_agent before insert on session_agents
+      begin
+        select raise(abort, 'forced session agent failure');
+      end
+    `);
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-partial-commit"),
+    ]);
+
+    await harness.importer.syncFile(source);
+
+    expect(harness.database.select().from(sessions).all()).toHaveLength(1);
+    expect(harness.database.select().from(sessionAgents).all()).toHaveLength(0);
+    expect(revisions).toEqual([["agents", "data-health", "projects", "sessions"]]);
+  });
+
+  it("rolls back an agent task summary when the paired session title update fails", async () => {
+    const revisions: AppRevisionScope[][] = [];
+    const harness = await createHarness({
+      onRevision: (scopes) => revisions.push([...scopes]),
+    });
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-summary-transaction"),
+    ]);
+    await harness.importer.syncAll();
+    revisions.length = 0;
+    harness.database.$client.exec(`
+      create trigger fail_session_title before update of title on sessions
+      when new.title is not old.title
+      begin
+        select raise(abort, 'forced session title failure');
+      end
+    `);
+    await appendFile(source, `${userMessage("Summary must remain atomic")}\n`);
+
+    await harness.importer.syncFile(source);
+
+    expect(harness.database.select().from(sessionAgents).get()?.taskSummary).toBeNull();
+    expect(harness.database.select().from(sessions).get()?.title).toBeNull();
+    expect(revisions).toEqual([["data-health"]]);
+  });
+
+  it("publishes repricing scopes when an earlier model commits before a later model fails", async () => {
+    const onDataChanged = vi.fn();
+    const revisions: AppRevisionScope[][] = [];
+    const harness = await createHarness({
+      onDataChanged,
+      onRevision: (scopes) => revisions.push([...scopes]),
+    });
+    const firstSource = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-backfill-model-a"),
+      turnContext("model-a"),
+      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+    ]);
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-backfill-model-b"),
+      turnContext("model-b"),
+      tokenCount("2026-07-12T01:01:00.000Z", 100, 20, 10, 4),
+    ]);
+    await harness.importer.syncAll();
+    upsertModelRate(harness.database, {
+      cachedInputRate: 1,
+      inputRate: 2,
+      model: "model-a",
+      outputRate: 3,
+    });
+    upsertModelRate(harness.database, {
+      cachedInputRate: 1,
+      inputRate: 2,
+      model: "model-b",
+      outputRate: 3,
+    });
+    harness.database.$client.exec(`
+      create trigger fail_model_b_backfill before update of cost_usd on usage_events
+      when old.model = 'model-b' and old.cost_usd is null
+      begin
+        select raise(abort, 'forced model-b backfill failure');
+      end
+    `);
+    await appendFile(firstSource, `${JSON.stringify({ payload: {}, type: "unsupported" })}\n`);
+    onDataChanged.mockClear();
+    revisions.length = 0;
+
+    await harness.importer.syncAll();
+
+    const costs = harness.database
+      .select({ costUsd: usageEvents.costUsd, model: usageEvents.model })
+      .from(usageEvents)
+      .orderBy(usageEvents.model)
+      .all();
+    expect(costs).toEqual([
+      { costUsd: expect.any(Number), model: "model-a" },
+      { costUsd: null, model: "model-b" },
+    ]);
+    expect(revisions).toEqual([
+      ["agents", "catalog", "dashboard", "projects", "sessions", "turns"],
+    ]);
+    expect(onDataChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("bulk-loads state and diagnostics for unchanged inventory files", async () => {
+    let statements = 0;
+    const harness = await createHarness({ onStatement: () => (statements += 1) });
+    await Promise.all(
+      Array.from({ length: 40 }, (_, index) =>
+        createSessionFile(harness.sessionsDirectory, [
+          sessionMeta(`session-bulk-${index}`),
+          tokenCount("2026-07-12T00:01:00.000Z", 10 + index, 2, 2, 1),
+        ]),
+      ),
+    );
+    await harness.importer.syncAll();
+    statements = 0;
+
+    const warm = await harness.importer.syncAll();
+
+    expect(warm.sourceScan.lastCompleted).toMatchObject({ filesRead: 0, filesSkipped: 40 });
+    expect(statements).toBeLessThanOrEqual(5);
   });
 
   it("keeps exact dedupe and source flags across rename, delete and restore", async () => {
@@ -838,6 +1110,157 @@ describe("session importer", () => {
     ]);
   });
 
+  it("counts a cumulative token snapshot once across model replay and recompute events", async () => {
+    const harness = await createHarness();
+    const cumulativeUsage = { cached: 800, input: 1_000, output: 100, reasoning: 40 };
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-cumulative-replay"),
+      taskStarted("turn-canonical", "2026-07-12T01:00:00.000Z"),
+      turnContext("gpt-canonical", "2026-07-12T01:00:01.000Z", "turn-canonical"),
+      tokenCount("2026-07-12T01:00:02.000Z", 100, 20, 10, 4, cumulativeUsage),
+      taskCompleted("turn-canonical", "2026-07-12T01:00:03.000Z"),
+      taskStarted("turn-replay", "2026-07-12T01:01:00.000Z"),
+      turnContext("gpt-replay", "2026-07-12T01:01:01.000Z", "turn-replay"),
+      tokenCount("2026-07-12T01:01:02.000Z", 200, 50, 30, 10, cumulativeUsage),
+      tokenCount("2026-07-12T01:01:03.000Z", 0, 0, 0, 0, cumulativeUsage),
+      taskCompleted("turn-replay", "2026-07-12T01:01:04.000Z"),
+    ]);
+
+    expect((await harness.importer.syncAll()).recordsInserted).toBe(1);
+    expect(harness.database.select().from(usageEvents).all()).toEqual([
+      expect.objectContaining({
+        cachedInputTokens: 20,
+        inputTokens: 100,
+        model: "gpt-canonical",
+        outputTokens: 10,
+        reasoningOutputTokens: 4,
+        timestamp: "2026-07-12T01:00:02.000Z",
+        totalTokens: 110,
+        turnKey: createTurnKey("session-cumulative-replay", "turn-canonical"),
+      }),
+    ]);
+    expect(harness.database.select().from(turnModelUsage).all()).toEqual([
+      expect.objectContaining({
+        model: "gpt-canonical",
+        requestCount: 1,
+        totalTokens: 110,
+        turnKey: createTurnKey("session-cumulative-replay", "turn-canonical"),
+      }),
+    ]);
+  });
+
+  it("migrates v6 cumulative replay rows into one canonical v7 event", async () => {
+    const harness = await createHarness();
+    const cumulativeUsage = { cached: 800, input: 1_000, output: 100, reasoning: 40 };
+    const canonicalLine = tokenCount("2026-07-12T02:00:02.000Z", 100, 20, 10, 4, cumulativeUsage);
+    const replayLine = tokenCount("2026-07-12T02:01:02.000Z", 200, 50, 30, 10, cumulativeUsage);
+    const source = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-v6-replay"),
+      taskStarted("turn-v6-canonical", "2026-07-12T02:00:00.000Z"),
+      turnContext("gpt-v6-canonical", "2026-07-12T02:00:01.000Z", "turn-v6-canonical"),
+      canonicalLine,
+      taskCompleted("turn-v6-canonical", "2026-07-12T02:00:03.000Z"),
+      taskStarted("turn-v6-replay", "2026-07-12T02:01:00.000Z"),
+      turnContext("gpt-v6-replay", "2026-07-12T02:01:01.000Z", "turn-v6-replay"),
+      replayLine,
+      taskCompleted("turn-v6-replay", "2026-07-12T02:01:03.000Z"),
+    ]);
+    await harness.importer.syncAll();
+
+    const canonicalEvent = harness.database.select().from(usageEvents).get();
+    if (!canonicalEvent) throw new Error("Expected canonical cumulative usage fixture");
+    const canonicalV6 = previousUsageIdentity(
+      "session-v6-replay",
+      "session-v6-replay",
+      "gpt-v6-canonical",
+      canonicalLine,
+    );
+    const replayV6 = previousUsageIdentity(
+      "session-v6-replay",
+      "session-v6-replay",
+      "gpt-v6-replay",
+      replayLine,
+    );
+    const replayTurnKey = createTurnKey("session-v6-replay", "turn-v6-replay");
+    harness.database
+      .update(usageEvents)
+      .set({ id: canonicalV6.id, sourceHash: canonicalV6.sourceHash })
+      .where(eq(usageEvents.id, canonicalEvent.id))
+      .run();
+    harness.database
+      .insert(usageEvents)
+      .values({
+        ...canonicalEvent,
+        cachedInputTokens: 50,
+        id: replayV6.id,
+        inputTokens: 200,
+        model: "gpt-v6-replay",
+        outputTokens: 30,
+        reasoningOutputTokens: 10,
+        sourceHash: replayV6.sourceHash,
+        timestamp: "2026-07-12T02:01:02.000Z",
+        totalTokens: 230,
+        turnKey: replayTurnKey,
+      })
+      .run();
+    harness.database
+      .insert(turnModelUsage)
+      .values({
+        cachedInputTokens: 50,
+        costAttributionMissingCount: 0,
+        costUsd: 0,
+        inputTokens: 200,
+        model: "gpt-v6-replay",
+        outputTokens: 30,
+        reasoningOutputTokens: 10,
+        requestCount: 1,
+        totalTokens: 230,
+        turnKey: replayTurnKey,
+        unpricedCachedInputTokens: 50,
+        unpricedInputTokens: 200,
+        unpricedOutputTokens: 30,
+        unpricedUsageCount: 1,
+      })
+      .run();
+    harness.database
+      .update(importStates)
+      .set({ dedupeVersion: 6 })
+      .where(eq(importStates.sourcePath, source))
+      .run();
+
+    const repaired = await harness.importer.syncAll();
+    expect(repaired.error).toBeNull();
+    expect(repaired.recordsReclassified).toBeGreaterThanOrEqual(2);
+    expect(repaired.sourceScan.lastCompleted).toMatchObject({ filesRead: 1, filesSkipped: 0 });
+    expect(harness.database.select().from(usageEvents).all()).toEqual([
+      expect.objectContaining({
+        cachedInputTokens: 20,
+        inputTokens: 100,
+        model: "gpt-v6-canonical",
+        outputTokens: 10,
+        reasoningOutputTokens: 4,
+        timestamp: "2026-07-12T02:00:02.000Z",
+        totalTokens: 110,
+        turnKey: createTurnKey("session-v6-replay", "turn-v6-canonical"),
+      }),
+    ]);
+    expect(harness.database.select().from(turnModelUsage).all()).toEqual([
+      expect.objectContaining({
+        model: "gpt-v6-canonical",
+        requestCount: 1,
+        totalTokens: 110,
+      }),
+    ]);
+    expect(
+      harness.database.select().from(importStates).where(eq(importStates.sourcePath, source)).get()
+        ?.dedupeVersion,
+    ).toBe(7);
+
+    const warm = await harness.importer.syncAll();
+    expect(warm.sourceScan.lastCompleted).toMatchObject({ filesRead: 0, filesSkipped: 1 });
+    expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
+  });
+
   it("retries an incomplete inherited prefix instead of advancing past its handoff", async () => {
     const harness = await createHarness();
     await createSessionFile(harness.sessionsDirectory, [
@@ -880,6 +1303,96 @@ describe("session importer", () => {
         .map((event) => event.agentId)
         .sort(),
     ).toEqual(["agent-partial", "session-partial-handoff"]);
+  });
+
+  it("skips and repairs copied history in a single-metadata subagent rollout", async () => {
+    const harness = await createHarness();
+    const mainTask = taskStarted("turn-single-main", "2026-07-12T01:00:00.000Z");
+    const mainContext = turnContext(
+      "gpt-single-main",
+      "2026-07-12T01:00:01.000Z",
+      "turn-single-main",
+    );
+    const mainUsage = tokenCount("2026-07-12T01:00:02.000Z", 100, 20, 10, 4, {
+      cached: 20,
+      input: 100,
+      output: 10,
+      reasoning: 4,
+    });
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-single-meta"),
+      mainTask,
+      mainContext,
+      mainUsage,
+    ]);
+    const childSource = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-single-meta", {
+        agentId: "agent-single-meta",
+        depth: 1,
+        forkedFromId: "session-single-meta",
+        parentThreadId: "session-single-meta",
+        threadSource: "subagent",
+      }),
+      mainTask,
+      mainContext,
+      mainUsage,
+      taskStarted("turn-single-child", "2026-07-12T01:01:00.000Z"),
+      turnContext("gpt-single-child", "2026-07-12T01:01:01.000Z", "turn-single-child"),
+      interAgentHandoff("2026-07-12T01:01:02.000Z"),
+      tokenCount("2026-07-12T01:01:03.000Z", 200, 50, 30, 10, {
+        cached: 70,
+        input: 300,
+        output: 40,
+        reasoning: 14,
+      }),
+    ]);
+
+    await harness.importer.syncAll();
+    expect(
+      harness.database
+        .select({ agentId: usageEvents.agentId, totalTokens: usageEvents.totalTokens })
+        .from(usageEvents)
+        .orderBy(usageEvents.agentId)
+        .all(),
+    ).toEqual([
+      { agentId: "agent-single-meta", totalTokens: 230 },
+      { agentId: "session-single-meta", totalTokens: 110 },
+    ]);
+
+    const mainEvent = harness.database
+      .select()
+      .from(usageEvents)
+      .where(eq(usageEvents.agentId, "session-single-meta"))
+      .get();
+    if (!mainEvent) throw new Error("Expected main copied-history fixture");
+    harness.database
+      .insert(usageEvents)
+      .values({
+        ...mainEvent,
+        agentId: "agent-single-meta",
+        id: "legacy-single-meta-inherited-row",
+        sourceHash: "legacy-single-meta-inherited-row",
+      })
+      .run();
+    harness.database
+      .update(importStates)
+      .set({ dedupeVersion: 6 })
+      .where(eq(importStates.sourcePath, childSource))
+      .run();
+
+    const repaired = await harness.importer.syncAll();
+    expect(repaired.error).toBeNull();
+    expect(repaired.recordsReclassified).toBeGreaterThanOrEqual(2);
+    expect(
+      harness.database
+        .select({ agentId: usageEvents.agentId, totalTokens: usageEvents.totalTokens })
+        .from(usageEvents)
+        .orderBy(usageEvents.agentId)
+        .all(),
+    ).toEqual([
+      { agentId: "agent-single-meta", totalTokens: 230 },
+      { agentId: "session-single-meta", totalTokens: 110 },
+    ]);
   });
 
   it("skips inherited main snapshots while preserving canonical child usage, activity, and cost", async () => {
@@ -1006,6 +1519,240 @@ describe("session importer", () => {
         .from(usageDailyRollups)
         .get()?.total,
     ).toBe(340);
+  });
+
+  it("skips copied root-fork history and repairs usage imported by the previous boundary", async () => {
+    const harness = await createHarness();
+    const parentMeta = sessionMeta("session-fork-parent");
+    const parentItems = [
+      taskStarted("turn-parent", "2026-07-12T01:00:00.000Z"),
+      turnContext("gpt-fork", "2026-07-12T01:00:01.000Z", "turn-parent"),
+      activityCall("call-parent", "2026-07-12T01:00:02.000Z"),
+      JSON.stringify({
+        timestamp: "2026-07-12T01:00:02.500Z",
+        type: "response_item",
+        payload: {
+          id: "parent-large-item",
+          content: "x".repeat(16 * 1_024),
+          role: "assistant",
+          type: "message",
+        },
+      }),
+      tokenCount("2026-07-12T01:00:03.000Z", 100, 20, 10, 4, {
+        cached: 20,
+        input: 100,
+        output: 10,
+        reasoning: 4,
+      }),
+      taskCompleted("turn-parent", "2026-07-12T01:00:04.000Z"),
+    ];
+    await createSessionFile(harness.sessionsDirectory, [parentMeta, ...parentItems]);
+    await harness.importer.syncAll();
+
+    const forkSource = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-fork-child", { forkedFromId: "session-fork-parent" }),
+      copyRolloutItem(parentMeta, "2026-07-12T02:00:00.000Z"),
+      ...parentItems.map((line, index) =>
+        copyRolloutItem(
+          line,
+          `2026-07-12T02:00:1${index}.000Z`,
+          index === 3 ? "fork-large-item" : undefined,
+        ),
+      ),
+      userMessage("Only this fork turn is new"),
+      taskStarted("turn-child", "2026-07-12T02:01:00.000Z"),
+      turnContext("gpt-fork", "2026-07-12T02:01:01.000Z", "turn-child"),
+      activityCall("call-child", "2026-07-12T02:01:02.000Z"),
+      tokenCount("2026-07-12T02:01:03.000Z", 200, 50, 30, 10, {
+        cached: 70,
+        input: 300,
+        output: 40,
+        reasoning: 14,
+      }),
+      taskCompleted("turn-child", "2026-07-12T02:01:04.000Z"),
+    ]);
+
+    await harness.importer.syncAll();
+    expect(
+      harness.database
+        .select({ sessionId: usageEvents.sessionId, totalTokens: usageEvents.totalTokens })
+        .from(usageEvents)
+        .orderBy(usageEvents.sessionId)
+        .all(),
+    ).toEqual([
+      { sessionId: "session-fork-child", totalTokens: 230 },
+      { sessionId: "session-fork-parent", totalTokens: 110 },
+    ]);
+
+    const parentUsage = harness.database
+      .select()
+      .from(usageEvents)
+      .where(eq(usageEvents.sessionId, "session-fork-parent"))
+      .get();
+    if (!parentUsage) throw new Error("Expected parent usage fixture");
+    harness.database
+      .insert(usageEvents)
+      .values({
+        ...parentUsage,
+        agentId: "session-fork-child",
+        id: "legacy-root-fork-duplicate",
+        localDate: "2026-07-12",
+        sessionId: "session-fork-child",
+        sourceHash: "legacy-root-fork-duplicate",
+        timestamp: "2026-07-12T02:00:03.000Z",
+      })
+      .run();
+    harness.database
+      .update(importStates)
+      .set({ dedupeVersion: 6 })
+      .where(eq(importStates.sourcePath, forkSource))
+      .run();
+
+    await harness.importer.syncAll();
+
+    expect(
+      harness.database
+        .select({ sessionId: usageEvents.sessionId, totalTokens: usageEvents.totalTokens })
+        .from(usageEvents)
+        .orderBy(usageEvents.sessionId)
+        .all(),
+    ).toEqual([
+      { sessionId: "session-fork-child", totalTokens: 230 },
+      { sessionId: "session-fork-parent", totalTokens: 110 },
+    ]);
+    expect(
+      harness.database
+        .select()
+        .from(importStates)
+        .where(eq(importStates.sourcePath, forkSource))
+        .get()?.dedupeVersion,
+    ).toBe(7);
+
+    await appendFile(
+      forkSource,
+      `${[
+        userMessage("A later fork turn"),
+        taskStarted("turn-child-later", "2026-07-12T02:02:00.000Z"),
+        turnContext("gpt-fork", "2026-07-12T02:02:01.000Z", "turn-child-later"),
+        tokenCount("2026-07-12T02:02:02.000Z", 50, 10, 5, 2),
+        taskCompleted("turn-child-later", "2026-07-12T02:02:03.000Z"),
+      ].join("\n")}\n`,
+    );
+    expect(await harness.importer.syncFile(forkSource)).toBe(1);
+    expect(
+      harness.database
+        .select({ sessionId: usageEvents.sessionId, totalTokens: usageEvents.totalTokens })
+        .from(usageEvents)
+        .orderBy(usageEvents.sessionId, usageEvents.timestamp)
+        .all(),
+    ).toEqual([
+      { sessionId: "session-fork-child", totalTokens: 230 },
+      { sessionId: "session-fork-child", totalTokens: 55 },
+      { sessionId: "session-fork-parent", totalTokens: 110 },
+    ]);
+
+    expect(harness.importer.queueDeepSync()).toBe(true);
+    await vi.waitFor(
+      () =>
+        expect(harness.importer.getStatus().sourceScan.lastCompleted).toMatchObject({
+          mode: "deep",
+        }),
+      { interval: 10, timeout: 2_000 },
+    );
+    expect(
+      harness.database
+        .select({ sessionId: usageEvents.sessionId, totalTokens: usageEvents.totalTokens })
+        .from(usageEvents)
+        .orderBy(usageEvents.sessionId, usageEvents.timestamp)
+        .all(),
+    ).toEqual([
+      { sessionId: "session-fork-child", totalTokens: 230 },
+      { sessionId: "session-fork-child", totalTokens: 55 },
+      { sessionId: "session-fork-parent", totalTokens: 110 },
+    ]);
+  });
+
+  it("rolls back root-fork repair without deleting existing history", async () => {
+    const harness = await createHarness();
+    const parentMeta = sessionMeta("session-fork-rollback-parent");
+    await createSessionFile(harness.sessionsDirectory, [
+      parentMeta,
+      turnContext("gpt-fork", "2026-07-12T01:00:01.000Z"),
+      tokenCount("2026-07-12T01:00:02.000Z", 100, 20, 10, 4),
+    ]);
+    await harness.importer.syncAll();
+    const forkSource = await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-fork-rollback-child", {
+        forkedFromId: "session-fork-rollback-parent",
+      }),
+      copyRolloutItem(parentMeta, "2026-07-12T02:00:00.000Z"),
+      copyRolloutItem(
+        turnContext("gpt-fork", "2026-07-12T01:00:01.000Z"),
+        "2026-07-12T02:00:01.000Z",
+      ),
+      copyRolloutItem(
+        tokenCount("2026-07-12T01:00:02.000Z", 100, 20, 10, 4),
+        "2026-07-12T02:00:02.000Z",
+      ),
+      turnContext("gpt-fork", "2026-07-12T02:01:01.000Z"),
+      tokenCount("2026-07-12T02:01:02.000Z", 200, 50, 30, 10),
+    ]);
+    await harness.importer.syncAll();
+
+    const parentUsage = harness.database
+      .select()
+      .from(usageEvents)
+      .where(eq(usageEvents.sessionId, "session-fork-rollback-parent"))
+      .get();
+    if (!parentUsage) throw new Error("Expected rollback parent usage fixture");
+    harness.database
+      .insert(usageEvents)
+      .values({
+        ...parentUsage,
+        agentId: "session-fork-rollback-child",
+        id: "legacy-root-fork-rollback-duplicate",
+        sessionId: "session-fork-rollback-child",
+        sourceHash: "legacy-root-fork-rollback-duplicate",
+        timestamp: "2026-07-12T02:00:02.000Z",
+      })
+      .run();
+    harness.database
+      .update(importStates)
+      .set({ dedupeVersion: 6 })
+      .where(eq(importStates.sourcePath, forkSource))
+      .run();
+    harness.database.$client.exec(`
+      create trigger fail_root_fork_repair before insert on usage_events
+      when new.session_id = 'session-fork-rollback-child'
+      begin select raise(abort, 'forced root fork repair failure'); end;
+    `);
+
+    expect((await harness.importer.syncAll()).error).toContain("forced root fork repair failure");
+    expect(
+      harness.database
+        .select({ totalTokens: usageEvents.totalTokens })
+        .from(usageEvents)
+        .where(eq(usageEvents.sessionId, "session-fork-rollback-child"))
+        .orderBy(usageEvents.timestamp)
+        .all(),
+    ).toEqual([{ totalTokens: 110 }, { totalTokens: 230 }]);
+    expect(
+      harness.database
+        .select()
+        .from(importStates)
+        .where(eq(importStates.sourcePath, forkSource))
+        .get(),
+    ).toMatchObject({ dedupeVersion: 6, lastOffset: 0 });
+
+    harness.database.$client.exec("drop trigger fail_root_fork_repair");
+    expect((await harness.importer.syncAll()).error).toBeNull();
+    expect(
+      harness.database
+        .select({ totalTokens: usageEvents.totalTokens })
+        .from(usageEvents)
+        .where(eq(usageEvents.sessionId, "session-fork-rollback-child"))
+        .all(),
+    ).toEqual([{ totalTokens: 230 }]);
   });
 
   it("attributes nested subagents to their own models without overwriting the main workspace", async () => {
@@ -1184,6 +1931,31 @@ describe("session importer", () => {
     ).toBe("Tên task chuẩn trong Codex");
   });
 
+  it("applies an indexed title when the session JSONL arrives after the index", async () => {
+    const harness = await createHarness();
+    await writeFile(
+      join(harness.sessionsDirectory, "..", "session_index.jsonl"),
+      JSON.stringify({
+        id: "session-index-first",
+        thread_name: "Title có trước source",
+        updated_at: "2026-07-12T01:00:00.000Z",
+      }),
+    );
+    await harness.importer.syncAll();
+
+    await createSessionFile(harness.sessionsDirectory, [
+      sessionMeta("session-index-first"),
+      userMessage("Fallback không được thắng"),
+      turnContext("gpt-indexed"),
+      tokenCount("2026-07-12T01:00:00.000Z", 10, 0, 2, 0),
+    ]);
+    await harness.importer.syncAll();
+
+    expect(
+      getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0]?.title,
+    ).toBe("Title có trước source");
+  });
+
   it("streams session-index appends, retains partial tails and rebuilds after rewrite", async () => {
     const harness = await createHarness();
     await createSessionFile(harness.sessionsDirectory, [
@@ -1235,27 +2007,30 @@ describe("session importer", () => {
     const indexPath = join(harness.sessionsDirectory, "..", "session_index.jsonl");
 
     await harness.importer.start();
-    await harness.importer.syncAll();
-    await writeFile(
-      indexPath,
-      JSON.stringify({
-        id: "session-watched-index",
-        thread_name: "Tên đổi trong Codex",
-        updated_at: "2026-07-12T01:00:00.000Z",
-      }),
-    );
-    await vi.waitFor(
-      () => {
-        expect(
-          getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0]
-            ?.title,
-        ).toBe("Tên đổi trong Codex");
-        expect(harness.importer.getStatus().filesProcessed).toBe(0);
-      },
-      { interval: 50, timeout: 3_000 },
-    );
-    await harness.importer.stop();
-  });
+    try {
+      await harness.importer.syncAll();
+      await writeFile(
+        indexPath,
+        JSON.stringify({
+          id: "session-watched-index",
+          thread_name: "Tên đổi trong Codex",
+          updated_at: "2026-07-12T01:00:00.000Z",
+        }),
+      );
+      await vi.waitFor(
+        () => {
+          expect(
+            getSessions(harness.database, { from: "2026-07-12", to: "2026-07-12" }).sessions[0]
+              ?.title,
+          ).toBe("Tên đổi trong Codex");
+          expect(harness.importer.getStatus().filesProcessed).toBe(0);
+        },
+        { interval: 50, timeout: 6_000 },
+      );
+    } finally {
+      await harness.importer.stop();
+    }
+  }, 10_000);
 
   it("marks watcher unlinks immediately and restores the source without duplicating history", async () => {
     const harness = await createHarness();
@@ -1640,6 +2415,26 @@ describe("session importer", () => {
     expect(harness.database.select().from(usageEvents).all()).toHaveLength(1);
     expect(harness.database.select().from(usageHourlyRollups).all()).toHaveLength(0);
     expect(harness.database.select().from(usageDailyRollups).all()).toHaveLength(0);
+  });
+
+  it("publishes only retention freshness and leaves alert analytics clean when no rows change", async () => {
+    const harness = await createHarness();
+    const onDataChanged = vi.fn();
+    const revisions: (readonly AppRevisionScope[] | undefined)[] = [];
+    const retention = new RetentionService(
+      harness.database,
+      join(harness.sessionsDirectory, "..", "usage.db"),
+      harness.sessionsDirectory,
+      () => new Date("2026-07-13T00:00:00.000Z"),
+      harness.inventory,
+      (scopes) => revisions.push(scopes),
+      onDataChanged,
+    );
+
+    await retention.compact();
+
+    expect(onDataChanged).not.toHaveBeenCalled();
+    expect(revisions).toEqual([["data-health", "storage"]]);
   });
 
   it("reports storage paths and keeps scheduled compaction single-instance", async () => {
@@ -2104,6 +2899,9 @@ describe("session importer", () => {
 async function createHarness(
   options: {
     createInventory?: (sessionsDirectory: string) => SourceInventory;
+    onDataChanged?: () => void;
+    onRevision?: (scopes: readonly AppRevisionScope[]) => void;
+    onStatement?: (statement: unknown) => void;
     scanIntervalMs?: number;
   } = {},
 ) {
@@ -2112,12 +2910,16 @@ async function createHarness(
   const sessionsDirectory = join(directory, "sessions");
   await mkdir(sessionsDirectory, { recursive: true });
   const databasePath = join(directory, "usage.db");
-  const database = createDatabase(databasePath);
+  const database = createDatabase(databasePath, {
+    ...(options.onStatement ? { onStatement: options.onStatement } : {}),
+  });
   migrateDatabase(database);
   const inventory =
     options.createInventory?.(sessionsDirectory) ?? new SourceInventory(sessionsDirectory);
   const importer = new SessionImporter(database, sessionsDirectory, {
     inventory,
+    ...(options.onDataChanged ? { onDataChanged: options.onDataChanged } : {}),
+    ...(options.onRevision ? { onRevision: options.onRevision } : {}),
     ...(options.scanIntervalMs === undefined ? {} : { scanIntervalMs: options.scanIntervalMs }),
   });
   const retention = new RetentionService(
@@ -2156,6 +2958,7 @@ function sessionMeta(
     agentId?: string;
     cwd?: string;
     depth?: number;
+    forkedFromId?: string;
     name?: string;
     parentThreadId?: string;
     role?: string;
@@ -2168,6 +2971,7 @@ function sessionMeta(
       ...(options.depth === undefined
         ? {}
         : { source: { subagent: { thread_spawn: { depth: options.depth } } } }),
+      ...(options.forkedFromId ? { forked_from_id: options.forkedFromId } : {}),
       ...(options.name ? { agent_nickname: options.name } : {}),
       ...(options.parentThreadId ? { parent_thread_id: options.parentThreadId } : {}),
       ...(options.role ? { agent_role: options.role } : {}),
@@ -2178,6 +2982,20 @@ function sessionMeta(
     },
     timestamp: "2026-07-12T00:00:00.000Z",
     type: "session_meta",
+  });
+}
+
+function copyRolloutItem(rawLine: string, timestamp: string, responseItemId?: string): string {
+  const parsed = JSON.parse(rawLine) as Record<string, unknown>;
+  const { timestamp: _previousTimestamp, ...item } = parsed;
+  void _previousTimestamp;
+  const payload = item["payload"];
+  return JSON.stringify({
+    timestamp,
+    ...item,
+    ...(responseItemId && typeof payload === "object" && payload !== null
+      ? { payload: { ...payload, id: responseItemId } }
+      : {}),
   });
 }
 
@@ -2283,4 +3101,26 @@ function tokenCount(
     timestamp,
     type: "event_msg",
   });
+}
+
+function previousUsageIdentity(
+  sessionId: string,
+  agentId: string,
+  model: string,
+  rawLine: string,
+): { id: string; sourceHash: string } {
+  const parsed = JSON.parse(rawLine) as {
+    payload?: { info?: { last_token_usage?: unknown; total_token_usage?: unknown } };
+  };
+  const lastUsage = normalizeTokenUsage(parsed.payload?.info?.last_token_usage);
+  if (!lastUsage) throw new Error("Expected last token usage fixture");
+  const cumulativeUsage = normalizeTokenUsage(parsed.payload?.info?.total_token_usage);
+  const observation = cumulativeUsage ? { cumulativeUsage, lastUsage } : rawLine;
+  const sourceHash = createHash("sha256")
+    .update(JSON.stringify({ agentId, model, observation }))
+    .digest("hex");
+  return {
+    id: createHash("sha256").update(`${sessionId}\u0000${sourceHash}`).digest("hex"),
+    sourceHash,
+  };
 }
