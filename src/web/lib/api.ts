@@ -1,10 +1,27 @@
-import type { DashboardFilters, ModelRate, SessionFilters } from "@/shared/types";
+import type {
+  DailyMinuteReportQuery,
+  DashboardFilters,
+  ModelRate,
+  SessionFilters,
+} from "@/shared/types";
 import { apiClient, rpcJson, rpcOptions, toDashboardQuery } from "@/web/lib/rpc-client";
 
 export function fetchDashboard(filters: DashboardFilters, signal?: AbortSignal) {
   return rpcJson(
     apiClient.api.dashboard.$get({ query: toDashboardQuery(filters) }, rpcOptions(signal)),
   );
+}
+
+export function fetchDailyMinuteReport(filters: DashboardFilters, signal?: AbortSignal) {
+  const dashboardQuery = toDashboardQuery(filters);
+  const query: DailyMinuteReportQuery = {
+    date: filters.from,
+    ...(dashboardQuery.agentKind ? { agentKind: dashboardQuery.agentKind } : {}),
+    ...(dashboardQuery.model ? { model: dashboardQuery.model } : {}),
+    ...(dashboardQuery.models ? { models: dashboardQuery.models } : {}),
+    ...(dashboardQuery.project ? { project: dashboardQuery.project } : {}),
+  };
+  return rpcJson(apiClient.api.dashboard.minutes.$get({ query }, rpcOptions(signal)));
 }
 
 export function fetchSessionSummaries(filters: SessionFilters, signal?: AbortSignal) {

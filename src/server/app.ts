@@ -16,6 +16,7 @@ import {
 import {
   backfillUnpricedUsage,
   getDashboard,
+  getDailyMinuteReport,
   getKnownModels,
   getModelRates,
   getSessionDetail,
@@ -59,6 +60,7 @@ import type {
   AgentFilters,
   DashboardFilters,
   DashboardQuery,
+  DailyMinuteReportQuery,
   PricingSimulationRequest,
   ProjectPageFilters,
   ProjectPageQuery,
@@ -348,12 +350,18 @@ function createActivityRoutes({ database }: AppDependencies) {
 
 function createAnalyticsRoutes({ database, events }: AppDependencies) {
   const dashboardQuery = queryValidator<DashboardQuery>()(parseFilters);
+  const dailyMinuteReportQuery = queryValidator<DailyMinuteReportQuery>()(
+    parseDailyMinuteReportFilters,
+  );
   const sessionQuery = queryValidator<SessionQuery>()(parseSessionFilters);
   const agentQuery = queryValidator<AgentQuery>()(parseAgentFilters);
   const agentPageQuery = queryValidator<AgentPageQuery>()(parseAgentPageFilters);
   const projectPageQuery = queryValidator<ProjectPageQuery>()(parseProjectPageFilters);
   const projectBody = jsonValidator(projectSchema);
   return new Hono()
+    .get("/dashboard/minutes", dailyMinuteReportQuery, (context) =>
+      context.json(getDailyMinuteReport(database, context.req.valid("query"))),
+    )
     .get("/dashboard", dashboardQuery, (context) =>
       context.json(getDashboard(database, context.req.valid("query"))),
     )
@@ -746,6 +754,16 @@ function parseFilters(
   if (models.length > 0) data.models = [...new Set(models)];
   if (projectId) data.projectId = projectId;
   return { data, success: true };
+}
+
+function parseDailyMinuteReportFilters(
+  query: Record<string, string | undefined>,
+): ParseResult<DashboardFilters> {
+  const date = query["date"];
+  if (!date || !isIsoDate(date)) {
+    return { error: "date must be a valid ISO date", success: false };
+  }
+  return parseFilters({ ...query, from: date, to: date });
 }
 
 function parseSessionFilters(

@@ -26,7 +26,13 @@ import { useSearchParams } from "react-router";
 import type { TooltipContentProps } from "recharts";
 import { toast } from "sonner";
 
-import { fetchDashboard, fetchModels, fetchStatus, syncSessions } from "@/web/lib/api";
+import {
+  fetchDailyMinuteReport,
+  fetchDashboard,
+  fetchModels,
+  fetchStatus,
+  syncSessions,
+} from "@/web/lib/api";
 import { InsightsPanel } from "@/web/components/insights-panel";
 import { MetricCard } from "@/web/components/metric-card";
 import { ProductFilterBar } from "@/web/components/product-filter-bar";
@@ -59,12 +65,16 @@ import type {
   DashboardKpis,
   HourlyModelUsage,
   HourlyUsage,
+  MinuteModelCall,
+  MinuteUsageBucket,
   ModelUsage,
 } from "@/shared/types";
 import {
   fetchOverview,
   fetchProjectOptions,
   filtersFromSearch as parseUrlFilters,
+  localDate,
+  shiftDate,
   updateFilterSearch,
 } from "@/web/lib/product-api";
 import {
@@ -88,6 +98,11 @@ const USD_FORMATTER = new Intl.NumberFormat("en-US", {
   currency: "USD",
   maximumFractionDigits: 2,
   style: "currency",
+});
+const MINUTE_REPORT_TIME_FORMATTER = new Intl.DateTimeFormat("vi-VN", {
+  hour: "2-digit",
+  minute: "2-digit",
+  timeZone: "Asia/Ho_Chi_Minh",
 });
 const loadDashboardCharts = () => import("@/web/components/dashboard-chart-primitives");
 const Bar = lazy(async () => ({ default: (await loadDashboardCharts()).Bar }));
@@ -378,6 +393,9 @@ export function DashboardView({ mode = "overview" }: { mode?: DashboardMode }) {
                 </CardContent>
               </Card>
             ) : null}
+            {mode === "overview" && showHourly ? (
+              <DailyMinuteReportCard filters={deferredFilters} metric={chartMetric} />
+            ) : null}
           </DeferredChartSection>
           <Card className="deferred-section overflow-hidden xl:col-span-5">
             <CardHeader className="flex-row flex-wrap items-start justify-between gap-4 space-y-0">
@@ -508,8 +526,8 @@ function DeferredChartSection({ children }: { children: React.ReactNode }) {
   return (
     <div
       ref={container}
-      className="deferred-section grid gap-4 xl:col-span-5"
-      style={{ containIntrinsicSize: "900px", contentVisibility: "auto" }}
+      className={`grid gap-4 xl:col-span-5${visible ? "" : "deferred-section"}`}
+      style={visible ? undefined : { containIntrinsicSize: "900px" }}
     >
       {visible ? (
         <Suspense fallback={<ChartSectionSkeleton />}>{children}</Suspense>
@@ -767,6 +785,419 @@ function UsageChart({
           onSelect={onBucketSelect}
         />
       ) : null}
+    </div>
+  );
+}
+
+function DailyMinuteReportCard({
+  filters,
+  metric,
+}: {
+  filters: DashboardFilters;
+  metric: ChartMetric;
+}) {
+  const today = useCurrentLocalDate();
+  const isToday = filters.from === filters.to && filters.from === today;
+  const report = useQuery({
+    enabled: isToday,
+    queryKey: ["dashboard", "minutes", filters],
+    queryFn: ({ signal }) => fetchDailyMinuteReport(filters, signal),
+    staleTime: 30_000,
+  });
+
+  if (!isToday) {
+    return (
+      <Card className="xl:col-span-5" data-testid="daily-minute-report">
+        <CardHeader>
+          <CardTitle>Chi tiết 5 phút</CardTitle>
+          <CardDescription>
+            Chi tiết 5 phút chỉ có cho hôm nay; ngày {filters.from} vẫn còn breakdown theo giờ.
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="xl:col-span-5" data-testid="daily-minute-report">
+      <CardHeader>
+        <CardTitle>Chi tiết 5 phút hôm nay</CardTitle>
+        <CardDescription>
+          {filters.from} theo timezone Asia/Ho_Chi_Minh
+          {report.data?.generatedAt
+            ? `; cập nhật lúc ${MINUTE_REPORT_TIME_FORMATTER.format(new Date(report.data.generatedAt))}.`
+            : "; token, cost và yêu cầu theo từng bucket 5 phút."}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {report.isLoading ? (
+          <div className="space-y-3" aria-label="Đang tải báo cáo 5 phút" role="status">
+            <Skeleton className="h-64" />
+            <Skeleton className="h-24" />
+          </div>
+        ) : report.error ? (
+          <div className="border-destructive/50 bg-destructive/5 flex min-h-40 flex-col items-center justify-center gap-3 rounded-lg border px-6 text-center text-sm">
+            <p>Không tải được chi tiết 5 phút: {report.error.message}</p>
+            <Button size="sm" variant="outline" onClick={() => void report.refetch()}>
+              Thử lại
+            </Button>
+          </div>
+        ) : report.data && !report.data.available ? (
+          <div className="text-muted-foreground flex min-h-40 items-center justify-center rounded-lg border border-dashed px-6 text-center text-sm">
+            Chi tiết 5 phút chỉ có cho ngày {report.data.availableDate}; dữ liệu theo giờ vẫn được
+            giữ theo retention hiện tại.
+          </div>
+        ) : (
+          <MinuteUsageChart
+            data={report.data?.buckets ?? []}
+            metric={metric}
+            modelCalls={report.data?.modelCalls ?? []}
+          />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function MinuteUsageChart({
+  data,
+  metric,
+  modelCalls,
+}: {
+  data: MinuteUsageBucket[];
+  metric: ChartMetric;
+  modelCalls: MinuteModelCall[];
+}) {
+  const latestUsageMinute = useMemo(
+    () => data.findLast(hasMinuteUsage)?.minute ?? data.at(-1)?.minute ?? null,
+    [data],
+  );
+  const [selectedMinute, setSelectedMinute] = useState<string | null>(() => latestUsageMinute);
+  const [showTable, setShowTable] = useState(false);
+  const dataByMinute = useMemo(
+    () => new Map(data.map((bucket) => [bucket.minute, bucket])),
+    [data],
+  );
+  const modelCallsByMinute = useMemo(() => groupMinuteModelCalls(modelCalls), [modelCalls]);
+  const points = useMemo(
+    () =>
+      data.map((bucket) => ({
+        ...bucket,
+        value: chartMetricValue(metric, bucket),
+      })),
+    [data, metric],
+  );
+  const effectiveSelectedMinute =
+    selectedMinute && dataByMinute.has(selectedMinute) ? selectedMinute : latestUsageMinute;
+  const selected = effectiveSelectedMinute ? dataByMinute.get(effectiveSelectedMinute) : undefined;
+  const currentMinute = data.at(-1)?.minute;
+  const hasUsage = data.some(hasMinuteUsage);
+  const moveSelection = (direction: -1 | 1) => {
+    if (data.length === 0) return;
+    const currentIndex = effectiveSelectedMinute
+      ? data.findIndex((bucket) => bucket.minute === effectiveSelectedMinute)
+      : data.length - 1;
+    const nextIndex = Math.min(data.length - 1, Math.max(0, currentIndex + direction));
+    setSelectedMinute(data.at(nextIndex)?.minute ?? null);
+  };
+
+  if (!hasUsage) {
+    return (
+      <div className="text-muted-foreground flex h-56 items-center justify-center rounded-lg border border-dashed px-6 text-center text-sm">
+        Chưa có usage trong ngày hôm nay.
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-w-0 space-y-4">
+      <ChartContainer
+        aria-describedby="minute-report-detail"
+        aria-label={`${metricLabel(metric)} theo bucket 5 phút; dùng phím mũi tên trái hoặc phải để đổi bucket`}
+        className="focus-visible:ring-ring h-64 rounded-md outline-none focus-visible:ring-2"
+        config={chartConfig}
+        data-testid="minute-report-chart"
+        onKeyDown={(event) => {
+          if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+            event.preventDefault();
+            moveSelection(event.key === "ArrowLeft" ? -1 : 1);
+          } else if (event.key === "Home") {
+            event.preventDefault();
+            setSelectedMinute(data[0]?.minute ?? null);
+          } else if (event.key === "End") {
+            event.preventDefault();
+            setSelectedMinute(data.at(-1)?.minute ?? null);
+          }
+        }}
+        role="group"
+        tabIndex={0}
+      >
+        <ComposedChart
+          data={points}
+          margin={{ left: 8, right: 8, top: 8 }}
+          onClick={(state) => {
+            if (typeof state?.activeLabel === "string") setSelectedMinute(state.activeLabel);
+          }}
+          onMouseMove={(state) => {
+            if (typeof state?.activeLabel === "string") setSelectedMinute(state.activeLabel);
+          }}
+        >
+          <CartesianGrid strokeDasharray="3 3" vertical={false} />
+          <XAxis dataKey="minute" interval={11} tickLine={false} axisLine={false} />
+          <YAxis
+            yAxisId="metric"
+            tickFormatter={(value: number) =>
+              metric === "cost" ? `$${value.toFixed(1)}` : compactNumber(value)
+            }
+            tickLine={false}
+            axisLine={false}
+            width={52}
+          />
+          <Tooltip
+            content={(props) => (
+              <MinuteChartTooltip
+                {...props}
+                dataByMinute={dataByMinute}
+                metric={metric}
+                modelCallsByMinute={modelCallsByMinute}
+              />
+            )}
+          />
+          <Line
+            yAxisId="metric"
+            activeDot={{ r: 4 }}
+            dataKey="value"
+            dot={false}
+            isAnimationActive={false}
+            name={metricLabel(metric)}
+            stroke="var(--chart-1)"
+            strokeWidth={2}
+            type="stepAfter"
+          />
+        </ComposedChart>
+      </ChartContainer>
+
+      {selected ? (
+        <MinuteBucketDetail
+          bucket={selected}
+          current={selected.minute === currentMinute}
+          modelCalls={modelCallsByMinute.get(selected.minute) ?? []}
+        />
+      ) : null}
+
+      <Button
+        aria-controls="minute-report-table"
+        aria-expanded={showTable}
+        size="sm"
+        type="button"
+        variant="outline"
+        onClick={() => setShowTable((value) => !value)}
+      >
+        {showTable ? "Ẩn dữ liệu dạng bảng" : "Xem dữ liệu dạng bảng"}
+      </Button>
+      {showTable ? <MinuteUsageTable data={data} modelCallsByMinute={modelCallsByMinute} /> : null}
+    </div>
+  );
+}
+
+function MinuteChartTooltip({
+  active,
+  dataByMinute,
+  label,
+  metric,
+  modelCallsByMinute,
+}: TooltipContentProps & {
+  dataByMinute: Map<string, MinuteUsageBucket>;
+  metric: ChartMetric;
+  modelCallsByMinute: Map<string, MinuteModelCall[]>;
+}) {
+  if (!active || typeof label !== "string") return null;
+  const bucket = dataByMinute.get(label);
+  if (!bucket) return null;
+  const modelCalls = modelCallsByMinute.get(bucket.minute) ?? [];
+  return (
+    <div className="bg-background min-w-52 space-y-1 rounded-md border p-3 text-sm shadow-md">
+      <p className="font-medium">{bucket.minute}</p>
+      <p>
+        {metricLabel(metric)}: <strong>{formatChartMetric(metric, bucket)}</strong>
+      </p>
+      <p>Cost ước tính: {formatUsd(bucket.estimatedCostUsd)}</p>
+      <p>Yêu cầu: {formatTokens(bucket.requestCount)}</p>
+      {modelCalls.slice(0, 3).map((item) => (
+        <p className="text-muted-foreground" key={item.model}>
+          {item.model}: {formatTokens(item.requestCount)} lượt
+        </p>
+      ))}
+      {modelCalls.length > 3 ? (
+        <p className="text-muted-foreground">+{formatTokens(modelCalls.length - 3)} model khác</p>
+      ) : null}
+    </div>
+  );
+}
+
+function MinuteBucketDetail({
+  bucket,
+  current,
+  modelCalls,
+}: {
+  bucket: MinuteUsageBucket;
+  current: boolean;
+  modelCalls: MinuteModelCall[];
+}) {
+  const uncachedInput = Math.max(0, bucket.inputTokens - bucket.cachedInputTokens);
+  const cacheRate = safeRatio(bucket.cachedInputTokens, bucket.inputTokens) * 100;
+  return (
+    <div
+      className="bg-muted/40 space-y-3 rounded-lg border p-4"
+      data-testid="minute-report-detail"
+      id="minute-report-detail"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="font-medium">Bucket {bucket.minute}</p>
+        {current ? <Badge variant="secondary">Đang cập nhật</Badge> : null}
+      </div>
+      <dl className="grid gap-3 text-sm min-[420px]:grid-cols-2 lg:grid-cols-4">
+        <MinuteDetailValue label="Yêu cầu" value={formatTokens(bucket.requestCount)} />
+        <MinuteDetailValue label="Input thường" value={formatTokens(uncachedInput)} />
+        <MinuteDetailValue
+          label="Cache"
+          value={`${formatTokens(bucket.cachedInputTokens)} · ${formatPercent(cacheRate)}`}
+        />
+        <MinuteDetailValue label="Output" value={formatTokens(bucket.outputTokens)} />
+        <MinuteDetailValue label="Reasoning" value={formatTokens(bucket.reasoningOutputTokens)} />
+        <MinuteDetailValue label="Tổng token" value={formatTokens(bucket.totalTokens)} />
+        <MinuteDetailValue label="Cost ước tính" value={formatUsd(bucket.estimatedCostUsd)} />
+        <MinuteDetailValue label="Phiên" value={formatTokens(bucket.sessionCount)} />
+      </dl>
+      {bucket.unpricedUsageCount > 0 ? (
+        <p className="text-sm text-amber-700 dark:text-amber-300">
+          {formatTokens(bucket.unpricedUsageCount)}/{formatTokens(bucket.requestCount)} yêu cầu chưa
+          định giá; cost hiện tại chỉ là subtotal.
+        </p>
+      ) : (
+        <p className="text-muted-foreground text-sm">Cost đã được định giá đầy đủ.</p>
+      )}
+      <section aria-label={`Số lượt gọi model trong bucket ${bucket.minute}`} className="space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-sm font-medium">Call theo model</p>
+          <Badge variant="outline">{formatTokens(bucket.requestCount)} lượt</Badge>
+        </div>
+        {modelCalls.length > 0 ? (
+          <ul className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+            {modelCalls.slice(0, 12).map((item) => (
+              <li
+                className="bg-background flex min-w-0 items-center justify-between gap-3 rounded-md border px-3 py-2 text-sm"
+                key={item.model}
+              >
+                <span className="truncate" title={item.model}>
+                  {item.model}
+                </span>
+                <strong className="shrink-0 tabular-nums">
+                  {formatTokens(item.requestCount)} lượt
+                </strong>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-muted-foreground text-sm">Bucket này chưa có model phát sinh call.</p>
+        )}
+        {modelCalls.length > 12 ? (
+          <p className="text-muted-foreground text-sm">
+            Còn {formatTokens(modelCalls.length - 12)} model khác trong bucket.
+          </p>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
+function MinuteDetailValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="mt-1 font-medium tabular-nums">{value}</dd>
+    </div>
+  );
+}
+
+function MinuteUsageTable({
+  data,
+  modelCallsByMinute,
+}: {
+  data: MinuteUsageBucket[];
+  modelCallsByMinute: Map<string, MinuteModelCall[]>;
+}) {
+  return (
+    <div
+      aria-label="Bảng chi tiết usage theo bucket 5 phút"
+      className="overflow-x-auto rounded-lg border"
+      id="minute-report-table"
+      role="region"
+      // A focusable scroll container keeps every table column keyboard-reachable.
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+      tabIndex={0}
+    >
+      <table className="w-full min-w-[70rem] text-sm">
+        <caption className="sr-only">
+          Usage hôm nay theo từng bucket 5 phút, timezone Asia/Ho_Chi_Minh
+        </caption>
+        <thead className="bg-muted/50">
+          <tr>
+            <th className="px-3 py-2 text-left">Thời gian</th>
+            <th className="px-3 py-2 text-right">Yêu cầu</th>
+            <th className="px-3 py-2 text-right">Input thường</th>
+            <th className="px-3 py-2 text-right">Cache</th>
+            <th className="px-3 py-2 text-right">Output</th>
+            <th className="px-3 py-2 text-right">Reasoning</th>
+            <th className="px-3 py-2 text-right">Tổng token</th>
+            <th className="px-3 py-2 text-right">Cost</th>
+            <th className="px-3 py-2 text-right">Phiên</th>
+            <th className="px-3 py-2 text-left">Call theo model</th>
+            <th className="px-3 py-2 text-left">Độ phủ giá</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.map((bucket) => (
+            <tr className="border-t" key={bucket.minute}>
+              <th className="px-3 py-2 text-left font-medium" scope="row">
+                {bucket.minute}
+              </th>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatTokens(bucket.requestCount)}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatTokens(Math.max(0, bucket.inputTokens - bucket.cachedInputTokens))}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatTokens(bucket.cachedInputTokens)}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatTokens(bucket.outputTokens)}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatTokens(bucket.reasoningOutputTokens)}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatTokens(bucket.totalTokens)}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatUsd(bucket.estimatedCostUsd)}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums">
+                {formatTokens(bucket.sessionCount)}
+              </td>
+              <td className="px-3 py-2">
+                {formatMinuteModelCalls(modelCallsByMinute.get(bucket.minute) ?? [])}
+              </td>
+              <td className="px-3 py-2">
+                {bucket.unpricedUsageCount > 0
+                  ? `${formatTokens(bucket.unpricedUsageCount)}/${formatTokens(bucket.requestCount)} chưa định giá`
+                  : "Đầy đủ"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -1136,6 +1567,45 @@ function formatChartMetric(
   }
 }
 
+function chartMetricValue(
+  metric: ChartMetric,
+  usage: { estimatedCostUsd: number; requestCount: number; totalTokens: number },
+): number {
+  switch (metric) {
+    case "cost":
+      return usage.estimatedCostUsd;
+    case "requests":
+      return usage.requestCount;
+    case "tokens":
+      return usage.totalTokens;
+  }
+}
+
+function hasMinuteUsage(bucket: MinuteUsageBucket): boolean {
+  return bucket.requestCount > 0 || bucket.totalTokens > 0 || bucket.estimatedCostUsd > 0;
+}
+
+function groupMinuteModelCalls(rows: MinuteModelCall[]): Map<string, MinuteModelCall[]> {
+  const groups = new Map<string, MinuteModelCall[]>();
+  for (const row of rows) {
+    const values = groups.get(row.minute) ?? [];
+    values.push(row);
+    groups.set(row.minute, values);
+  }
+  for (const values of groups.values()) {
+    values.sort(
+      (left, right) =>
+        right.requestCount - left.requestCount || left.model.localeCompare(right.model),
+    );
+  }
+  return groups;
+}
+
+function formatMinuteModelCalls(rows: MinuteModelCall[]): string {
+  if (rows.length === 0) return "—";
+  return rows.map((row) => `${row.model}: ${formatTokens(row.requestCount)}`).join(" · ");
+}
+
 function groupModelUsage<T extends { model: string }>(
   rows: T[],
   bucket: (row: T) => string,
@@ -1239,6 +1709,27 @@ function inclusiveDays(from: string | undefined, to: string | undefined): number
       (new Date(`${to}T12:00:00`).getTime() - new Date(`${from}T12:00:00`).getTime()) / 86_400_000,
     ) + 1,
   );
+}
+
+function useCurrentLocalDate(): string {
+  const [today, setToday] = useState(() => localDate(new Date()));
+
+  useEffect(() => {
+    let timer: number | undefined;
+    const scheduleNextMidnight = () => {
+      const current = localDate(new Date());
+      setToday(current);
+      const nextDate = shiftDate(current, 1);
+      const nextMidnight = Date.parse(`${nextDate}T00:00:01+07:00`);
+      timer = window.setTimeout(scheduleNextMidnight, Math.max(1_000, nextMidnight - Date.now()));
+    };
+    scheduleNextMidnight();
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, []);
+
+  return today;
 }
 
 function safeRatio(numerator: number, denominator: number): number {

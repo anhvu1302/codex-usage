@@ -7,6 +7,8 @@ import type {
   ActivityTimelineResponse,
   AgentPageQuery,
   AgentsPageResponse,
+  DailyMinuteReportQuery,
+  DailyMinuteReportResponse,
   DashboardQuery,
   DashboardResponse,
   SessionQuery,
@@ -14,7 +16,7 @@ import type {
   ProjectPageQuery,
   ProjectsPageResponse,
 } from "@/shared/types";
-import { fetchSessionDetail } from "@/web/lib/api";
+import { fetchDailyMinuteReport, fetchSessionDetail } from "@/web/lib/api";
 import { dismissAllAlerts } from "@/web/lib/product-api";
 import { apiClient, rpcJson } from "@/web/lib/rpc-client";
 
@@ -25,6 +27,8 @@ describe("Hono RPC contract", () => {
     type AgentPageResult = InferResponseType<typeof apiClient.api.agents.page.$get, 200>;
     type DashboardRequest = InferRequestType<typeof apiClient.api.dashboard.$get>;
     type DashboardResult = InferResponseType<typeof apiClient.api.dashboard.$get, 200>;
+    type DailyMinuteRequest = InferRequestType<typeof apiClient.api.dashboard.minutes.$get>;
+    type DailyMinuteResult = InferResponseType<typeof apiClient.api.dashboard.minutes.$get, 200>;
     type SessionRequest = InferRequestType<typeof apiClient.api.sessions.summary.$get>;
     type SessionResult = InferResponseType<typeof apiClient.api.sessions.summary.$get, 200>;
     type TimelineRequest = InferRequestType<typeof apiClient.api.activity.timeline.$get>;
@@ -37,6 +41,9 @@ describe("Hono RPC contract", () => {
     expectTypeOf<DashboardRequest>().toEqualTypeOf<{ query: DashboardQuery }>();
     expectTypeOf<DashboardResult>().toMatchTypeOf<DashboardResponse>();
     expectTypeOf<DashboardResponse>().toMatchTypeOf<DashboardResult>();
+    expectTypeOf<DailyMinuteRequest>().toEqualTypeOf<{ query: DailyMinuteReportQuery }>();
+    expectTypeOf<DailyMinuteResult>().toMatchTypeOf<DailyMinuteReportResponse>();
+    expectTypeOf<DailyMinuteReportResponse>().toMatchTypeOf<DailyMinuteResult>();
     expectTypeOf<AgentPageRequest>().toEqualTypeOf<{ query: AgentPageQuery }>();
     expectTypeOf<AgentPageResult>().toEqualTypeOf<AgentsPageResponse>();
     expectTypeOf<SessionRequest>().toEqualTypeOf<{ query: SessionQuery }>();
@@ -112,6 +119,16 @@ describe("RPC browser transport", () => {
       },
       controller.signal,
     );
+    await fetchDailyMinuteReport(
+      {
+        agentKind: "subagent",
+        from: "2026-07-12",
+        models: ["gpt/a", "gpt b"],
+        projectId: "project/alpha",
+        to: "2026-07-12",
+      },
+      controller.signal,
+    );
 
     const request = requests[0];
     expect(request?.input).toContain(
@@ -120,6 +137,12 @@ describe("RPC browser transport", () => {
     expect(request?.input).toContain("models=gpt%2Fa%2Cgpt+b");
     expect(request?.input).toContain("project=project%2Falpha");
     expect(request?.init?.signal).toBe(controller.signal);
+    const minuteRequest = requests[1];
+    expect(minuteRequest?.input).toContain("/api/dashboard/minutes?date=2026-07-12");
+    expect(minuteRequest?.input).toContain("agentKind=subagent");
+    expect(minuteRequest?.input).toContain("models=gpt%2Fa%2Cgpt+b");
+    expect(minuteRequest?.input).toContain("project=project%2Falpha");
+    expect(minuteRequest?.init?.signal).toBe(controller.signal);
   });
 
   it("falls back to bounded alert patches while an older server lacks bulk dismiss", async () => {

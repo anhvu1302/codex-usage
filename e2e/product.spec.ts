@@ -142,7 +142,9 @@ test("notification tự đánh dấu đã đọc khi xem turn và hỗ trợ xó
   await confirmation.getByRole("button", { name: "Xóa tất cả" }).click();
   await expect.poll(() => deleteRequests).toBe(1);
   await expect(page.getByText("Chưa có cảnh báo")).toBeVisible();
+  await page.getByRole("button", { name: "Đóng" }).click();
   await expect(page.getByRole("button", { name: "Thông báo", exact: true })).toBeVisible();
+  await expect(page.getByText("Đã xóa 2 thông báo.")).toBeHidden();
 
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);

@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 
-import { getDashboard, getSessionAnomalyRows, getSessions } from "@/server/analytics";
+import {
+  getDailyMinuteReport,
+  getDashboard,
+  getSessionAnomalyRows,
+  getSessions,
+} from "@/server/analytics";
 import { createDatabase, migrateDatabase, type AppDatabase } from "@/server/db/client";
 import {
   getAgentsPage,
@@ -65,6 +70,8 @@ try {
     }),
     alerts: () => getAlertFeed(database!, now),
     dashboard7Days: () => getDashboard(database!, sevenDayFilters, now),
+    dailyMinutes: () =>
+      getDailyMinuteReport(database!, { from: "2026-07-30", to: "2026-07-30" }, now),
     anomaly7Days: () => getSessionAnomalyRows(database!, sevenDayFilters, now),
     anomalyBaseline7Days: () =>
       getSessionAnomalyRows(database!, { from: "2026-07-10", to: "2026-07-23" }, now),

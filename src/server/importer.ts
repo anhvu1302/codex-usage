@@ -135,6 +135,11 @@ type UsageRepairPreparation = {
 
 type UsageEventRow = typeof usageEvents.$inferSelect;
 
+type UsagePriceSnapshot = Pick<
+  UsageEventRow,
+  "cachedInputRate" | "costUsd" | "inputRate" | "outputRate"
+>;
+
 type ImportFileCache = {
   diagnostic: typeof importDiagnostics.$inferSelect | undefined;
   savedState: typeof importStates.$inferSelect | undefined;
@@ -270,6 +275,7 @@ export class SessionImporter {
   private sessionIndexTimer: NodeJS.Timeout | null = null;
   private sessionIndexTitles = new Map<string, IndexedTitle>();
   private stopping = false;
+  private usageRepairSnapshotTableReady = false;
   private watcher: FSWatcher | null = null;
   private status: ImportStatus = {
     error: null,
@@ -496,6 +502,7 @@ export class SessionImporter {
           .map((diagnostic) => [diagnostic.sourcePath, diagnostic]),
       );
       const usageRepair = await this.prepareUsageHistoryForDeduplication(files, states);
+      if (usageRepair.required) this.prepareUsageRepairSnapshotTable();
       const turnBackfill = this.prepareTurnAttribution(files, states);
       const repairRequired = usageRepair.required || turnBackfill.required;
       if (
@@ -556,6 +563,7 @@ export class SessionImporter {
       this.status.error = errorMessage(error);
       if (this.status.turnBackfill.isRunning) this.finishTurnBackfill(this.status.error);
     } finally {
+      this.clearUsageRepairSnapshotTable();
       this.status.sourceScan.current = null;
       this.status.isSyncing = false;
     }
@@ -1176,6 +1184,7 @@ export class SessionImporter {
   }
 
   private resetAgentDerivedData(agentId: string, sessionId: string, changes: ImporterChanges) {
+    this.snapshotUsagePrices(agentId);
     const usageDeleted = this.database
       .delete(usageEvents)
       .where(eq(usageEvents.agentId, agentId))
@@ -1225,6 +1234,67 @@ export class SessionImporter {
       .where(eq(sessionAgents.id, agentId))
       .run();
     if (titleReset.changes > 0 || summaryReset.changes > 0) markSessionChanged(changes);
+  }
+
+  private prepareUsageRepairSnapshotTable() {
+    if (this.usageRepairSnapshotTableReady) return;
+    this.database.$client.exec(`
+      create temp table usage_repair_price_snapshots (
+        id text primary key,
+        cached_input_rate real,
+        cost_usd real,
+        input_rate real,
+        output_rate real
+      )
+    `);
+    this.usageRepairSnapshotTableReady = true;
+  }
+
+  private snapshotUsagePrices(agentId: string) {
+    if (!this.usageRepairSnapshotTableReady) return;
+    this.database.$client
+      .prepare(
+        `insert or ignore into usage_repair_price_snapshots (
+           id,
+           cached_input_rate,
+           cost_usd,
+           input_rate,
+           output_rate
+         )
+         select
+           id,
+           cached_input_rate,
+           cost_usd,
+           input_rate,
+           output_rate
+         from usage_events
+         where agent_id = ?`,
+      )
+      .run(agentId);
+  }
+
+  private readUsagePriceSnapshot(candidateEventIds: readonly string[]) {
+    if (!this.usageRepairSnapshotTableReady) return undefined;
+    const statement = this.database.$client.prepare(
+      `select
+         cached_input_rate as cachedInputRate,
+         cost_usd as costUsd,
+         input_rate as inputRate,
+         output_rate as outputRate
+       from usage_repair_price_snapshots
+       where id = ?`,
+    );
+    for (const candidateEventId of candidateEventIds) {
+      const snapshot = statement.get(candidateEventId) as UsagePriceSnapshot | undefined;
+      if (snapshot) return snapshot;
+    }
+    return undefined;
+  }
+
+  private clearUsageRepairSnapshotTable() {
+    if (!this.usageRepairSnapshotTableReady) return;
+    this.database.$client.exec("drop table usage_repair_price_snapshots");
+    this.usageRepairSnapshotTableReady = false;
   }
 
   private handleLine(
@@ -1483,17 +1553,19 @@ export class SessionImporter {
       return 0;
     }
 
-    const rate = this.getRate(model);
+    const priceSnapshot =
+      existingEvents.length === 0 ? this.readUsagePriceSnapshot(candidateEventIds) : undefined;
+    const rate = priceSnapshot ? null : this.getRate(model);
     const usageEventValues = {
       agentId,
-      cachedInputRate: rate?.cachedInputRate ?? null,
+      cachedInputRate: priceSnapshot?.cachedInputRate ?? rate?.cachedInputRate ?? null,
       cachedInputTokens: usage.cachedInputTokens,
-      costUsd: rate ? calculateCost(usage, rate) : null,
-      inputRate: rate?.inputRate ?? null,
+      costUsd: priceSnapshot ? priceSnapshot.costUsd : rate ? calculateCost(usage, rate) : null,
+      inputRate: priceSnapshot?.inputRate ?? rate?.inputRate ?? null,
       inputTokens: usage.inputTokens,
       localDate,
       model,
-      outputRate: rate?.outputRate ?? null,
+      outputRate: priceSnapshot?.outputRate ?? rate?.outputRate ?? null,
       outputTokens: usage.outputTokens,
       reasoningOutputTokens: usage.reasoningOutputTokens,
       timestamp,

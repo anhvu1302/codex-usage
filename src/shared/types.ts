@@ -29,11 +29,36 @@ export type DashboardQuery = {
   to?: string;
 };
 
+export type DailyMinuteReportQuery = Omit<DashboardQuery, "from" | "to"> & {
+  date: string;
+};
+
 export type DashboardKpis = TokenUsage & {
   estimatedCostUsd: number;
   requestCount: number;
   sessionCount: number;
   unpricedUsageCount: number;
+};
+
+export type MinuteUsageBucket = DashboardKpis & {
+  minute: string;
+};
+
+export type MinuteModelCall = {
+  minute: string;
+  model: string;
+  requestCount: number;
+};
+
+export type DailyMinuteReportResponse = {
+  available: boolean;
+  availableDate: string;
+  bucketMinutes: 5;
+  buckets: MinuteUsageBucket[];
+  date: string;
+  generatedAt: string;
+  modelCalls: MinuteModelCall[];
+  timeZone: "Asia/Ho_Chi_Minh";
 };
 
 export type DailyUsage = DashboardKpis & {

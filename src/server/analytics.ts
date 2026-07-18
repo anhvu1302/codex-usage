@@ -12,12 +12,15 @@ import {
   usageHourlyRollups,
   usageRollupSessionMemberships,
 } from "@/server/db/schema";
-import { getRetentionCoverage, getSessionCoverage } from "@/server/retention";
+import { currentLocalDate, getRetentionCoverage, getSessionCoverage } from "@/server/retention";
 import { TURN_ATTRIBUTION_VERSION } from "@/server/turn-constants";
 import type {
   DashboardFilters,
   DashboardKpis,
   DashboardResponse,
+  DailyMinuteReportResponse,
+  MinuteModelCall,
+  MinuteUsageBucket,
   ModelRate,
   SessionAgentUsage,
   SessionFilters,
@@ -33,6 +36,94 @@ export type SessionAnomalyRow = {
   title: string | null;
   totalTokens: number;
 };
+
+const MINUTE_REPORT_BUCKET_MINUTES = 5 as const;
+const MINUTE_REPORT_TIME_ZONE = "Asia/Ho_Chi_Minh" as const;
+const LOCAL_TIME_FORMATTER = new Intl.DateTimeFormat("en-GB", {
+  hour: "2-digit",
+  hourCycle: "h23",
+  minute: "2-digit",
+  timeZone: MINUTE_REPORT_TIME_ZONE,
+});
+
+export function getDailyMinuteReport(
+  database: AppDatabase,
+  filters: DashboardFilters,
+  now = new Date(),
+): DailyMinuteReportResponse {
+  const availableDate = currentLocalDate(now);
+  const generatedAt = now.toISOString();
+  if (filters.from !== filters.to || filters.from !== availableDate) {
+    return {
+      available: false,
+      availableDate,
+      bucketMinutes: MINUTE_REPORT_BUCKET_MINUTES,
+      buckets: [],
+      date: filters.from,
+      generatedAt,
+      modelCalls: [],
+      timeZone: MINUTE_REPORT_TIME_ZONE,
+    };
+  }
+
+  const localMinute = sql<string>`printf(
+    '%02d:%02d',
+    cast(strftime('%H', datetime(${usageEvents.timestamp}, '+7 hours')) as integer),
+    (cast(strftime('%M', datetime(${usageEvents.timestamp}, '+7 hours')) as integer) / 5) * 5
+  )`;
+  const rows = database
+    .select({ minute: localMinute, ...aggregateFields })
+    .from(usageEvents)
+    .where(usageWhere(filters))
+    .groupBy(localMinute)
+    .all();
+  const modelCalls = database
+    .select({
+      minute: localMinute,
+      model: usageEvents.model,
+      requestCount: rawAggregateFields.requestCount,
+    })
+    .from(usageEvents)
+    .where(usageWhere(filters))
+    .groupBy(localMinute, usageEvents.model)
+    .all()
+    .map((row): MinuteModelCall => ({
+      minute: row.minute,
+      model: row.model,
+      requestCount: toNumber(row.requestCount),
+    }))
+    .sort(
+      (left, right) =>
+        left.minute.localeCompare(right.minute) ||
+        right.requestCount - left.requestCount ||
+        left.model.localeCompare(right.model),
+    );
+  const usageByMinute = new Map(
+    rows.map((row) => [row.minute, { minute: row.minute, ...toKpis(row) }]),
+  );
+  const currentMinute = localMinuteOfDay(now);
+  const lastBucketMinute =
+    Math.floor(currentMinute / MINUTE_REPORT_BUCKET_MINUTES) * MINUTE_REPORT_BUCKET_MINUTES;
+  const buckets = Array.from(
+    { length: lastBucketMinute / MINUTE_REPORT_BUCKET_MINUTES + 1 },
+    (_, index): MinuteUsageBucket => {
+      const minuteOfDay = index * MINUTE_REPORT_BUCKET_MINUTES;
+      const key = minuteLabel(minuteOfDay);
+      return usageByMinute.get(key) ?? { minute: key, ...emptyDashboardKpis() };
+    },
+  );
+
+  return {
+    available: true,
+    availableDate,
+    bucketMinutes: MINUTE_REPORT_BUCKET_MINUTES,
+    buckets,
+    date: filters.from,
+    generatedAt,
+    modelCalls,
+    timeZone: MINUTE_REPORT_TIME_ZONE,
+  };
+}
 
 export function getDashboard(
   database: AppDatabase,
@@ -1214,6 +1305,35 @@ function toKpis(row: AggregateRow | undefined): DashboardKpis {
     totalTokens: toNumber(row?.totalTokens),
     unpricedUsageCount: toNumber(row?.unpricedUsageCount),
   };
+}
+
+function emptyDashboardKpis(): DashboardKpis {
+  return {
+    cachedInputTokens: 0,
+    estimatedCostUsd: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    requestCount: 0,
+    sessionCount: 0,
+    totalTokens: 0,
+    unpricedUsageCount: 0,
+  };
+}
+
+function localMinuteOfDay(now: Date): number {
+  const parts = Object.fromEntries(
+    LOCAL_TIME_FORMATTER.formatToParts(now)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+  return Number(parts["hour"]) * 60 + Number(parts["minute"]);
+}
+
+function minuteLabel(minuteOfDay: number): string {
+  const hour = Math.floor(minuteOfDay / 60);
+  const minute = minuteOfDay % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
 function toNumber(value: number | string | null | undefined): number {

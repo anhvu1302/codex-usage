@@ -1030,25 +1030,33 @@ describe("session importer", () => {
       model: "gpt-child",
       outputRate: 2,
     });
-    await createSessionFile(harness.sessionsDirectory, [
-      sessionMeta("session-repair"),
-      turnContext("gpt-parent"),
-      tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
-    ]);
-    await createSessionFile(harness.sessionsDirectory, [
-      sessionMeta("session-repair", {
-        agentId: "agent-legacy",
-        depth: 1,
-        name: "Legacy",
-        parentThreadId: "session-repair",
-        threadSource: "subagent",
-      }),
-      sessionMeta("session-repair"),
-      taskStarted("turn-repair", "2026-07-12T01:00:01.000Z"),
-      turnContext("gpt-child"),
-      interAgentHandoff("2026-07-12T01:00:02.000Z"),
-      tokenCount("2026-07-12T01:01:00.000Z", 200, 50, 30, 10),
-    ]);
+    await createSessionFile(
+      harness.sessionsDirectory,
+      [
+        sessionMeta("session-repair"),
+        turnContext("gpt-parent"),
+        tokenCount("2026-07-12T01:00:00.000Z", 100, 20, 10, 4),
+      ],
+      "rollout-0-parent.jsonl",
+    );
+    await createSessionFile(
+      harness.sessionsDirectory,
+      [
+        sessionMeta("session-repair", {
+          agentId: "agent-legacy",
+          depth: 1,
+          name: "Legacy",
+          parentThreadId: "session-repair",
+          threadSource: "subagent",
+        }),
+        sessionMeta("session-repair"),
+        taskStarted("turn-repair", "2026-07-12T01:00:01.000Z"),
+        turnContext("gpt-child"),
+        interAgentHandoff("2026-07-12T01:00:02.000Z"),
+        tokenCount("2026-07-12T01:01:00.000Z", 200, 50, 30, 10),
+      ],
+      "rollout-1-child.jsonl",
+    );
     await harness.importer.syncAll();
 
     harness.database
@@ -2944,10 +2952,14 @@ async function createHarness(
   };
 }
 
-async function createSessionFile(directory: string, lines: string[]): Promise<string> {
+async function createSessionFile(
+  directory: string,
+  lines: string[],
+  fileName = `rollout-${Math.random().toString(16).slice(2)}.jsonl`,
+): Promise<string> {
   const nestedDirectory = join(directory, "2026", "07", "12");
   await mkdir(nestedDirectory, { recursive: true });
-  const filePath = join(nestedDirectory, `rollout-${Math.random().toString(16).slice(2)}.jsonl`);
+  const filePath = join(nestedDirectory, fileName);
   await writeFile(filePath, `${lines.join("\n")}\n`);
   return filePath;
 }

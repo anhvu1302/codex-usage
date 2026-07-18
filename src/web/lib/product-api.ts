@@ -5,6 +5,7 @@ import type {
   AgentQuery,
   BudgetSetting,
   DashboardFilters,
+  DismissAlertsResponse,
   PricingSimulationRequest,
   ProjectPageFilters,
   ProjectPageQuery,
@@ -103,7 +104,7 @@ export function fetchAlerts(signal?: AbortSignal) {
   return rpcJson(apiClient.api.alerts.$get(undefined, rpcOptions(signal)));
 }
 
-export async function dismissAllAlerts(alertIds: string[]) {
+export async function dismissAllAlerts(alertIds: string[]): Promise<DismissAlertsResponse> {
   const response = await apiClient.api.alerts.$delete();
   if (Number(response.status) !== 404) return rpcJson(response);
 

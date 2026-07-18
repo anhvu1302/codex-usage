@@ -108,6 +108,142 @@ test("theme, density, mobile navigation và accessibility", async ({ page }) => 
   await expect(page.getByRole("region", { name: "Bảng danh sách session" })).toHaveCount(0);
 });
 
+test("báo cáo hôm nay drilldown theo bucket 5 phút mà không tạo request thừa", async ({ page }) => {
+  const today = localDateInHoChiMinh(new Date());
+  const yesterday = shiftIsoDate(today, -1);
+  let minuteRequests = 0;
+  const invalidChartSizeWarnings: string[] = [];
+  page.on("console", (message) => {
+    if (
+      message.type() === "warning" &&
+      message.text().includes("width(") &&
+      message.text().includes("height(") &&
+      message.text().includes("should be greater than 0")
+    ) {
+      invalidChartSizeWarnings.push(message.text());
+    }
+  });
+  await page.route("**/api/dashboard/minutes?*", async (route) => {
+    minuteRequests += 1;
+    expect(new URL(route.request().url()).searchParams.get("date")).toBe(today);
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        available: true,
+        availableDate: today,
+        bucketMinutes: 5,
+        buckets: [
+          {
+            cachedInputTokens: 100,
+            estimatedCostUsd: 1.25,
+            inputTokens: 250,
+            minute: "00:00",
+            outputTokens: 50,
+            reasoningOutputTokens: 20,
+            requestCount: 2,
+            sessionCount: 1,
+            totalTokens: 300,
+            unpricedUsageCount: 1,
+          },
+          {
+            cachedInputTokens: 300,
+            estimatedCostUsd: 2.5,
+            inputTokens: 750,
+            minute: "00:05",
+            outputTokens: 90,
+            reasoningOutputTokens: 45,
+            requestCount: 3,
+            sessionCount: 2,
+            totalTokens: 840,
+            unpricedUsageCount: 0,
+          },
+          {
+            cachedInputTokens: 0,
+            estimatedCostUsd: 0,
+            inputTokens: 0,
+            minute: "00:10",
+            outputTokens: 0,
+            reasoningOutputTokens: 0,
+            requestCount: 0,
+            sessionCount: 0,
+            totalTokens: 0,
+            unpricedUsageCount: 0,
+          },
+        ],
+        date: today,
+        generatedAt: `${today}T00:12:30.000+07:00`,
+        modelCalls: [
+          { minute: "00:00", model: "gpt-monitor", requestCount: 2 },
+          { minute: "00:05", model: "gpt-monitor", requestCount: 2 },
+          { minute: "00:05", model: "gpt-review", requestCount: 1 },
+        ],
+        timeZone: "Asia/Ho_Chi_Minh",
+      },
+      status: 200,
+    });
+  });
+
+  await page.goto(`/?from=${today}&to=${today}`);
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  const report = page.getByTestId("daily-minute-report");
+  await expect(report.getByRole("heading", { name: "Chi tiết 5 phút hôm nay" })).toBeVisible();
+  await expect(report.getByTestId("minute-report-detail")).toContainText("Bucket 00:05");
+  await expect(report.getByTestId("minute-report-detail")).toContainText("840");
+  await expect(report.getByTestId("minute-report-detail")).toContainText("gpt-monitor");
+  await expect(report.getByTestId("minute-report-detail")).toContainText("2 lượt");
+  await expect(report.getByTestId("minute-report-detail")).toContainText("gpt-review");
+  await expect.poll(() => minuteRequests).toBe(1);
+
+  await page
+    .getByLabel("Metric biểu đồ")
+    .getByRole("button", { exact: true, name: "Cost" })
+    .click();
+  await expect(report.getByTestId("minute-report-chart")).toHaveAttribute(
+    "aria-label",
+    /Cost theo bucket 5 phút/,
+  );
+  await page.waitForTimeout(100);
+  expect(minuteRequests).toBe(1);
+
+  const chart = report.getByTestId("minute-report-chart");
+  await chart.focus();
+  await chart.press("Home");
+  await expect(report.getByTestId("minute-report-detail")).toContainText("Bucket 00:00");
+  await chart.press("ArrowRight");
+  await expect(report.getByTestId("minute-report-detail")).toContainText("Bucket 00:05");
+
+  await report.getByRole("button", { name: "Xem dữ liệu dạng bảng" }).click();
+  const table = report.getByRole("table", { name: /Usage hôm nay theo từng bucket 5 phút/ });
+  await expect(table.getByRole("row", { name: /00:05/ })).toContainText("$2.50");
+  await expect(table.getByRole("row", { name: /00:05/ })).toContainText("840");
+  await expect(table.getByRole("row", { name: /00:05/ })).toContainText(
+    "gpt-monitor: 2 · gpt-review: 1",
+  );
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(report).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+  const accessibility = await new AxeBuilder({ page })
+    .include('[data-testid="daily-minute-report"]')
+    .analyze();
+  expect(accessibility.violations).toEqual([]);
+  expect(invalidChartSizeWarnings).toEqual([]);
+
+  await page.goto(`/?from=${yesterday}&to=${yesterday}`);
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await expect(page.getByTestId("daily-minute-report")).toContainText(
+    "Chi tiết 5 phút chỉ có cho hôm nay",
+  );
+  expect(minuteRequests).toBe(1);
+
+  await page.goto(`/?from=${yesterday}&to=${today}`);
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await expect(page.getByTestId("daily-minute-report")).toHaveCount(0);
+  expect(minuteRequests).toBe(1);
+});
+
 test("request graph theo route không tải dữ liệu hoặc chart thừa", async ({ page }) => {
   const requests: string[] = [];
   page.on("request", (request) => requests.push(new URL(request.url()).pathname));
@@ -312,3 +448,20 @@ test("SSE scoped refresh, reconnect và fallback không tạo request wave", asy
   await page.waitForTimeout(2_500);
   expect(requests.filter((path) => path === "/api/status")).toHaveLength(0);
 });
+
+function localDateInHoChiMinh(date: Date): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    timeZone: "Asia/Ho_Chi_Minh",
+    year: "numeric",
+  }).formatToParts(date);
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${value["year"]}-${value["month"]}-${value["day"]}`;
+}
+
+function shiftIsoDate(date: string, days: number): string {
+  const value = new Date(`${date}T12:00:00.000Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
+}

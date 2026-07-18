@@ -119,6 +119,7 @@ describe("revision scope matching", () => {
     expect(matchesRevisionScopes(["status"], scopes)).toBe(false);
     expect(matchesRevisionScopes(["overview", {}], scopes)).toBe(true);
     expect(matchesRevisionScopes(["dashboard", {}], scopes)).toBe(true);
+    expect(matchesRevisionScopes(["dashboard", "minutes", {}], scopes)).toBe(true);
     expect(matchesRevisionScopes(["session", "id"], scopes)).toBe(true);
     expect(matchesRevisionScopes(["sessions", "summary", {}], scopes)).toBe(true);
   });
