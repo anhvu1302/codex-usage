@@ -20,5 +20,27 @@ args = ["serve", "--mcp", "--path", "/Users/VanAnh/WorkSpace/Personal/codex-usag
 enabled = false
 
 [agents]
+# Keep routing bounded: one selected search role, one impact review, and up to
+# three non-overlapping workers alongside the coordinating main thread.
 max_threads = 6
 max_depth = 1
+
+[agents.explorer]
+description = "Fast read-only Codex Usage search for routine bounded lookup."
+config_file = "./agents/explorer.toml"
+nickname_candidates = ["Scout", "Mapper"]
+
+[agents.explorer_deep]
+description = "High-confidence read-only Codex Usage search for ambiguous or high-risk traces."
+config_file = "./agents/explorer-deep.toml"
+nickname_candidates = ["Tracer", "Pathfinder"]
+
+[agents.repo_impact]
+description = "Read-only Codex Usage cross-layer impact review for contracts, SQLite, importer, retention, privacy, and UI risk."
+config_file = "./agents/repo-impact.toml"
+nickname_candidates = ["Impact", "Review"]
+
+[agents.repo_worker]
+description = "Workspace-write Codex Usage implementation worker for one non-overlapping repository or exact file partition."
+config_file = "./agents/repo-worker.toml"
+nickname_candidates = ["Builder", "Patch"]
