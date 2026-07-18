@@ -80,8 +80,12 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
                 ],
               },
               {
-                duration: 550,
-                easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+                // A strongly front-loaded ease makes the radius cover most of the
+                // viewport immediately, then appear to stall near the far edge.
+                // Keep radial velocity constant so dense dashboard snapshots reveal
+                // continuously instead of pausing halfway through the page.
+                duration: 360,
+                easing: "linear",
                 pseudoElement: "::view-transition-new(root)",
               },
             ),

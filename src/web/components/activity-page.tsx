@@ -19,7 +19,15 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { Link, useSearchParams } from "react-router";
 
 import { DataHealthCenter } from "@/web/components/data-health-center";
@@ -54,11 +62,13 @@ import {
   defaultDateRange,
   fetchProjectOptions,
   formatTokens,
+  formatUsd,
   localDate,
   shiftDate,
 } from "@/web/lib/product-api";
 import { cn } from "@/web/lib/utils";
 import type {
+  ActivityDailyUsage,
   ActivityFilters,
   ActivityKind,
   ActivitySummary,
@@ -70,6 +80,8 @@ type ProjectOption = { displayName: string; id: string };
 
 type TrendGrouping = "agent" | "kind" | "project";
 type ActivityTab = "health" | "overview" | "timeline";
+type HeatmapMetric = "cost" | "events" | "tokens";
+type HeatmapDay = ActivityDailyUsage & { eventCount: number };
 type TrendPoint = Record<string, number | string> & { date: string };
 type TrendSeries = { color: string; id: string; label: string };
 type TimelineAgentNode = {
@@ -109,6 +121,11 @@ const LOCAL_DATE_FORMATTER = new Intl.DateTimeFormat("vi-VN", {
   year: "numeric",
 });
 const highlightedKinds: ActivityKind[] = ["patch", "mcp", "web", "compaction", "abort"];
+const heatmapMetrics: { id: HeatmapMetric; label: string }[] = [
+  { id: "events", label: "Event" },
+  { id: "tokens", label: "Token" },
+  { id: "cost", label: "Cost" },
+];
 const chartColors = [
   "var(--chart-1)",
   "var(--chart-2)",
@@ -317,21 +334,13 @@ export function ActivityPage() {
               </CardContent>
             </Card>
 
-            <Card>
-              <CardHeader>
-                <CardTitle>Heatmap hoạt động</CardTitle>
-                <CardDescription>
-                  Cường độ event theo ngày, tối đa 365 ngày gần nhất của range.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                {activity.isLoading ? (
-                  <Skeleton className="h-52" />
-                ) : (
-                  <ActivityHeatmap daily={daily} filters={filters} />
-                )}
-              </CardContent>
-            </Card>
+            <ActivityHeatmap
+              key={activityFilterKey(filters)}
+              daily={daily}
+              dailyUsage={activity.data?.dailyUsage ?? []}
+              filters={filters}
+              loading={activity.isLoading}
+            />
           </div>
         </TabsContent>
 
@@ -718,95 +727,315 @@ function ActivityTrend({
 
 function ActivityHeatmap({
   daily,
+  dailyUsage,
   filters,
+  loading,
 }: {
   daily: ActivitySummary[];
+  dailyUsage: ActivityDailyUsage[];
   filters: ActivityFilters;
+  loading: boolean;
 }) {
+  const [metric, setMetric] = useState<HeatmapMetric>("events");
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [showTable, setShowTable] = useState(false);
-  const totals = new Map<string, number>();
-  for (const row of daily) totals.set(row.date, (totals.get(row.date) ?? 0) + row.count);
+  const cellReferences = useRef(new Map<string, HTMLButtonElement>());
   const visibleFrom =
     filters.from < shiftIsoDate(filters.to, -364) ? shiftIsoDate(filters.to, -364) : filters.from;
-  const dates = calendarGridDates(visibleFrom, filters.to);
-  const max = Math.max(0, ...totals.values());
+  const dates = useMemo(
+    () => calendarGridDates(visibleFrom, filters.to),
+    [filters.to, visibleFrom],
+  );
+  const dateRows = useMemo(
+    () =>
+      Array.from({ length: 7 }, (_, rowIndex) =>
+        dates.filter((_, dateIndex) => dateIndex % 7 === rowIndex),
+      ),
+    [dates],
+  );
+  const heatmapDays = useMemo(
+    () => buildHeatmapDays(daily, dailyUsage, visibleFrom, filters.to),
+    [daily, dailyUsage, filters.to, visibleFrom],
+  );
+  const daysByDate = useMemo(
+    () => new Map(heatmapDays.map((day) => [day.date, day])),
+    [heatmapDays],
+  );
+  const defaultDate = useMemo(
+    () =>
+      heatmapDays.findLast(
+        (day) =>
+          day.eventCount > 0 ||
+          day.requestCount > 0 ||
+          day.totalTokens > 0 ||
+          day.estimatedCostUsd > 0,
+      )?.date ??
+      heatmapDays.at(-1)?.date ??
+      null,
+    [heatmapDays],
+  );
+  const activeDate = selectedDate && daysByDate.has(selectedDate) ? selectedDate : defaultDate;
+  const selectedDay = activeDate ? daysByDate.get(activeDate) : undefined;
+  const maximum = Math.max(0, ...heatmapDays.map((day) => heatmapMetricValue(day, metric)));
+  const hasVisibleData = heatmapDays.some(
+    (day) =>
+      day.eventCount > 0 || day.requestCount > 0 || day.totalTokens > 0 || day.estimatedCostUsd > 0,
+  );
   const clipped = visibleFrom !== filters.from;
 
-  if (daily.length === 0) return <EmptyState label="Chưa có event để dựng heatmap." />;
+  function moveFocus(date: string, days: number) {
+    const nextDate = shiftIsoDate(date, days);
+    if (!daysByDate.has(nextDate)) return;
+    setSelectedDate(nextDate);
+    const element = cellReferences.current.get(nextDate);
+    element?.focus();
+    element?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  function handleCellKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, date: string) {
+    const movement =
+      event.key === "ArrowUp"
+        ? -1
+        : event.key === "ArrowDown"
+          ? 1
+          : event.key === "ArrowLeft"
+            ? -7
+            : event.key === "ArrowRight"
+              ? 7
+              : null;
+    if (movement !== null) {
+      event.preventDefault();
+      moveFocus(date, movement);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setSelectedDate(defaultDate);
+    }
+  }
 
   return (
-    <>
-      {clipped ? (
-        <p className="text-muted-foreground mb-3 text-xs">
-          Range dài hơn một năm; heatmap hiển thị từ {formatLocalDate(visibleFrom)}.
-        </p>
-      ) : null}
-      <div className="overflow-x-auto pb-2">
+    <Card className="min-w-0 self-start" data-testid="activity-heatmap-card">
+      <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <CardTitle>Heatmap hoạt động</CardTitle>
+          <CardDescription>
+            Tối đa 365 ngày. Token và cost là usage toàn ngày, không phụ thuộc loại event.
+          </CardDescription>
+        </div>
         <div
-          aria-label="Heatmap activity theo ngày"
-          className="grid w-max grid-flow-col grid-rows-7 gap-1"
-          role="img"
+          aria-label="Metric Heatmap"
+          className="bg-muted inline-flex w-fit rounded-lg p-1"
+          role="group"
         >
-          {dates.map((date) => {
-            const count = totals.get(date) ?? 0;
-            const inRange = date >= visibleFrom && date <= filters.to;
-            return (
-              <span
-                key={date}
-                aria-label={`${formatLocalDate(date)}: ${formatTokens(count)} event`}
-                className={cn(
-                  "size-3 rounded-[3px] border border-transparent sm:size-3.5",
-                  !inRange && "opacity-0",
-                  inRange && heatmapClass(count, max),
+          {heatmapMetrics.map((option) => (
+            <Button
+              key={option.id}
+              aria-pressed={metric === option.id}
+              disabled={loading}
+              size="sm"
+              type="button"
+              variant={metric === option.id ? "outline" : "ghost"}
+              onClick={() => setMetric(option.id)}
+            >
+              {option.label}
+            </Button>
+          ))}
+        </div>
+      </CardHeader>
+      <CardContent>
+        {loading ? (
+          <Skeleton className="h-64" />
+        ) : !hasVisibleData || !selectedDay ? (
+          <EmptyState label="Chưa có event hoặc usage trong cửa sổ Heatmap." />
+        ) : (
+          <>
+            {clipped ? (
+              <p className="text-muted-foreground mb-3 text-xs">
+                Range dài hơn một năm; Heatmap hiển thị từ {formatLocalDate(visibleFrom)}.
+              </p>
+            ) : null}
+
+            <div
+              id="activity-heatmap-day-detail"
+              className="bg-muted/35 mb-4 rounded-lg border p-3"
+              aria-live="polite"
+              data-testid="activity-heatmap-detail"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="font-medium">{formatLocalDate(selectedDay.date)}</p>
+                {selectedDay.unpricedUsageCount > 0 ? (
+                  <Badge variant="secondary">
+                    {formatTokens(selectedDay.unpricedUsageCount)}/
+                    {formatTokens(selectedDay.requestCount)} yêu cầu chưa định giá
+                  </Badge>
+                ) : (
+                  <Badge variant="outline">Cost đã định giá</Badge>
                 )}
-                title={`${formatLocalDate(date)} · ${formatTokens(count)} event`}
-              />
-            );
-          })}
-        </div>
-      </div>
-      <div className="text-muted-foreground mt-3 flex items-center justify-end gap-1 text-xs">
-        Ít
-        {[0, 1, 2, 3, 4].map((level) => (
-          <span
-            key={level}
-            className={cn("size-3 rounded-[3px]", heatmapLevelClass(level))}
-            aria-hidden="true"
-          />
-        ))}
-        Nhiều
-      </div>
-      <Button
-        className="mt-3"
-        size="sm"
-        type="button"
-        variant="outline"
-        onClick={() => setShowTable((value) => !value)}
-      >
-        {showTable ? "Ẩn dữ liệu dạng bảng" : "Xem dữ liệu dạng bảng"}
-      </Button>
-      {showTable ? (
-        <div className="mt-3 max-h-72 overflow-auto">
-          <table className="w-full text-sm">
-            <caption>Heatmap hoạt động dạng bảng</caption>
-            <thead>
-              <tr>
-                <th>Ngày</th>
-                <th>Số event</th>
-              </tr>
-            </thead>
-            <tbody>
-              {[...totals.entries()].map(([date, count]) => (
-                <tr key={date}>
-                  <th>{date}</th>
-                  <td>{count}</td>
-                </tr>
+              </div>
+              <dl className="mt-3 grid grid-cols-3 gap-2">
+                <HeatmapDetailValue label="Event" value={formatTokens(selectedDay.eventCount)} />
+                <HeatmapDetailValue label="Token" value={formatTokens(selectedDay.totalTokens)} />
+                <HeatmapDetailValue
+                  label="Cost ước tính"
+                  value={formatUsd(selectedDay.estimatedCostUsd)}
+                />
+              </dl>
+              {selectedDay.unpricedUsageCount > 0 ? (
+                <p className="text-muted-foreground mt-2 text-xs">
+                  Cost hiện là subtotal của usage đã có giá; phần chưa định giá không bị tính thành
+                  $0.
+                </p>
+              ) : null}
+              {(filters.kinds?.length ?? 0) > 0 ? (
+                <p className="text-muted-foreground mt-2 text-xs">
+                  Bộ lọc loại event chỉ áp dụng cho số event; token và cost vẫn là usage toàn ngày.
+                </p>
+              ) : null}
+            </div>
+
+            <div className="overflow-x-auto pb-2" data-testid="activity-heatmap-scroll">
+              <div
+                aria-colcount={Math.ceil(dates.length / 7)}
+                aria-label={`Heatmap activity theo ngày, màu theo ${heatmapMetricLabel(metric)}`}
+                aria-rowcount={7}
+                className="flex w-max flex-col gap-0.5"
+                role="grid"
+              >
+                {dateRows.map((row, rowIndex) => (
+                  <div key={rowIndex} className="flex gap-0.5" role="row">
+                    {row.map((date) => {
+                      const day = daysByDate.get(date);
+                      if (!day) {
+                        return (
+                          <span
+                            key={date}
+                            aria-disabled="true"
+                            aria-label={`${formatLocalDate(date)}: ngoài khoảng thời gian`}
+                            className="size-6 [@media(pointer:coarse)]:size-8"
+                            role="gridcell"
+                          />
+                        );
+                      }
+                      const value = heatmapMetricValue(day, metric);
+                      const level = heatmapLevel(value, maximum);
+                      return (
+                        <button
+                          key={date}
+                          ref={(element) => {
+                            if (element) cellReferences.current.set(date, element);
+                            else cellReferences.current.delete(date);
+                          }}
+                          aria-describedby="activity-heatmap-day-detail"
+                          aria-label={heatmapDayLabel(day)}
+                          aria-selected={date === activeDate}
+                          className="focus-visible:ring-ring focus-visible:ring-offset-background flex size-6 items-center justify-center rounded-[5px] outline-none focus-visible:ring-2 focus-visible:ring-offset-2 [@media(pointer:coarse)]:size-8"
+                          data-heatmap-date={date}
+                          data-heatmap-level={level}
+                          data-heatmap-value={value}
+                          role="gridcell"
+                          tabIndex={date === activeDate ? 0 : -1}
+                          type="button"
+                          onClick={() => setSelectedDate(date)}
+                          onFocus={() => setSelectedDate(date)}
+                          onKeyDown={(event) => handleCellKeyDown(event, date)}
+                          onPointerEnter={() => setSelectedDate(date)}
+                        >
+                          <span
+                            aria-hidden="true"
+                            className={cn(
+                              "size-5 rounded-[4px] border border-transparent [@media(pointer:coarse)]:size-7",
+                              heatmapLevelClass(level),
+                            )}
+                          />
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="text-muted-foreground mt-3 flex flex-wrap items-center justify-end gap-1 text-xs">
+              <span className="mr-1">{heatmapMetricLabel(metric)}</span>
+              Ít
+              {[0, 1, 2, 3, 4].map((level) => (
+                <span
+                  key={level}
+                  className={cn(
+                    "size-3 rounded-[3px] border border-transparent",
+                    heatmapLevelClass(level),
+                  )}
+                  aria-hidden="true"
+                />
               ))}
-            </tbody>
-          </table>
-        </div>
-      ) : null}
-    </>
+              Nhiều
+            </div>
+            <Button
+              className="mt-3"
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={() => setShowTable((value) => !value)}
+            >
+              {showTable ? "Ẩn dữ liệu dạng bảng" : "Xem dữ liệu dạng bảng"}
+            </Button>
+            {showTable ? (
+              <div
+                aria-label="Bảng dữ liệu Heatmap, cuộn để xem thêm"
+                className="mt-3 max-h-72 max-w-full overflow-auto"
+                role="region"
+              >
+                <a
+                  className="focus:bg-background focus:ring-ring sr-only focus:not-sr-only focus:sticky focus:top-0 focus:z-10 focus:inline-flex focus:rounded-md focus:px-3 focus:py-2 focus:ring-2"
+                  href="#activity-heatmap-table"
+                >
+                  Chuyển đến bảng Heatmap
+                </a>
+                <table id="activity-heatmap-table" className="w-full min-w-[38rem] text-sm">
+                  <caption>Heatmap hoạt động dạng bảng</caption>
+                  <thead>
+                    <tr>
+                      <th>Ngày</th>
+                      <th>Event</th>
+                      <th>Token</th>
+                      <th>Cost ước tính</th>
+                      <th>Độ phủ giá</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {heatmapDays.map((day) => (
+                      <tr key={day.date}>
+                        <th>{formatLocalDate(day.date)}</th>
+                        <td>{formatTokens(day.eventCount)}</td>
+                        <td>{formatTokens(day.totalTokens)}</td>
+                        <td>{formatUsd(day.estimatedCostUsd)}</td>
+                        <td>
+                          {day.unpricedUsageCount > 0
+                            ? `${formatTokens(day.unpricedUsageCount)}/${formatTokens(day.requestCount)} chưa định giá`
+                            : "Đầy đủ"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function HeatmapDetailValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-background/65 min-w-0 rounded-md border px-2.5 py-2">
+      <dt className="text-muted-foreground text-xs">{label}</dt>
+      <dd className="mt-1 truncate font-semibold tabular-nums" title={value}>
+        {value}
+      </dd>
+    </div>
   );
 }
 
@@ -1194,9 +1423,65 @@ function parseIsoDate(value: string): Date {
   return new Date(`${value}T12:00:00.000Z`);
 }
 
-function heatmapClass(value: number, max: number): string {
-  if (value === 0 || max === 0) return heatmapLevelClass(0);
-  return heatmapLevelClass(Math.max(1, Math.ceil((value / max) * 4)));
+function buildHeatmapDays(
+  daily: ActivitySummary[],
+  dailyUsage: ActivityDailyUsage[],
+  from: string,
+  to: string,
+): HeatmapDay[] {
+  const eventTotals = new Map<string, number>();
+  for (const row of daily) {
+    eventTotals.set(row.date, (eventTotals.get(row.date) ?? 0) + row.count);
+  }
+  const usageByDate = new Map(dailyUsage.map((row) => [row.date, row]));
+  return calendarGridDates(from, to)
+    .filter((date) => date >= from && date <= to)
+    .map((date) => {
+      const usage = usageByDate.get(date);
+      return {
+        date,
+        estimatedCostUsd: usage?.estimatedCostUsd ?? 0,
+        eventCount: eventTotals.get(date) ?? 0,
+        requestCount: usage?.requestCount ?? 0,
+        totalTokens: usage?.totalTokens ?? 0,
+        unpricedUsageCount: usage?.unpricedUsageCount ?? 0,
+      };
+    });
+}
+
+function heatmapMetricValue(day: HeatmapDay, metric: HeatmapMetric): number {
+  switch (metric) {
+    case "cost":
+      return day.estimatedCostUsd;
+    case "events":
+      return day.eventCount;
+    case "tokens":
+      return day.totalTokens;
+  }
+}
+
+function heatmapMetricLabel(metric: HeatmapMetric): string {
+  switch (metric) {
+    case "cost":
+      return "Cost";
+    case "events":
+      return "Event";
+    case "tokens":
+      return "Token";
+  }
+}
+
+function heatmapDayLabel(day: HeatmapDay): string {
+  const priceCoverage =
+    day.unpricedUsageCount > 0
+      ? `${formatTokens(day.unpricedUsageCount)} trên ${formatTokens(day.requestCount)} yêu cầu chưa định giá`
+      : "cost đã định giá";
+  return `${formatLocalDate(day.date)}: ${formatTokens(day.eventCount)} event, ${formatTokens(day.totalTokens)} token, cost ước tính ${formatUsd(day.estimatedCostUsd)}, ${priceCoverage}`;
+}
+
+function heatmapLevel(value: number, maximum: number): number {
+  if (value === 0 || maximum === 0) return 0;
+  return Math.max(1, Math.ceil((value / maximum) * 4));
 }
 
 function heatmapLevelClass(level: number): string {

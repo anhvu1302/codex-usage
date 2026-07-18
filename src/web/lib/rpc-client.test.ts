@@ -15,6 +15,7 @@ import type {
   ProjectsPageResponse,
 } from "@/shared/types";
 import { fetchSessionDetail } from "@/web/lib/api";
+import { dismissAllAlerts } from "@/web/lib/product-api";
 import { apiClient, rpcJson } from "@/web/lib/rpc-client";
 
 describe("Hono RPC contract", () => {
@@ -119,5 +120,45 @@ describe("RPC browser transport", () => {
     expect(request?.input).toContain("models=gpt%2Fa%2Cgpt+b");
     expect(request?.input).toContain("project=project%2Falpha");
     expect(request?.init?.signal).toBe(controller.signal);
+  });
+
+  it("falls back to bounded alert patches while an older server lacks bulk dismiss", async () => {
+    const requests: { method: string; pathname: string }[] = [];
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        "http://localhost",
+      );
+      const method = init?.method ?? "GET";
+      requests.push({ method, pathname: url.pathname });
+      if (method === "DELETE") {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: "API route not found" }), {
+            headers: { "content-type": "application/json" },
+            status: 404,
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            alert: {
+              dismissedAt: "2026-07-16T09:00:00.000Z",
+              id: url.pathname.split("/").at(-1),
+            },
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        ),
+      );
+    });
+
+    await expect(dismissAllAlerts(["alert/one", "alert two"])).resolves.toEqual({
+      dismissedCount: 2,
+    });
+    expect(requests).toEqual([
+      { method: "DELETE", pathname: "/api/alerts" },
+      { method: "PATCH", pathname: "/api/alerts/alert%2Fone" },
+      { method: "PATCH", pathname: "/api/alerts/alert%20two" },
+    ]);
   });
 });

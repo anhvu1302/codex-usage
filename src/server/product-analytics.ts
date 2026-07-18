@@ -920,6 +920,14 @@ export function updateAlert(
   return value ? toAlertEvent(value) : null;
 }
 
+export function dismissAllAlerts(database: AppDatabase): number {
+  return database
+    .update(alertEvents)
+    .set({ dismissedAt: Date.now() })
+    .where(isNull(alertEvents.dismissedAt))
+    .run().changes;
+}
+
 export function simulatePricing(
   database: AppDatabase,
   request: PricingSimulationRequest,

@@ -65,6 +65,47 @@ test("hiển thị card mobile và không có lỗi accessibility", async ({ pag
   expect(accessibility.violations).toEqual([]);
 });
 
+test("tooltip biểu đồ theo dark mode thay vì nền trắng mặc định", async ({ page }) => {
+  await page.addInitScript(() => window.localStorage.setItem("codex-usage-theme", "dark"));
+  await page.goto(`/turns?${TURN_RANGE}`);
+
+  const chart = page.getByRole("img", { name: "Phân bố context pressure của turn" });
+  await chart.scrollIntoViewIfNeeded();
+  const bar = chart.locator(".recharts-bar-rectangle path").first();
+  await expect(bar).toBeVisible();
+  await bar.hover();
+
+  const tooltip = chart.locator(".recharts-default-tooltip");
+  await expect(tooltip).toBeVisible();
+  const colorsMatchTheme = await tooltip.evaluate((element) => {
+    const reference = document.createElement("div");
+    reference.style.backgroundColor = "var(--popover)";
+    reference.style.color = "var(--popover-foreground)";
+    document.body.append(reference);
+    const tooltipStyle = getComputedStyle(element);
+    const referenceStyle = getComputedStyle(reference);
+    const matches = {
+      background: tooltipStyle.backgroundColor === referenceStyle.backgroundColor,
+      foreground: tooltipStyle.color === referenceStyle.color,
+    };
+    reference.remove();
+    return matches;
+  });
+  expect(colorsMatchTheme).toEqual({ background: true, foreground: true });
+
+  const cursorUsesMutedTheme = await chart
+    .locator(".recharts-tooltip-cursor")
+    .evaluate((element) => {
+      const reference = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      reference.style.fill = "var(--muted)";
+      document.body.append(reference);
+      const matches = getComputedStyle(element).fill === getComputedStyle(reference).fill;
+      reference.remove();
+      return matches;
+    });
+  expect(cursorUsesMutedTheme).toBe(true);
+});
+
 test("dark mode reveal lan tròn và tôn trọng reduced motion", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "no-preference" });
   await page.addInitScript(() => {
@@ -119,8 +160,8 @@ test("dark mode reveal lan tròn và tôn trọng reduced motion", async ({ page
             clipPath: expect.arrayContaining([expect.stringContaining("circle(0px")]),
           }),
           options: expect.objectContaining({
-            duration: 550,
-            easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+            duration: 360,
+            easing: "linear",
             pseudoElement: "::view-transition-new(root)",
           }),
         }),

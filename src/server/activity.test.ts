@@ -6,7 +6,7 @@ import BetterSqlite3 from "better-sqlite3";
 import { eq, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { getActivity, getDataHealth } from "@/server/activity";
+import { getActivity, getActivitySummary, getDataHealth } from "@/server/activity";
 import { createApp } from "@/server/app";
 import { createDatabase, migrateDatabase, type AppDatabase } from "@/server/db/client";
 import {
@@ -15,7 +15,9 @@ import {
   archivedActivityEventIds,
   importDiagnostics,
   importStates,
+  sessionAgents,
   sessions,
+  usageDailyRollups,
   usageEvents,
 } from "@/server/db/schema";
 import { SessionImporter } from "@/server/importer";
@@ -322,6 +324,198 @@ describe("activity import and retention", () => {
     expect(client.pragma("integrity_check", { simple: true })).toBe("ok");
     expect(client.pragma("foreign_key_check")).toEqual([]);
     client.close();
+  });
+
+  it("returns daily usage independently from event kinds and preserves filter semantics", async () => {
+    const harness = await createHarness();
+    harness.database
+      .insert(sessions)
+      .values([
+        {
+          id: "usage-session-a",
+          lastSeenAt: 1,
+          projectId: "project-a",
+          sourcePath: "/usage-a.jsonl",
+        },
+        {
+          id: "usage-session-b",
+          lastSeenAt: 1,
+          projectId: "project-b",
+          sourcePath: "/usage-b.jsonl",
+        },
+      ])
+      .run();
+    harness.database
+      .insert(sessionAgents)
+      .values([
+        {
+          id: "usage-main-a",
+          lastSeenAt: 1,
+          sessionId: "usage-session-a",
+          sourcePath: "/usage-a.jsonl",
+          threadSource: "cli",
+        },
+        {
+          id: "usage-sub-a",
+          lastSeenAt: 1,
+          sessionId: "usage-session-a",
+          sourcePath: "/usage-a-sub.jsonl",
+          threadSource: "subagent",
+        },
+        {
+          id: "usage-main-b",
+          lastSeenAt: 1,
+          sessionId: "usage-session-b",
+          sourcePath: "/usage-b.jsonl",
+          threadSource: "cli",
+        },
+      ])
+      .run();
+    harness.database
+      .insert(usageEvents)
+      .values([
+        usageEventRow({
+          agentId: "usage-main-a",
+          costUsd: 1.25,
+          id: "usage-a-main",
+          sessionId: "usage-session-a",
+          totalTokens: 100,
+        }),
+        usageEventRow({
+          agentId: "usage-sub-a",
+          costUsd: null,
+          id: "usage-a-sub",
+          sessionId: "usage-session-a",
+          totalTokens: 200,
+        }),
+        usageEventRow({
+          agentId: "usage-main-b",
+          costUsd: 3,
+          id: "usage-b-main",
+          sessionId: "usage-session-b",
+          totalTokens: 300,
+        }),
+      ])
+      .run();
+    harness.database
+      .insert(activityEvents)
+      .values([
+        activityEventRow({
+          agentId: "usage-main-a",
+          agentKind: "main",
+          id: "activity-a-main",
+          kind: "shell",
+          projectId: "project-a",
+          sessionId: "usage-session-a",
+        }),
+        activityEventRow({
+          agentId: "usage-sub-a",
+          agentKind: "subagent",
+          id: "activity-a-sub",
+          kind: "web",
+          projectId: "project-a",
+          sessionId: "usage-session-a",
+        }),
+        activityEventRow({
+          agentId: "usage-main-b",
+          agentKind: "main",
+          id: "activity-b-main",
+          kind: "shell",
+          projectId: "project-b",
+          sessionId: "usage-session-b",
+        }),
+      ])
+      .run();
+    harness.database
+      .insert(usageDailyRollups)
+      .values({
+        agentKind: "main",
+        cachedInputTokens: 0,
+        costUsd: 2.5,
+        inputTokens: 400,
+        localDate: "2026-05-01",
+        model: "gpt-archived",
+        outputTokens: 0,
+        projectId: "project-a",
+        reasoningOutputTokens: 0,
+        requestCount: 2,
+        totalTokens: 400,
+        unpricedCachedInputTokens: 0,
+        unpricedInputTokens: 50,
+        unpricedOutputTokens: 0,
+        unpricedUsageCount: 1,
+      })
+      .run();
+
+    const filters = { from: "2026-05-01", to: "2026-07-12" };
+    const summary = getActivitySummary(harness.database, filters);
+    expect(summary.dailyUsage).toEqual([
+      {
+        date: "2026-05-01",
+        estimatedCostUsd: 2.5,
+        requestCount: 2,
+        totalTokens: 400,
+        unpricedUsageCount: 1,
+      },
+      {
+        date: "2026-07-12",
+        estimatedCostUsd: 4.25,
+        requestCount: 3,
+        totalTokens: 600,
+        unpricedUsageCount: 1,
+      },
+    ]);
+
+    const shellOnly = getActivitySummary(harness.database, { ...filters, kinds: ["shell"] });
+    expect(shellOnly.daily.reduce((total, row) => total + row.count, 0)).toBe(2);
+    expect(shellOnly.dailyUsage).toEqual(summary.dailyUsage);
+
+    expect(
+      getActivitySummary(harness.database, {
+        ...filters,
+        agentKind: "main",
+        projectId: "project-a",
+      }).dailyUsage,
+    ).toEqual([
+      expect.objectContaining({ date: "2026-05-01", totalTokens: 400 }),
+      expect.objectContaining({ date: "2026-07-12", totalTokens: 100 }),
+    ]);
+    expect(
+      getActivitySummary(harness.database, {
+        ...filters,
+        agentKind: "subagent",
+        projectId: "project-a",
+      }).dailyUsage,
+    ).toEqual([
+      {
+        date: "2026-07-12",
+        estimatedCostUsd: 0,
+        requestCount: 1,
+        totalTokens: 200,
+        unpricedUsageCount: 1,
+      },
+    ]);
+    expect(
+      getActivitySummary(harness.database, {
+        ...filters,
+        sessionId: "usage-session-a",
+      }).dailyUsage,
+    ).toEqual([
+      {
+        date: "2026-07-12",
+        estimatedCostUsd: 1.25,
+        requestCount: 2,
+        totalTokens: 300,
+        unpricedUsageCount: 1,
+      },
+    ]);
+
+    const app = createApp(harness.database, harness.importer, harness.retention);
+    const response = await app.request("/api/activity/summary?from=2026-05-01&to=2026-07-12");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ dailyUsage: summary.dailyUsage });
+    const legacy = await (await app.request("/api/activity?from=2026-05-01&to=2026-07-12")).json();
+    expect(legacy).not.toHaveProperty("dailyUsage");
   });
 
   it("imports metadata only and deduplicates append, truncate, rescan, and archive", async () => {
@@ -636,6 +830,65 @@ async function createSource(directory: string, content: string): Promise<string>
   const source = join(nested, `rollout-${Math.random().toString(16).slice(2)}.jsonl`);
   await writeFile(source, content);
   return source;
+}
+
+function usageEventRow({
+  agentId,
+  costUsd,
+  id,
+  sessionId,
+  totalTokens,
+}: {
+  agentId: string;
+  costUsd: number | null;
+  id: string;
+  sessionId: string;
+  totalTokens: number;
+}) {
+  return {
+    agentId,
+    cachedInputTokens: 0,
+    costUsd,
+    createdAt: 1,
+    id,
+    inputTokens: totalTokens,
+    localDate: "2026-07-12",
+    model: "gpt-usage",
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    sessionId,
+    sourceHash: `${id}-hash`,
+    timestamp: "2026-07-12T01:00:00.000Z",
+    totalTokens,
+  };
+}
+
+function activityEventRow({
+  agentId,
+  agentKind,
+  id,
+  kind,
+  projectId,
+  sessionId,
+}: {
+  agentId: string;
+  agentKind: "main" | "subagent";
+  id: string;
+  kind: "shell" | "web";
+  projectId: string;
+  sessionId: string;
+}) {
+  return {
+    agentId,
+    agentKind,
+    createdAt: 1,
+    id,
+    kind,
+    localDate: "2026-07-12",
+    projectId,
+    sessionId,
+    timestamp: "2026-07-12T01:00:00.000Z",
+  };
 }
 
 function sessionMeta(

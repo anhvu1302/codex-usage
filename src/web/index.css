@@ -89,6 +89,26 @@ body {
   @apply bg-background text-foreground min-h-screen overflow-x-hidden antialiased;
 }
 
+[data-slot="chart"] .recharts-default-tooltip {
+  background-color: var(--popover) !important;
+  border-color: var(--border) !important;
+  border-radius: calc(var(--radius) - 2px);
+  box-shadow:
+    0 10px 15px -3px rgb(0 0 0 / 0.1),
+    0 4px 6px -4px rgb(0 0 0 / 0.1);
+  color: var(--popover-foreground);
+}
+
+[data-slot="chart"] .recharts-tooltip-label {
+  color: var(--popover-foreground);
+}
+
+[data-slot="chart"] .recharts-tooltip-cursor {
+  fill: var(--muted);
+  fill-opacity: 0.4;
+  stroke: var(--border);
+}
+
 ::view-transition-old(root),
 ::view-transition-new(root) {
   animation: none;

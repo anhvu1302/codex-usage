@@ -1,6 +1,8 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
+import type { AlertEvent } from "../src/shared/types";
+
 test("projects, agents và insights dùng đúng filter", async ({ page }) => {
   await page.goto("/?from=2026-07-12&to=2026-07-12");
   await expect(page.getByRole("heading", { name: "Phân tích" })).toBeVisible();
@@ -73,6 +75,79 @@ test("budget, notification, pricing simulator và export", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Trung tâm thông báo" })).toBeVisible();
 });
 
+test("notification tự đánh dấu đã đọc khi xem turn và hỗ trợ xóa tất cả", async ({ page }) => {
+  const turnKey = "a".repeat(64);
+  let alerts: AlertEvent[] = [notificationFixture("alert-turn", { turnKey })];
+  const seenActions: string[] = [];
+  let deleteRequests = 0;
+  await page.route("**/api/alerts**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/alerts" && request.method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        json: { alerts, unseenCount: alerts.filter((alert) => alert.seenAt === null).length },
+      });
+      return;
+    }
+    if (path === "/api/alerts" && request.method() === "DELETE") {
+      deleteRequests += 1;
+      const dismissedCount = alerts.length;
+      alerts = [];
+      await route.fulfill({ contentType: "application/json", json: { dismissedCount } });
+      return;
+    }
+    if (request.method() === "PATCH") {
+      const id = decodeURIComponent(path.split("/").at(-1) ?? "");
+      const body = request.postDataJSON() as { action?: string };
+      if (body.action === "seen") seenActions.push(id);
+      const alert = alerts.find((value) => value.id === id);
+      if (!alert) {
+        await route.fulfill({
+          contentType: "application/json",
+          json: { error: "missing" },
+          status: 404,
+        });
+        return;
+      }
+      const updated = {
+        ...alert,
+        ...(body.action === "dismiss"
+          ? { dismissedAt: new Date().toISOString() }
+          : { seenAt: new Date().toISOString() }),
+      };
+      alerts =
+        body.action === "dismiss"
+          ? alerts.filter((value) => value.id !== id)
+          : alerts.map((value) => (value.id === id ? updated : value));
+      await route.fulfill({ contentType: "application/json", json: { alert: updated } });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/?from=2026-07-12&to=2026-07-12");
+  await page.getByRole("button", { name: "Thông báo: 1 chưa đọc" }).click();
+  await page.getByRole("button", { name: "Xem turn" }).click();
+  await expect.poll(() => seenActions).toEqual(["alert-turn"]);
+  await expect.poll(() => new URL(page.url()).pathname).toBe(`/turns/${turnKey}`);
+  await expect(page.getByRole("button", { name: "Thông báo", exact: true })).toBeVisible();
+
+  alerts = [notificationFixture("alert-one"), notificationFixture("alert-two")];
+  await page.goto("/?from=2026-07-12&to=2026-07-12");
+  await page.getByRole("button", { name: "Thông báo: 2 chưa đọc" }).click();
+  await page.getByRole("button", { name: "Xóa tất cả" }).click();
+  const confirmation = page.getByRole("dialog", { name: "Xóa tất cả thông báo?" });
+  await expect(confirmation).toBeVisible();
+  await confirmation.getByRole("button", { name: "Xóa tất cả" }).click();
+  await expect.poll(() => deleteRequests).toBe(1);
+  await expect(page.getByText("Chưa có cảnh báo")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Thông báo", exact: true })).toBeVisible();
+
+  const accessibility = await new AxeBuilder({ page }).analyze();
+  expect(accessibility.violations).toEqual([]);
+});
+
 test("role và turn text filters debounce thành một request cuối", async ({ page }) => {
   await page.route("**/api/events", (route) => route.abort());
   const requests: string[] = [];
@@ -105,3 +180,18 @@ test("role và turn text filters debounce thành một request cuối", async ({
   await page.waitForTimeout(350);
   expect(requests.filter((url) => url.startsWith("/api/turns?"))).toHaveLength(1);
 });
+
+function notificationFixture(id: string, options: { turnKey?: string | null } = {}): AlertEvent {
+  return {
+    createdAt: "2026-07-16T08:00:00.000Z",
+    dismissedAt: null,
+    id,
+    message: "Thông báo kiểm thử không chứa dữ liệu nhạy cảm.",
+    periodStart: "2026-07-16",
+    seenAt: null,
+    severity: "warning",
+    title: "Cảnh báo kiểm thử",
+    turnKey: options.turnKey ?? null,
+    type: options.turnKey ? "context-pressure" : "anomaly",
+  };
+}

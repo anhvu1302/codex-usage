@@ -18,6 +18,7 @@ function ChartContainer({
   );
   return (
     <div
+      data-slot="chart"
       className={cn(
         "[&_.recharts-cartesian-axis-tick_text]:fill-muted-foreground h-72 w-full text-xs",
         className,

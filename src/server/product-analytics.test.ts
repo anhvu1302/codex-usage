@@ -25,6 +25,7 @@ import {
 } from "@/server/db/schema";
 import { SessionImporter } from "@/server/importer";
 import {
+  dismissAllAlerts,
   exportDataset,
   exportTurnDataset,
   getAlertFeed,
@@ -494,6 +495,9 @@ describe("phase 2 product analytics", () => {
     const dismissed = updateAlert(harness.database, first[0]!.id, "dismiss");
     expect(dismissed?.dismissedAt).not.toBeNull();
     expect(updateAlert(harness.database, "missing", "seen")).toBeNull();
+    expect(dismissAllAlerts(harness.database)).toBe(2);
+    expect(getAlertFeed(harness.database)).toEqual({ alerts: [], unseenCount: 0 });
+    expect(dismissAllAlerts(harness.database)).toBe(0);
   });
 
   it("raises stable context-pressure alerts without downgrading their severity", () => {
@@ -1067,6 +1071,13 @@ describe("phase 2 API", () => {
         })
       ).status,
     ).toBe(404);
+    const dismissedAll = await app.request("/api/alerts", { method: "DELETE" });
+    expect(dismissedAll.status).toBe(200);
+    expect(await dismissedAll.json()).toMatchObject({ dismissedCount: expect.any(Number) });
+    expect(await (await app.request("/api/alerts")).json()).toEqual({
+      alerts: [],
+      unseenCount: 0,
+    });
   });
 
   it("invalidates alert analytics only for data-changing mutation groups", async () => {

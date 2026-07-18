@@ -103,6 +103,19 @@ export function fetchAlerts(signal?: AbortSignal) {
   return rpcJson(apiClient.api.alerts.$get(undefined, rpcOptions(signal)));
 }
 
+export async function dismissAllAlerts(alertIds: string[]) {
+  const response = await apiClient.api.alerts.$delete();
+  if (Number(response.status) !== 404) return rpcJson(response);
+
+  let dismissedCount = 0;
+  for (let index = 0; index < alertIds.length; index += 8) {
+    const batch = alertIds.slice(index, index + 8);
+    await Promise.all(batch.map((id) => updateAlert({ action: "dismiss", id })));
+    dismissedCount += batch.length;
+  }
+  return { dismissedCount };
+}
+
 export function updateAlert({ action, id }: { action: "dismiss" | "seen"; id: string }) {
   return rpcJson(
     apiClient.api.alerts[":id"].$patch({

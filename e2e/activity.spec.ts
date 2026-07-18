@@ -1,7 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
-import type { DataHealthResponse } from "../src/shared/types";
+import type { ActivitySummaryResponse, DataHealthResponse } from "../src/shared/types";
 
 test("timeline và data health không tải chart graph", async ({ page }) => {
   const scripts: string[] = [];
@@ -25,7 +25,7 @@ test("filter hoạt động, agent timeline và sức khỏe dữ liệu", async
 
   await expect(page.getByRole("heading", { name: "Hoạt động", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Xu hướng event theo ngày" })).toBeVisible();
-  await expect(page.getByRole("img", { name: /Heatmap activity/ })).toBeVisible();
+  await expect(page.getByRole("grid", { name: /Heatmap activity/ })).toBeVisible();
 
   await page.getByRole("combobox", { name: "Lọc loại agent" }).click();
   await page.getByRole("option", { name: "Subagent" }).click();
@@ -61,6 +61,122 @@ test("filter hoạt động, agent timeline và sức khỏe dữ liệu", async
   );
 
   const accessibility = await new AxeBuilder({ page }).analyze();
+  expect(accessibility.violations).toEqual([]);
+});
+
+test("heatmap đổi Event, Token, Cost không refetch và hỗ trợ bàn phím", async ({ page }) => {
+  let summaryRequests = 0;
+  const summary: ActivitySummaryResponse = {
+    daily: [
+      {
+        agentKind: "main",
+        count: 1,
+        date: "2026-07-11",
+        kind: "shell",
+        projectId: "e2e-project",
+      },
+      {
+        agentKind: "main",
+        count: 4,
+        date: "2026-07-12",
+        kind: "web",
+        projectId: "e2e-project",
+      },
+    ],
+    dailyUsage: [
+      {
+        date: "2026-07-11",
+        estimatedCostUsd: 10,
+        requestCount: 2,
+        totalTokens: 1_000,
+        unpricedUsageCount: 0,
+      },
+      {
+        date: "2026-07-12",
+        estimatedCostUsd: 30,
+        requestCount: 3,
+        totalTokens: 100,
+        unpricedUsageCount: 1,
+      },
+    ],
+    timelineCoverage: { from: "2026-07-11", status: "full", to: "2026-07-12" },
+    timelineTotal: 5,
+  };
+  await page.route("**/api/activity/summary?**", async (route) => {
+    summaryRequests += 1;
+    await route.fulfill({ json: summary });
+  });
+
+  await page.goto("/activity?from=2026-07-11&to=2026-07-12");
+  const heatmap = page.getByTestId("activity-heatmap-card");
+  const grid = heatmap.getByRole("grid", { name: /Heatmap activity/ });
+  await expect(grid).toBeVisible();
+  const firstDay = grid.locator('[data-heatmap-date="2026-07-11"]');
+  const secondDay = grid.locator('[data-heatmap-date="2026-07-12"]');
+  await expect(firstDay).toHaveAttribute("data-heatmap-level", "1");
+  await expect(secondDay).toHaveAttribute("data-heatmap-level", "4");
+  const firstDayBox = await firstDay.boundingBox();
+  expect(firstDayBox).not.toBeNull();
+  expect(firstDayBox?.height).toBeGreaterThanOrEqual(23.5);
+  expect(firstDayBox?.width).toBeGreaterThanOrEqual(23.5);
+  expect(
+    await grid
+      .getByRole("gridcell")
+      .evaluateAll((cells) =>
+        cells
+          .filter((cell) => cell.getAttribute("tabindex") === "0")
+          .map((cell) => cell.getAttribute("data-heatmap-date")),
+      ),
+  ).toEqual(["2026-07-12"]);
+
+  await firstDay.hover();
+  const detail = page.getByTestId("activity-heatmap-detail");
+  await expect(detail).toContainText("11/07/2026");
+  await expect(detail).toContainText("1,000");
+  await expect(detail).toContainText("$10.00");
+
+  await heatmap.getByRole("button", { name: "Token", exact: true }).click();
+  await expect(firstDay).toHaveAttribute("data-heatmap-level", "4");
+  await heatmap.getByRole("button", { name: "Cost", exact: true }).click();
+  await expect(firstDay).toHaveAttribute("data-heatmap-level", "2");
+  await expect.poll(() => summaryRequests).toBe(1);
+
+  await firstDay.focus();
+  await page.keyboard.press("ArrowDown");
+  await expect(secondDay).toBeFocused();
+  await expect(detail).toContainText("12/07/2026");
+  await expect(detail).toContainText("1/3 yêu cầu chưa định giá");
+  expect(
+    await grid
+      .getByRole("gridcell")
+      .evaluateAll((cells) =>
+        cells
+          .filter((cell) => cell.getAttribute("tabindex") === "0")
+          .map((cell) => cell.getAttribute("data-heatmap-date")),
+      ),
+  ).toEqual(["2026-07-12"]);
+
+  await heatmap.getByRole("button", { name: "Xem dữ liệu dạng bảng" }).click();
+  await expect(
+    page.getByRole("row", { name: /11\/07\/2026 1 1,000 \$10\.00 Đầy đủ/ }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("row", { name: /12\/07\/2026 4 100 \$30\.00 1\/3 chưa định giá/ }),
+  ).toBeVisible();
+
+  await page.setViewportSize({ height: 844, width: 390 });
+  await heatmap.scrollIntoViewIfNeeded();
+  const mobileCardBox = await heatmap.boundingBox();
+  const mobileScrollBox = await heatmap.getByTestId("activity-heatmap-scroll").boundingBox();
+  expect(mobileCardBox).not.toBeNull();
+  expect(mobileScrollBox).not.toBeNull();
+  expect(mobileCardBox?.x).toBeGreaterThanOrEqual(0);
+  expect((mobileCardBox?.x ?? 0) + (mobileCardBox?.width ?? 0)).toBeLessThanOrEqual(390);
+  expect(mobileScrollBox?.width).toBeLessThanOrEqual(mobileCardBox?.width ?? 0);
+
+  const accessibility = await new AxeBuilder({ page })
+    .include('[data-testid="activity-heatmap-card"]')
+    .analyze();
   expect(accessibility.violations).toEqual([]);
 });
 

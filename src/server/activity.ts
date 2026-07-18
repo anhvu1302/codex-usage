@@ -16,6 +16,7 @@ import {
 import type { SessionImporter } from "@/server/importer";
 import { getRetentionCoverage, type RetentionService } from "@/server/retention";
 import type {
+  ActivityDailyUsage,
   ActivityFilters,
   ActivityKind,
   ActivityResponse,
@@ -92,8 +93,39 @@ export function getActivitySummary(
     .where(and(...rawConditions))
     .get();
 
+  const rawDailyUsage = database
+    .select({
+      date: usageEvents.localDate,
+      estimatedCostUsd: sql<number>`coalesce(sum(${usageEvents.costUsd}), 0)`,
+      requestCount: sql<number>`count(*)`,
+      totalTokens: sql<number>`coalesce(sum(${usageEvents.totalTokens}), 0)`,
+      unpricedUsageCount: sql<number>`coalesce(sum(case when ${usageEvents.costUsd} is null then 1 else 0 end), 0)`,
+    })
+    .from(usageEvents)
+    .where(and(...activityUsageConditions(filters)))
+    .groupBy(usageEvents.localDate)
+    .all()
+    .map(toActivityDailyUsage);
+
+  const archivedDailyUsage = filters.sessionId
+    ? []
+    : database
+        .select({
+          date: usageDailyRollups.localDate,
+          estimatedCostUsd: sql<number>`coalesce(sum(${usageDailyRollups.costUsd}), 0)`,
+          requestCount: sql<number>`coalesce(sum(${usageDailyRollups.requestCount}), 0)`,
+          totalTokens: sql<number>`coalesce(sum(${usageDailyRollups.totalTokens}), 0)`,
+          unpricedUsageCount: sql<number>`coalesce(sum(${usageDailyRollups.unpricedUsageCount}), 0)`,
+        })
+        .from(usageDailyRollups)
+        .where(and(...activityDailyUsageConditions(filters)))
+        .groupBy(usageDailyRollups.localDate)
+        .all()
+        .map(toActivityDailyUsage);
+
   return {
     daily: mergeDailyActivity([...archivedDaily, ...rawDaily]),
+    dailyUsage: mergeActivityDailyUsage([...archivedDailyUsage, ...rawDailyUsage]),
     timelineCoverage: activityTimelineCoverage(filters),
     timelineTotal: toNumber(total?.count),
   };
@@ -326,6 +358,45 @@ function activityConditions(table: ActivityTable, filters: ActivityFilters): SQL
   return conditions;
 }
 
+function activityUsageConditions(filters: ActivityFilters): SQL[] {
+  const conditions: SQL[] = [
+    gte(usageEvents.localDate, filters.from),
+    lte(usageEvents.localDate, filters.to),
+  ];
+  if (filters.sessionId) conditions.push(eq(usageEvents.sessionId, filters.sessionId));
+  if (filters.agentKind && filters.agentKind !== "all") {
+    conditions.push(sql`exists (
+      select 1 from ${sessionAgents}
+      where ${sessionAgents.id} = ${usageEvents.agentId}
+        and ${sessionAgents.threadSource} ${
+          filters.agentKind === "subagent" ? sql`= 'subagent'` : sql`!= 'subagent'`
+        }
+    )`);
+  }
+  if (filters.projectId) {
+    conditions.push(sql`exists (
+      select 1 from ${sessions}
+      where ${sessions.id} = ${usageEvents.sessionId}
+        and ${sessions.projectId} = ${filters.projectId}
+    )`);
+  }
+  return conditions;
+}
+
+function activityDailyUsageConditions(filters: ActivityFilters): SQL[] {
+  const conditions: SQL[] = [
+    gte(usageDailyRollups.localDate, filters.from),
+    lte(usageDailyRollups.localDate, filters.to),
+  ];
+  if (filters.agentKind && filters.agentKind !== "all") {
+    conditions.push(eq(usageDailyRollups.agentKind, filters.agentKind));
+  }
+  if (filters.projectId) {
+    conditions.push(eq(usageDailyRollups.projectId, filters.projectId));
+  }
+  return conditions;
+}
+
 function mergeDailyActivity(
   rows: {
     agentKind: string;
@@ -359,6 +430,38 @@ function mergeDailyActivity(
       left.kind.localeCompare(right.kind) ||
       left.projectId.localeCompare(right.projectId),
   );
+}
+
+function toActivityDailyUsage(row: {
+  date: string;
+  estimatedCostUsd: number;
+  requestCount: number;
+  totalTokens: number;
+  unpricedUsageCount: number;
+}): ActivityDailyUsage {
+  return {
+    date: row.date,
+    estimatedCostUsd: toNumber(row.estimatedCostUsd),
+    requestCount: toNumber(row.requestCount),
+    totalTokens: toNumber(row.totalTokens),
+    unpricedUsageCount: toNumber(row.unpricedUsageCount),
+  };
+}
+
+function mergeActivityDailyUsage(rows: ActivityDailyUsage[]): ActivityDailyUsage[] {
+  const totals = new Map<string, ActivityDailyUsage>();
+  for (const row of rows) {
+    const existing = totals.get(row.date);
+    if (existing) {
+      existing.estimatedCostUsd += row.estimatedCostUsd;
+      existing.requestCount += row.requestCount;
+      existing.totalTokens += row.totalTokens;
+      existing.unpricedUsageCount += row.unpricedUsageCount;
+      continue;
+    }
+    totals.set(row.date, { ...row });
+  }
+  return [...totals.values()].sort((left, right) => left.date.localeCompare(right.date));
 }
 
 function toTimelineItem(row: {

@@ -26,6 +26,7 @@ import {
 import type { AppDatabase } from "@/server/db/client";
 import type { SessionImporter } from "@/server/importer";
 import {
+  dismissAllAlerts,
   exportDataset,
   exportTurnDataset,
   getAgents,
@@ -454,6 +455,11 @@ function createProductRoutes({ alerts, database, events }: AppDependencies) {
       return context.json({ budget });
     })
     .get("/alerts", (context) => context.json(alerts.getFeed()))
+    .delete("/alerts", (context) => {
+      const dismissedCount = dismissAllAlerts(database);
+      if (dismissedCount > 0) events.publish("budget", ["alerts"]);
+      return context.json({ dismissedCount });
+    })
     .patch("/alerts/:id", alertBody, (context) => {
       const alert = updateAlert(
         database,

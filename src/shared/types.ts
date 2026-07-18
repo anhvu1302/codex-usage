@@ -459,6 +459,10 @@ export type AlertsResponse = {
   unseenCount: number;
 };
 
+export type DismissAlertsResponse = {
+  dismissedCount: number;
+};
+
 export type PricingSimulationRequest = DashboardFilters & {
   rates: Omit<ModelRate, "updatedAt">[];
 };
@@ -481,6 +485,14 @@ export type ActivityKind =
   | "task_started"
   | "turn"
   | "web";
+
+export type ActivityDailyUsage = {
+  date: string;
+  estimatedCostUsd: number;
+  requestCount: number;
+  totalTokens: number;
+  unpricedUsageCount: number;
+};
 
 export type ActivitySummary = {
   agentKind: Exclude<AgentKind, "all">;
@@ -529,6 +541,7 @@ export type ActivityResponse = {
 
 export type ActivitySummaryResponse = {
   daily: ActivitySummary[];
+  dailyUsage: ActivityDailyUsage[];
   timelineCoverage: SessionCoverage;
   timelineTotal: number;
 };
