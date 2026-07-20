@@ -19,6 +19,11 @@ import type {
   TurnContextBucket,
   TurnCostCoverage,
   TurnCoverage,
+  TurnDiagnosticBaseline,
+  TurnDiagnosticItem,
+  TurnDiagnosticMetric,
+  TurnDiagnosticReason,
+  TurnDiagnosticsResponse,
   TurnDailyUsage,
   TurnDetailResponse,
   TurnFilters,
@@ -32,6 +37,17 @@ import type {
 } from "@/shared/types";
 
 const TIMELINE_LIMIT = 2_000;
+const DIAGNOSTIC_MAX_DAYS = 90;
+const DIAGNOSTIC_MAX_MATCHED_TURNS = 20_000;
+const DIAGNOSTIC_MAX_ITEMS = 50;
+const DIAGNOSTIC_MINIMUM_SAMPLE = 20;
+
+export class TurnDiagnosticsLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TurnDiagnosticsLimitError";
+  }
+}
 
 type AggregateRow = {
   agentId: string;
@@ -96,6 +112,87 @@ export function getTurnPage(
   filters: TurnFilters,
 ): Pick<TurnsResponse, "page" | "pageSize" | "total" | "turns"> {
   return readTurnPage(database, filters, buildFilters(filters));
+}
+
+export function getTurnDiagnostics(
+  database: AppDatabase,
+  filters: TurnFilters,
+  backfill: TurnBackfillStatus,
+): TurnDiagnosticsResponse {
+  if (inclusiveDayCount(filters.from, filters.to) > DIAGNOSTIC_MAX_DAYS) {
+    throw new TurnDiagnosticsLimitError(
+      "Turn diagnostics supports at most 90 days; narrow the date range",
+    );
+  }
+  const filterSql = buildFilters(filters);
+  const totalRow = database.$client
+    .prepare(`${baseCountSql()} where ${filterSql.where}`)
+    .get(...filterSql.params) as { total: number } | undefined;
+  const matchedTurnCount = Number(totalRow?.total ?? 0);
+  if (matchedTurnCount > DIAGNOSTIC_MAX_MATCHED_TURNS) {
+    throw new TurnDiagnosticsLimitError(
+      "Turn diagnostics matched more than 20,000 turns; narrow the filters",
+    );
+  }
+  const rows = database.$client
+    .prepare(`${baseSummarySql(filterSql.models)} where ${filterSql.where} order by t.id asc`)
+    .all(...filterSql.models, ...filterSql.params) as AggregateRow[];
+  const turns = rows.map(toSummary);
+  const baselines = {
+    cost: diagnosticBaseline(
+      turns.flatMap((turn) => (turn.costCoverage === "exact" ? [turn.estimatedCostUsd] : [])),
+      turns.length,
+    ),
+    duration: diagnosticBaseline(
+      turns.flatMap((turn) => (turn.durationMs === null ? [] : [turn.durationMs])),
+      turns.length,
+    ),
+    ttft: diagnosticBaseline(
+      turns.flatMap((turn) => (turn.timeToFirstTokenMs === null ? [] : [turn.timeToFirstTokenMs])),
+      turns.length,
+    ),
+  } satisfies Record<TurnDiagnosticMetric, TurnDiagnosticBaseline>;
+  let outlierTurnCount = 0;
+  const candidates = turns.flatMap((turn) => {
+    const reasons: TurnDiagnosticReason[] = [];
+    if (diagnosticOutlier(turn.durationMs, baselines.duration)) reasons.push("duration-p95");
+    if (diagnosticOutlier(turn.timeToFirstTokenMs, baselines.ttft)) reasons.push("ttft-p95");
+    if (turn.costCoverage === "exact") {
+      if (diagnosticOutlier(turn.estimatedCostUsd, baselines.cost)) reasons.push("cost-p95");
+    } else reasons.push(turn.costCoverage === "partial" ? "cost-partial" : "cost-unavailable");
+    const contextReason = diagnosticContextReason(turn.contextUtilizationPercent);
+    if (contextReason) reasons.push(contextReason);
+    if (reasons.length === 0) return [];
+    if (reasons.some((reason) => reason !== "cost-partial" && reason !== "cost-unavailable")) {
+      outlierTurnCount += 1;
+    }
+    return [
+      {
+        contextSeverity: diagnosticContextSeverity(turn.contextUtilizationPercent),
+        item: { reasons, turn } satisfies TurnDiagnosticItem,
+        p95Ratio: Math.max(
+          diagnosticP95Ratio(turn.durationMs, baselines.duration),
+          diagnosticP95Ratio(turn.timeToFirstTokenMs, baselines.ttft),
+          turn.costCoverage === "exact"
+            ? diagnosticP95Ratio(turn.estimatedCostUsd, baselines.cost)
+            : 0,
+        ),
+      },
+    ];
+  });
+  candidates.sort(
+    (left, right) =>
+      right.contextSeverity - left.contextSeverity ||
+      right.p95Ratio - left.p95Ratio ||
+      left.item.turn.turnKey.localeCompare(right.item.turn.turnKey),
+  );
+  return {
+    baselines,
+    coverage: turnCoverage(filters, backfill),
+    items: candidates.slice(0, DIAGNOSTIC_MAX_ITEMS).map((candidate) => candidate.item),
+    matchedTurnCount,
+    outlierTurnCount,
+  };
 }
 
 function readTurnPage(
@@ -247,6 +344,16 @@ function buildFilters(filters: TurnFilters): FilterSql {
   if (filters.projectId) {
     conditions.push("t.project_id = ?");
     params.push(filters.projectId);
+  }
+  if (filters.tagIds?.length) {
+    conditions.push(
+      `exists (
+        select 1 from project_tags tag_filter
+        where tag_filter.project_id = t.project_id
+          and tag_filter.tag_id in (${filters.tagIds.map(() => "?").join(", ")})
+      )`,
+    );
+    params.push(...filters.tagIds);
   }
   if (filters.agentKind && filters.agentKind !== "all") {
     conditions.push(
@@ -682,6 +789,67 @@ function readPercentile(
     )
     .get(...filters.params, offset) as { value: number } | undefined;
   return row ? Number(row.value) : null;
+}
+
+function diagnosticBaseline(values: number[], total: number): TurnDiagnosticBaseline {
+  const sorted = values.filter(Number.isFinite).sort((left, right) => left - right);
+  if (sorted.length < DIAGNOSTIC_MINIMUM_SAMPLE) {
+    return {
+      baselineAvailable: false,
+      eligibleCount: sorted.length,
+      median: null,
+      p95: null,
+      unavailableCount: total - sorted.length,
+    };
+  }
+  const middle = Math.floor(sorted.length / 2);
+  const median =
+    sorted.length % 2 === 0
+      ? (sorted.at(middle - 1)! + sorted.at(middle)!) / 2
+      : sorted.at(middle)!;
+  return {
+    baselineAvailable: true,
+    eligibleCount: sorted.length,
+    median,
+    p95: sorted.at(Math.ceil(sorted.length * 0.95) - 1)!,
+    unavailableCount: total - sorted.length,
+  };
+}
+
+function diagnosticOutlier(value: number | null, baseline: TurnDiagnosticBaseline): boolean {
+  return (
+    value !== null &&
+    baseline.baselineAvailable &&
+    baseline.median !== null &&
+    baseline.p95 !== null &&
+    baseline.p95 > baseline.median &&
+    value >= baseline.p95
+  );
+}
+
+function diagnosticP95Ratio(value: number | null, baseline: TurnDiagnosticBaseline): number {
+  return value !== null && baseline.p95 !== null && baseline.p95 > 0 ? value / baseline.p95 : 0;
+}
+
+function diagnosticContextReason(value: number | null): TurnDiagnosticReason | null {
+  if (value === null || value < 70) return null;
+  if (value >= 95) return "context-95";
+  if (value >= 85) return "context-85";
+  return "context-70";
+}
+
+function diagnosticContextSeverity(value: number | null): number {
+  if (value === null || value < 70) return 0;
+  if (value >= 95) return 3;
+  return value >= 85 ? 2 : 1;
+}
+
+function inclusiveDayCount(from: string, to: string): number {
+  return (
+    Math.floor(
+      (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / 86_400_000,
+    ) + 1
+  );
 }
 
 function sortSql(sort: NonNullable<TurnFilters["sort"]>, order: "asc" | "desc"): string {

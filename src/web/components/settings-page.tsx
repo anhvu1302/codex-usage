@@ -2,8 +2,11 @@ import { useMemo } from "react";
 import { useSearchParams } from "react-router";
 
 import { ExportActions } from "@/web/components/export-actions";
+import { NotificationSettings } from "@/web/components/notification-settings";
 import { BudgetSettings, PricingSimulator } from "@/web/components/product-tools";
 import { RateSettings } from "@/web/components/rate-settings";
+import { ReportBuilder } from "@/web/components/report-builder";
+import { TagSettings } from "@/web/components/tag-settings";
 import { filtersFromSearch } from "@/web/lib/product-api";
 
 export function SettingsPage() {
@@ -19,8 +22,11 @@ export function SettingsPage() {
         </p>
       </header>
       <RateSettings />
-      <BudgetSettings />
+      <NotificationSettings />
+      <TagSettings />
+      <BudgetSettings filters={filters} />
       <PricingSimulator filters={filters} />
+      <ReportBuilder filters={filters} />
       <ExportActions filters={filters} />
     </div>
   );

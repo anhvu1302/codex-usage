@@ -9,6 +9,7 @@ import { createApp } from "@/server/app";
 import { createDatabase, migrateDatabase, type AppDatabase } from "@/server/db/client";
 import {
   activityEvents,
+  projects,
   sessionAgents,
   sessions,
   turnActivityRollups,
@@ -18,7 +19,14 @@ import {
 } from "@/server/db/schema";
 import { SessionImporter } from "@/server/importer";
 import { RetentionService } from "@/server/retention";
-import { compareTurns, getTurnDetail, getTurns } from "@/server/turns";
+import { createTag, replaceProjectTags } from "@/server/tags";
+import {
+  compareTurns,
+  getTurnDetail,
+  getTurnDiagnostics,
+  getTurns,
+  TurnDiagnosticsLimitError,
+} from "@/server/turns";
 import type { TurnBackfillStatus } from "@/shared/types";
 
 const backfill: TurnBackfillStatus = {
@@ -95,6 +103,14 @@ describe("turn analytics", () => {
       getTurns(harness.database, { from: "2026-07-12", to: "2026-07-13" }, backfill, true)
         .liveRefreshSuggested,
     ).toBe(true);
+    expect(
+      getTurnDiagnostics(harness.database, { from: "2026-07-12", to: "2026-07-13" }, backfill)
+        .baselines,
+    ).toMatchObject({
+      cost: { baselineAvailable: false, eligibleCount: 2, unavailableCount: 1 },
+      duration: { baselineAvailable: false, eligibleCount: 2, unavailableCount: 1 },
+      ttft: { baselineAvailable: false, eligibleCount: 2, unavailableCount: 1 },
+    });
 
     const modelA = getTurns(
       harness.database,
@@ -115,6 +131,13 @@ describe("turn analytics", () => {
       models: ["model-a"],
       totalTokens: 110,
     });
+    expect(
+      getTurnDiagnostics(
+        harness.database,
+        { from: "2026-07-12", models: ["model-a"], projectId: "project-a", to: "2026-07-13" },
+        backfill,
+      ).matchedTurnCount,
+    ).toBe(1);
   });
 
   it("filters, sorts and paginates without weakening cost coverage", () => {
@@ -191,6 +214,161 @@ describe("turn analytics", () => {
       expect(page.pageSize).toBe(1);
       expect(page.turns).toHaveLength(1);
     }
+  });
+
+  it("filters retained turn aggregates by project tags", () => {
+    harness.database
+      .insert(projects)
+      .values({
+        createdAt: 1,
+        displayName: "Project A",
+        displayPath: "/project-a",
+        id: "project-a",
+        normalizedPath: "/project-a",
+        updatedAt: 1,
+      })
+      .run();
+    const selected = createTag(harness.database, "Selected");
+    const other = createTag(harness.database, "Other");
+    expect(replaceProjectTags(harness.database, "project-a", [selected.id])).toMatchObject({
+      status: "ok",
+    });
+
+    expect(
+      getTurns(
+        harness.database,
+        { from: "2026-07-12", tagIds: [selected.id], to: "2026-07-13" },
+        backfill,
+        false,
+      ).total,
+    ).toBe(3);
+    expect(
+      getTurns(
+        harness.database,
+        { from: "2026-07-12", tagIds: [other.id], to: "2026-07-13" },
+        backfill,
+        false,
+      ).total,
+    ).toBe(0);
+    expect(
+      getTurnDiagnostics(
+        harness.database,
+        { from: "2026-07-12", tagIds: [selected.id], to: "2026-07-13" },
+        backfill,
+      ).matchedTurnCount,
+    ).toBe(3);
+  });
+
+  it("computes full-range baselines and deterministic top 50 from retained aggregates", () => {
+    seedDiagnosticTurns(harness.database, 60);
+    const response = getTurnDiagnostics(
+      harness.database,
+      { from: "2026-07-14", to: "2026-07-14" },
+      backfill,
+    );
+    expect(response.matchedTurnCount).toBe(60);
+    expect(response.baselines.duration).toEqual({
+      baselineAvailable: true,
+      eligibleCount: 59,
+      median: 31,
+      p95: 58,
+      unavailableCount: 1,
+    });
+    expect(response.baselines.ttft).toMatchObject({
+      baselineAvailable: true,
+      eligibleCount: 59,
+      unavailableCount: 1,
+    });
+    expect(response.baselines.cost).toMatchObject({
+      baselineAvailable: true,
+      eligibleCount: 58,
+      unavailableCount: 2,
+    });
+    expect(response.items).toHaveLength(50);
+    expect(response.items[0]).toMatchObject({
+      reasons: expect.arrayContaining(["context-95"]),
+      turn: { turnId: "diagnostic-10" },
+    });
+    expect(response.outlierTurnCount).toBe(60);
+    expect(response.coverage).toMatchObject({ aggregate: "full", timeline: { status: "full" } });
+
+    harness.database.delete(usageEvents).run();
+    harness.database.delete(activityEvents).run();
+    expect(
+      getTurnDiagnostics(harness.database, { from: "2026-07-14", to: "2026-07-14" }, backfill)
+        .matchedTurnCount,
+    ).toBe(60);
+  });
+
+  it("keeps aggregate diagnostics when raw timelines have expired and reports source gaps", () => {
+    harness.database
+      .insert(turns)
+      .values({
+        agentId: "session-main",
+        createdAt: 1,
+        id: "f".repeat(64),
+        lastEventAt: "2026-04-01T00:00:00.000Z",
+        localDate: "2026-04-01",
+        projectId: "project-a",
+        sessionId: "session-main",
+        status: "completed",
+        turnId: "retained-only",
+        updatedAt: 1,
+      })
+      .run();
+    const response = getTurnDiagnostics(
+      harness.database,
+      { from: "2026-04-01", to: "2026-04-01" },
+      { ...backfill, sourceDeletedGaps: 1 },
+    );
+    expect(response).toMatchObject({
+      coverage: { aggregate: "partial", timeline: { status: "none" } },
+      matchedTurnCount: 1,
+    });
+  });
+
+  it("rejects diagnostics ranges over 90 days and matches over 20,000 turns", async () => {
+    expect(() =>
+      getTurnDiagnostics(harness.database, { from: "2026-01-01", to: "2026-04-01" }, backfill),
+    ).toThrow(TurnDiagnosticsLimitError);
+
+    harness.database.$client.exec(`
+      with recursive sequence(value) as (
+        select 1
+        union all
+        select value + 1 from sequence where value < 20001
+      )
+      insert into turns (
+        id, turn_id, session_id, agent_id, project_id, local_date,
+        last_event_at, status, created_at, updated_at
+      )
+      select
+        printf('%064x', 100000 + value),
+        'bulk-' || value,
+        'session-main',
+        'session-main',
+        'project-a',
+        '2026-08-01',
+        '2026-08-01T00:00:00.000Z',
+        'completed',
+        1,
+        1
+      from sequence;
+    `);
+    expect(() =>
+      getTurnDiagnostics(harness.database, { from: "2026-08-01", to: "2026-08-01" }, backfill),
+    ).toThrow("matched more than 20,000 turns");
+
+    const app = createApp(harness.database, harness.importer, harness.retention);
+    expect((await app.request("/api/turns/diagnostics?from=2026-01-01&to=2026-04-01")).status).toBe(
+      422,
+    );
+    expect((await app.request("/api/turns/diagnostics?from=2026-08-01&to=2026-08-01")).status).toBe(
+      422,
+    );
+    expect(
+      (await app.request("/api/turns/diagnostics?from=2026-07-12&to=2026-07-13&page=1")).status,
+    ).toBe(400);
   });
 
   it("returns detail timelines and compare results in requested order", () => {
@@ -452,6 +630,50 @@ function seedTurns(database: AppDatabase) {
       turnAttributionVersion: 1,
       turnKey: turnKeys.first,
     })
+    .run();
+}
+
+function seedDiagnosticTurns(database: AppDatabase, count: number) {
+  const values = Array.from({ length: count }, (_, offset) => {
+    const index = offset + 1;
+    return {
+      agentId: "session-main",
+      completedAt: `2026-07-14T00:00:${String(offset).padStart(2, "0")}.000Z`,
+      createdAt: 1,
+      durationMs: index === 1 ? null : index,
+      id: (1_000 + index).toString(16).padStart(64, "0"),
+      lastEventAt: `2026-07-14T00:00:${String(offset).padStart(2, "0")}.000Z`,
+      localDate: "2026-07-14",
+      modelContextWindow: 100,
+      peakInputTokens: index <= 10 ? 95 : index <= 20 ? 85 : 70,
+      projectId: "project-a",
+      sessionId: "session-main",
+      startedAt: "2026-07-14T00:00:00.000Z",
+      status: "completed",
+      timeToFirstTokenMs: index === 2 ? null : index * 2,
+      turnId: `diagnostic-${index}`,
+      updatedAt: 1,
+    } satisfies typeof turns.$inferInsert;
+  });
+  database.insert(turns).values(values).run();
+  database
+    .insert(turnModelUsage)
+    .values(
+      values.map((turn, offset) => {
+        const index = offset + 1;
+        return usageRollup(
+          turn.id,
+          "diagnostic-model",
+          index,
+          0,
+          1,
+          index + 1,
+          index === 1 ? 2 : 1,
+          index,
+          index <= 2 ? 1 : 0,
+        );
+      }),
+    )
     .run();
 }
 

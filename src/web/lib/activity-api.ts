@@ -61,10 +61,15 @@ export function activityFiltersFromSearch(
   const kinds = parseKinds(search.get("kinds"));
   const projectId = search.get("project")?.trim();
   const sessionId = search.get("session")?.trim();
+  const tagIds = (search.get("tags") ?? "")
+    .split(",")
+    .map((tagId) => tagId.trim())
+    .filter(Boolean);
   if (agentKind === "main" || agentKind === "subagent") filters.agentKind = agentKind;
   if (kinds.length > 0) filters.kinds = kinds;
   if (projectId) filters.projectId = projectId;
   if (sessionId) filters.sessionId = sessionId;
+  if (tagIds.length > 0) filters.tagIds = [...new Set(tagIds)].slice(0, 50);
   return filters;
 }
 
@@ -79,6 +84,7 @@ export function updateActivitySearch(
   setOptional(next, "kinds", filters.kinds?.join(","));
   setOptional(next, "project", filters.projectId);
   setOptional(next, "session", filters.sessionId);
+  setOptional(next, "tags", filters.tagIds?.join(","));
   return next;
 }
 

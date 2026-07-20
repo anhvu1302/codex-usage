@@ -15,6 +15,7 @@ import {
   archivedActivityEventIds,
   importDiagnostics,
   importStates,
+  projects,
   sessionAgents,
   sessions,
   usageDailyRollups,
@@ -22,6 +23,7 @@ import {
 } from "@/server/db/schema";
 import { SessionImporter } from "@/server/importer";
 import { compactUsage, RetentionService } from "@/server/retention";
+import { createTag, replaceProjectTags } from "@/server/tags";
 
 const temporaryDirectories: string[] = [];
 
@@ -224,6 +226,22 @@ describe("activity import and retention", () => {
       .run("/legacy/source.jsonl", 1);
     client.exec(await migrationSql(10));
     client.exec(await migrationSql(11));
+    client
+      .prepare(
+        `insert or ignore into projects
+          (id, display_name, display_path, normalized_path, created_at, updated_at)
+         values (?, ?, ?, ?, ?, ?)`,
+      )
+      .run("legacy-project", "Legacy", "/legacy", "/legacy", 1, 1);
+    client
+      .prepare(
+        `insert into budget_settings
+          (period, enabled, limit_usd, warning_thresholds, updated_at)
+         values (?, ?, ?, ?, ?)`,
+      )
+      .run("daily", 1, 12.5, "[50,100]", 1);
+    client.exec(await migrationSql(12));
+    client.exec(await migrationSql(13));
 
     expect(
       client
@@ -244,6 +262,22 @@ describe("activity import and retention", () => {
         )
         .get(),
     ).toEqual({ turnKey: null, version: 0 });
+    expect(
+      client
+        .prepare(
+          "select enabled, limit_usd as limitUsd, warning_thresholds as thresholds from budget_settings where period = 'daily'",
+        )
+        .get(),
+    ).toEqual({ enabled: 1, limitUsd: 12.5, thresholds: "[50,100]" });
+    expect(
+      client
+        .prepare(
+          `select name from sqlite_master
+           where type = 'table' and name in ('project_budget_settings', 'project_tags', 'tags')
+           order by name`,
+        )
+        .all(),
+    ).toEqual([{ name: "project_budget_settings" }, { name: "project_tags" }, { name: "tags" }]);
     expect(
       client
         .prepare(
@@ -328,6 +362,27 @@ describe("activity import and retention", () => {
 
   it("returns daily usage independently from event kinds and preserves filter semantics", async () => {
     const harness = await createHarness();
+    harness.database
+      .insert(projects)
+      .values([
+        {
+          createdAt: 1,
+          displayName: "Project A",
+          displayPath: "/project-a",
+          id: "project-a",
+          normalizedPath: "/project-a",
+          updatedAt: 1,
+        },
+        {
+          createdAt: 1,
+          displayName: "Project B",
+          displayPath: "/project-b",
+          id: "project-b",
+          normalizedPath: "/project-b",
+          updatedAt: 1,
+        },
+      ])
+      .run();
     harness.database
       .insert(sessions)
       .values([
@@ -510,10 +565,29 @@ describe("activity import and retention", () => {
       },
     ]);
 
+    const selectedTag = createTag(harness.database, "Selected");
+    const otherTag = createTag(harness.database, "Other");
+    replaceProjectTags(harness.database, "project-a", [selectedTag.id]);
+    replaceProjectTags(harness.database, "project-b", [otherTag.id]);
+    const tagged = getActivitySummary(harness.database, {
+      ...filters,
+      tagIds: [selectedTag.id],
+    });
+    expect(tagged.daily.reduce((total, row) => total + row.count, 0)).toBe(2);
+    expect(tagged.dailyUsage).toEqual([
+      expect.objectContaining({ date: "2026-05-01", totalTokens: 400 }),
+      expect.objectContaining({ date: "2026-07-12", totalTokens: 300 }),
+    ]);
+
     const app = createApp(harness.database, harness.importer, harness.retention);
     const response = await app.request("/api/activity/summary?from=2026-05-01&to=2026-07-12");
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ dailyUsage: summary.dailyUsage });
+    const taggedResponse = await app.request(
+      `/api/activity/summary?from=2026-05-01&to=2026-07-12&tags=${selectedTag.id}`,
+    );
+    expect(taggedResponse.status).toBe(200);
+    expect(await taggedResponse.json()).toMatchObject({ dailyUsage: tagged.dailyUsage });
     const legacy = await (await app.request("/api/activity?from=2026-05-01&to=2026-07-12")).json();
     expect(legacy).not.toHaveProperty("dailyUsage");
   });

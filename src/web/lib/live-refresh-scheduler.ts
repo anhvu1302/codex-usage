@@ -191,6 +191,7 @@ export function matchesRevisionScopes(
     scopes.has("catalog") &&
     (prefix === "models" ||
       prefix === "pricing-models" ||
+      prefix === "tags" ||
       (prefix === "projects" && detail === "options"))
   ) {
     return true;

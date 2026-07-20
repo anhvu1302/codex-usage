@@ -10,8 +10,10 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import { AppShell } from "@/web/components/app-shell";
 import { Skeleton } from "@/web/components/ui/skeleton";
 import { Toaster } from "@/web/components/ui/sonner";
+import { BrowserNotificationsProvider } from "@/web/lib/browser-notifications";
 import { LiveEvents } from "@/web/lib/live-events";
 import { PreferencesProvider } from "@/web/lib/preferences";
+import { SavedViewsProvider } from "@/web/lib/saved-views";
 import {
   loadActivityPage,
   loadAgentsPage,
@@ -58,69 +60,73 @@ const queryClient = new QueryClient({
 export function App() {
   return (
     <PreferencesProvider>
-      <QueryClientProvider client={queryClient}>
-        <LiveEvents />
-        <BrowserRouter>
-          <QueryProgress />
-          <Routes>
-            <Route element={<AppShell />}>
-              <Route index element={<DashboardRoute mode="overview" />} />
-              <Route path="explore" element={<DashboardRoute mode="explore" />} />
-              <Route
-                path="sessions"
-                element={
-                  <LazyPage>
-                    <SessionsPage />
-                  </LazyPage>
-                }
-              />
-              <Route
-                path="turns/*"
-                element={
-                  <LazyPage>
-                    <TurnsPage />
-                  </LazyPage>
-                }
-              />
-              <Route
-                path="projects"
-                element={
-                  <LazyPage>
-                    <ProjectsPage />
-                  </LazyPage>
-                }
-              />
-              <Route
-                path="agents"
-                element={
-                  <LazyPage>
-                    <AgentsPage />
-                  </LazyPage>
-                }
-              />
-              <Route
-                path="activity"
-                element={
-                  <LazyPage>
-                    <ActivityPage />
-                  </LazyPage>
-                }
-              />
-              <Route
-                path="settings"
-                element={
-                  <LazyPage>
-                    <SettingsPage />
-                  </LazyPage>
-                }
-              />
-              <Route path="rates" element={<Navigate replace to="/settings" />} />
-              <Route path="*" element={<Navigate replace to="/" />} />
-            </Route>
-          </Routes>
-          <Toaster />
-        </BrowserRouter>
-      </QueryClientProvider>
+      <BrowserNotificationsProvider>
+        <SavedViewsProvider>
+          <QueryClientProvider client={queryClient}>
+            <LiveEvents />
+            <BrowserRouter>
+              <QueryProgress />
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route index element={<DashboardRoute mode="overview" />} />
+                  <Route path="explore" element={<DashboardRoute mode="explore" />} />
+                  <Route
+                    path="sessions"
+                    element={
+                      <LazyPage>
+                        <SessionsPage />
+                      </LazyPage>
+                    }
+                  />
+                  <Route
+                    path="turns/*"
+                    element={
+                      <LazyPage>
+                        <TurnsPage />
+                      </LazyPage>
+                    }
+                  />
+                  <Route
+                    path="projects"
+                    element={
+                      <LazyPage>
+                        <ProjectsPage />
+                      </LazyPage>
+                    }
+                  />
+                  <Route
+                    path="agents"
+                    element={
+                      <LazyPage>
+                        <AgentsPage />
+                      </LazyPage>
+                    }
+                  />
+                  <Route
+                    path="activity"
+                    element={
+                      <LazyPage>
+                        <ActivityPage />
+                      </LazyPage>
+                    }
+                  />
+                  <Route
+                    path="settings"
+                    element={
+                      <LazyPage>
+                        <SettingsPage />
+                      </LazyPage>
+                    }
+                  />
+                  <Route path="rates" element={<Navigate replace to="/settings" />} />
+                  <Route path="*" element={<Navigate replace to="/" />} />
+                </Route>
+              </Routes>
+              <Toaster />
+            </BrowserRouter>
+          </QueryClientProvider>
+        </SavedViewsProvider>
+      </BrowserNotificationsProvider>
     </PreferencesProvider>
   );
 }

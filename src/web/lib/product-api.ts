@@ -9,6 +9,7 @@ import type {
   PricingSimulationRequest,
   ProjectPageFilters,
   ProjectPageQuery,
+  ProjectTagsResponse,
 } from "@/shared/types";
 import { apiClient, rpcJson, rpcOptions, toDashboardQuery } from "@/web/lib/rpc-client";
 
@@ -75,6 +76,39 @@ export function renameProject(id: string, displayName: string) {
   );
 }
 
+export function fetchTags(signal?: AbortSignal) {
+  return rpcJson(apiClient.api.tags.$get(undefined, rpcOptions(signal)));
+}
+
+export function createTag(name: string) {
+  return rpcJson(apiClient.api.tags.$post({ json: { name } }));
+}
+
+export function renameTag(id: string, name: string) {
+  return rpcJson(
+    apiClient.api.tags[":id"].$put({
+      json: { name },
+      param: { id: encodeURIComponent(id) },
+    }),
+  );
+}
+
+export function deleteTag(id: string) {
+  return rpcJson(apiClient.api.tags[":id"].$delete({ param: { id: encodeURIComponent(id) } }));
+}
+
+export function replaceProjectTags(
+  projectId: string,
+  tagIds: string[],
+): Promise<ProjectTagsResponse> {
+  return rpcJson(
+    apiClient.api.projects[":id"].tags.$put({
+      json: { tagIds },
+      param: { id: encodeURIComponent(projectId) },
+    }),
+  );
+}
+
 export function fetchAgentsSummary(filters: AgentFilters, signal?: AbortSignal) {
   return rpcJson(
     apiClient.api.agents.summary.$get({ query: toAgentQuery(filters) }, rpcOptions(signal)),
@@ -92,8 +126,13 @@ export function fetchAgentsPage(filters: AgentPageFilters, signal?: AbortSignal)
   return rpcJson(apiClient.api.agents.page.$get({ query }, rpcOptions(signal)));
 }
 
-export function fetchBudgets(signal?: AbortSignal) {
-  return rpcJson(apiClient.api.budgets.$get(undefined, rpcOptions(signal)));
+export function fetchBudgets(projectId?: string, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.budgets.$get(
+      { query: projectId ? { project: projectId } : {} },
+      rpcOptions(signal),
+    ),
+  );
 }
 
 export function saveBudget(budget: Omit<BudgetSetting, "updatedAt">) {
@@ -150,9 +189,11 @@ export function filtersFromSearch(search: URLSearchParams): DashboardFilters {
     .map((model) => model.trim())
     .filter(Boolean);
   const projectId = search.get("project")?.trim();
+  const tagIds = parseTagIds(search.get("tags"));
   const agentKind = search.get("agentKind")?.trim();
   if (models.length > 0) filters.models = [...new Set(models)];
   if (projectId) filters.projectId = projectId;
+  if (tagIds.length > 0) filters.tagIds = tagIds;
   if (agentKind === "main" || agentKind === "subagent") filters.agentKind = agentKind;
   return filters;
 }
@@ -170,10 +211,25 @@ export function updateFilterSearch(
   else next.delete("models");
   if (filters.projectId) next.set("project", filters.projectId);
   else next.delete("project");
+  if (filters.tagIds?.length) next.set("tags", [...new Set(filters.tagIds)].join(","));
+  else next.delete("tags");
   if (filters.agentKind && filters.agentKind !== "all") {
     next.set("agentKind", filters.agentKind);
   } else next.delete("agentKind");
   return next;
+}
+
+function parseTagIds(value: string | null): string[] {
+  return [
+    ...new Set(
+      (value ?? "")
+        .split(",")
+        .map((tagId) => tagId.trim())
+        .filter((tagId) =>
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(tagId),
+        ),
+    ),
+  ].slice(0, 50);
 }
 
 function toAgentQuery(filters: AgentFilters): AgentQuery {

@@ -16,6 +16,7 @@ export type DashboardFilters = DateRange & {
   model?: string;
   models?: string[];
   projectId?: string;
+  tagIds?: string[];
 };
 
 type AgentKind = "all" | "main" | "subagent";
@@ -26,6 +27,7 @@ export type DashboardQuery = {
   model?: string;
   models?: string;
   project?: string;
+  tags?: string;
   to?: string;
 };
 
@@ -333,6 +335,7 @@ export type ProjectSummary = DashboardKpis & {
   subagentCostUsd: number;
   subagentShare: number;
   subagentTokens: number;
+  tags: ProjectTag[];
   topSessions: SessionUsage[];
 };
 
@@ -352,7 +355,30 @@ export type ProjectListItem = DashboardKpis & {
   subagentCostUsd: number;
   subagentShare: number;
   subagentTokens: number;
+  tags: ProjectTag[];
   topModels: { model: string; totalTokens: number }[];
+};
+
+export type ProjectTag = {
+  id: string;
+  name: string;
+};
+
+export type Tag = ProjectTag & {
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TagSummary = Tag & {
+  projectCount: number;
+};
+
+export type TagsResponse = {
+  tags: TagSummary[];
+};
+
+export type ProjectTagsResponse = {
+  tags: ProjectTag[];
 };
 
 export type ProjectPageFilters = DashboardFilters & {
@@ -458,12 +484,19 @@ export type AgentQuery = DashboardQuery & {
 
 export type BudgetPeriod = "daily" | "monthly";
 
+export type BudgetScope = { kind: "global" } | { kind: "project"; projectId: string };
+
 export type BudgetSetting = {
   enabled: boolean;
   limitUsd: number;
   period: BudgetPeriod;
+  scope: BudgetScope;
   updatedAt: string;
   warningThresholds: number[];
+};
+
+export type BudgetQuery = {
+  project?: string;
 };
 
 export type AlertEvent = {
@@ -641,6 +674,8 @@ export type TurnQuery = DashboardQuery & {
   status?: TurnStatus;
 };
 
+export type TurnDiagnosticsQuery = Omit<TurnQuery, "order" | "page" | "pageSize" | "sort">;
+
 export type TurnComparisonQuery = {
   ids: string;
 };
@@ -714,6 +749,39 @@ export type TurnCoverage = {
   timeline: SessionCoverage;
 };
 
+export type TurnDiagnosticMetric = "cost" | "duration" | "ttft";
+
+export type TurnDiagnosticReason =
+  | "context-70"
+  | "context-85"
+  | "context-95"
+  | "cost-partial"
+  | "cost-p95"
+  | "cost-unavailable"
+  | "duration-p95"
+  | "ttft-p95";
+
+export type TurnDiagnosticBaseline = {
+  baselineAvailable: boolean;
+  eligibleCount: number;
+  median: number | null;
+  p95: number | null;
+  unavailableCount: number;
+};
+
+export type TurnDiagnosticItem = {
+  reasons: TurnDiagnosticReason[];
+  turn: TurnSummary;
+};
+
+export type TurnDiagnosticsResponse = {
+  baselines: Record<TurnDiagnosticMetric, TurnDiagnosticBaseline>;
+  coverage: TurnCoverage;
+  items: TurnDiagnosticItem[];
+  matchedTurnCount: number;
+  outlierTurnCount: number;
+};
+
 export type TurnsResponse = {
   contextBuckets: TurnContextBucket[];
   coverage: TurnCoverage;
@@ -758,4 +826,119 @@ export type TurnDetailResponse = {
 export type TurnComparisonResponse = {
   missingIds: string[];
   turns: TurnSummary[];
+};
+
+export type ReportPreset =
+  "agent-summary" | "cost-overview" | "project-summary" | "session-summary" | "turn-summary";
+
+export type ReportFormat = "csv" | "json";
+
+type CostOverviewReportColumn =
+  | "date"
+  | "estimatedCostUsd"
+  | "requestCount"
+  | "sessionCount"
+  | "totalTokens"
+  | "unpricedUsageCount";
+
+type ProjectSummaryReportColumn =
+  | "estimatedCostUsd"
+  | "modelCount"
+  | "projectDisplayName"
+  | "projectDisplayPath"
+  | "projectId"
+  | "requestCount"
+  | "sessionCount"
+  | "subagentShare"
+  | "subagentTokens"
+  | "totalTokens";
+
+type AgentSummaryReportColumn =
+  | "agentId"
+  | "agentName"
+  | "cacheRate"
+  | "depth"
+  | "estimatedCostUsd"
+  | "isSubagent"
+  | "requestCount"
+  | "role"
+  | "sessionCount"
+  | "totalTokens";
+
+type SessionSummaryReportColumn =
+  | "agentCount"
+  | "estimatedCostUsd"
+  | "lastEventAt"
+  | "models"
+  | "projectId"
+  | "requestCount"
+  | "sessionId"
+  | "sessionTitle"
+  | "subagentCount"
+  | "totalTokens";
+
+type TurnSummaryReportColumn =
+  | "agentName"
+  | "contextUtilizationPercent"
+  | "costCoverage"
+  | "durationMs"
+  | "estimatedCostUsd"
+  | "models"
+  | "projectId"
+  | "role"
+  | "sessionId"
+  | "sessionTitle"
+  | "status"
+  | "timeToFirstTokenMs"
+  | "totalTokens"
+  | "turnId"
+  | "turnKey";
+
+export type ReportColumnId =
+  | AgentSummaryReportColumn
+  | CostOverviewReportColumn
+  | ProjectSummaryReportColumn
+  | SessionSummaryReportColumn
+  | TurnSummaryReportColumn;
+
+type ReportRequestBase<Preset extends ReportPreset, Filters> = {
+  acknowledgeSensitive: string[];
+  columns: string[];
+  filters: Filters;
+  format: ReportFormat;
+  preset: Preset;
+};
+
+export type ReportRequest =
+  | ReportRequestBase<"cost-overview", DashboardFilters>
+  | ReportRequestBase<"project-summary", DashboardFilters>
+  | ReportRequestBase<"agent-summary", AgentFilters>
+  | ReportRequestBase<
+      "session-summary",
+      Omit<SessionFilters, "order" | "page" | "pageSize" | "sort">
+    >
+  | ReportRequestBase<"turn-summary", Omit<TurnFilters, "order" | "page" | "pageSize" | "sort">>;
+
+export type ReportColumnMetadata = {
+  id: ReportColumnId;
+  label: string;
+  selectedByDefault: boolean;
+  sensitive: boolean;
+};
+
+export type ReportCell = boolean | null | number | string;
+
+export type ReportCoverage = {
+  aggregate: "full" | "partial";
+  detail: SessionCoverage;
+};
+
+export type ReportPreviewResponse = {
+  acknowledgementMatches: boolean;
+  availableColumns: ReportColumnMetadata[];
+  coverage: ReportCoverage;
+  resolvedColumns: ReportColumnMetadata[];
+  rowCount: { kind: "estimated" | "exact"; value: number };
+  rows: Record<string, ReportCell>[];
+  sensitiveWarning: string | null;
 };

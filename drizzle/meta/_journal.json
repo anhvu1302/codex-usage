@@ -85,6 +85,20 @@
       "when": 1784138157160,
       "tag": "0011_daily_nick_fury",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1784534887366,
+      "tag": "0012_overconfident_elektra",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1784536052286,
+      "tag": "0013_tearful_peter_parker",
+      "breakpoints": true
     }
   ]
 }

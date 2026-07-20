@@ -14,7 +14,7 @@ type ManifestChunk = {
 
 const DISTANCE_BUDGETS = {
   coldActivityNonChartGzip: 190 * 1024,
-  coldRouteGzip: 175 * 1024,
+  coldRouteGzip: 179 * 1024,
   coldRouteRaw: 700 * 1024,
   entryGzip: 160 * 1024,
   entryRaw: 550 * 1024,

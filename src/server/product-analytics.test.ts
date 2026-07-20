@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -6,13 +7,14 @@ import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AlertMaterializer } from "@/server/alert-materializer";
-import { getDashboard, upsertModelRate } from "@/server/analytics";
+import { getDashboard, getSessions, upsertModelRate } from "@/server/analytics";
 import { AppEventBus } from "@/server/app-events";
 import { createApp } from "@/server/app";
 import { createDatabase, migrateDatabase, type AppDatabase } from "@/server/db/client";
 import {
   alertEvents,
   modelRates,
+  projectBudgetSettings,
   projects,
   sessionAgents,
   sessions,
@@ -21,6 +23,7 @@ import {
   usageAgentDailyRollups,
   usageDailyRollups,
   usageEvents,
+  usageHourlyRollups,
   usageRollupSessionMemberships,
 } from "@/server/db/schema";
 import { SessionImporter } from "@/server/importer";
@@ -47,6 +50,7 @@ import {
 } from "@/server/product-analytics";
 import { renameProject } from "@/server/projects";
 import { RetentionService } from "@/server/retention";
+import { createTag, replaceProjectTags } from "@/server/tags";
 import type { AgentLeaderboardMetric, AgentUsageSummary } from "@/shared/types";
 
 type Harness = Awaited<ReturnType<typeof createHarness>>;
@@ -366,6 +370,113 @@ describe("phase 2 product analytics", () => {
     });
   });
 
+  it("applies any-tag filters consistently to raw, rollup, pricing and export totals", () => {
+    const production = createTag(harness.database, "Production");
+    const internal = createTag(harness.database, "Internal");
+    expect(replaceProjectTags(harness.database, "project-alpha", [production.id])).toMatchObject({
+      status: "ok",
+    });
+    expect(replaceProjectTags(harness.database, "project-beta", [internal.id])).toMatchObject({
+      status: "ok",
+    });
+
+    const rawRange = { from: "2026-07-12", tagIds: [production.id], to: "2026-07-12" };
+    expect(getDashboard(harness.database, rawRange, fixedNow()).kpis).toMatchObject({
+      estimatedCostUsd: 3,
+      totalTokens: 3_600,
+    });
+    expect(getProjectsPage(harness.database, rawRange).projects).toEqual([
+      expect.objectContaining({
+        id: "project-alpha",
+        tags: [{ id: production.id, name: "Production" }],
+        totalTokens: 3_600,
+      }),
+    ]);
+    expect(getAgentsSummary(harness.database, rawRange, fixedNow())).toMatchObject({
+      totalAgents: 2,
+    });
+    expect(getSessions(harness.database, rawRange, fixedNow()).sessions).toEqual([
+      expect.objectContaining({ projectId: "project-alpha" }),
+    ]);
+    expect(
+      simulatePricing(harness.database, {
+        ...rawRange,
+        rates: [{ cachedInputRate: 0.5, inputRate: 2, model: "model-a", outputRate: 4 }],
+      }),
+    ).toMatchObject({ currentCostUsd: 3 });
+    expect(JSON.parse(exportDataset(harness.database, "projects", rawRange, "json").body)).toEqual([
+      expect.objectContaining({ id: "project-alpha" }),
+    ]);
+
+    expect(
+      getDashboard(
+        harness.database,
+        { from: "2026-07-12", tagIds: [production.id, internal.id], to: "2026-07-12" },
+        fixedNow(),
+      ).kpis.totalTokens,
+    ).toBe(3_900);
+
+    const aggregate = {
+      cachedInputTokens: 20,
+      costUsd: 0.25,
+      inputTokens: 100,
+      outputTokens: 10,
+      reasoningOutputTokens: 3,
+      requestCount: 1,
+      totalTokens: 110,
+      unpricedCachedInputTokens: 0,
+      unpricedInputTokens: 0,
+      unpricedOutputTokens: 0,
+      unpricedUsageCount: 0,
+    };
+    harness.database
+      .insert(usageDailyRollups)
+      .values({
+        ...aggregate,
+        agentKind: "main",
+        localDate: "2026-04-01",
+        model: "model-a",
+        projectId: "project-alpha",
+      })
+      .run();
+    harness.database
+      .insert(usageAgentDailyRollups)
+      .values({
+        ...aggregate,
+        agentId: "session-alpha",
+        agentKind: "main",
+        localDate: "2026-04-01",
+        model: "model-a",
+        projectId: "project-alpha",
+        sessionId: "session-alpha",
+      })
+      .run();
+    harness.database
+      .insert(usageRollupSessionMemberships)
+      .values({
+        agentKind: "main",
+        bucketStart: "2026-04-01",
+        bucketType: "day",
+        model: "model-a",
+        projectId: "project-alpha",
+        sessionId: "session-alpha",
+      })
+      .run();
+    const archivedRange = { from: "2026-04-01", tagIds: [production.id], to: "2026-04-01" };
+    expect(getDashboard(harness.database, archivedRange, fixedNow()).kpis).toMatchObject({
+      estimatedCostUsd: 0.25,
+      totalTokens: 110,
+    });
+    expect(getProjectsSummary(harness.database, archivedRange)).toMatchObject({
+      kpis: { totalTokens: 110 },
+      projectCount: 1,
+    });
+    expect(getAgentsSummary(harness.database, archivedRange, fixedNow())).toMatchObject({
+      main: { totalTokens: 110 },
+      totalAgents: 1,
+    });
+  });
+
   it("keeps legacy main/subagent totals when per-agent rollups do not exist yet", () => {
     const range = { from: "2026-03-01", to: "2026-03-01" };
     const base = {
@@ -498,6 +609,143 @@ describe("phase 2 product analytics", () => {
     expect(dismissAllAlerts(harness.database)).toBe(2);
     expect(getAlertFeed(harness.database)).toEqual({ alerts: [], unseenCount: 0 });
     expect(dismissAllAlerts(harness.database)).toBe(0);
+  });
+
+  it("stores project budgets and materializes global/project alerts with set-based totals", () => {
+    expect(getBudgets(harness.database, "project-alpha")).toEqual([
+      expect.objectContaining({ period: "daily", scope: { kind: "global" } }),
+      expect.objectContaining({ period: "monthly", scope: { kind: "global" } }),
+      expect.objectContaining({
+        enabled: false,
+        limitUsd: 0,
+        period: "daily",
+        scope: { kind: "project", projectId: "project-alpha" },
+      }),
+      expect.objectContaining({
+        enabled: false,
+        limitUsd: 0,
+        period: "monthly",
+        scope: { kind: "project", projectId: "project-alpha" },
+      }),
+    ]);
+
+    expect(
+      saveBudget(harness.database, {
+        enabled: true,
+        limitUsd: 3,
+        period: "daily",
+        scope: { kind: "global" },
+        warningThresholds: [100],
+      }),
+    ).toMatchObject({ scope: { kind: "global" } });
+    expect(
+      saveBudget(harness.database, {
+        enabled: true,
+        limitUsd: 2,
+        period: "daily",
+        scope: { kind: "project", projectId: "project-alpha" },
+        warningThresholds: [50, 80, 100],
+      }),
+    ).toMatchObject({ scope: { kind: "project", projectId: "project-alpha" } });
+    const archivedUsage = {
+      agentKind: "main",
+      cachedInputTokens: 200,
+      costUsd: 0.25,
+      inputTokens: 300,
+      localDate: "2026-07-01",
+      model: "model-a",
+      outputTokens: 50,
+      projectId: "project-alpha",
+      reasoningOutputTokens: 20,
+      requestCount: 2,
+      totalTokens: 350,
+      unpricedCachedInputTokens: 0,
+      unpricedInputTokens: 0,
+      unpricedOutputTokens: 0,
+      unpricedUsageCount: 0,
+    };
+    harness.database.insert(usageDailyRollups).values(archivedUsage).run();
+    harness.database
+      .insert(usageHourlyRollups)
+      .values({ ...archivedUsage, localHour: "09:00" })
+      .run();
+    expect(
+      saveBudget(harness.database, {
+        enabled: true,
+        limitUsd: 3.2,
+        period: "monthly",
+        scope: { kind: "project", projectId: "project-alpha" },
+        warningThresholds: [100, 105],
+      }),
+    ).toMatchObject({ scope: { kind: "project", projectId: "project-alpha" } });
+    expect(
+      saveBudget(harness.database, {
+        enabled: true,
+        limitUsd: 1,
+        period: "daily",
+        scope: { kind: "project", projectId: "missing" },
+        warningThresholds: [50],
+      }),
+    ).toBeNull();
+
+    const first = refreshAlerts(harness.database, new Date("2026-07-11T17:00:00.000Z")).filter(
+      (alert) => alert.type === "budget",
+    );
+    const second = refreshAlerts(harness.database, new Date("2026-07-11T17:00:00.000Z")).filter(
+      (alert) => alert.type === "budget",
+    );
+    expect(second.map((alert) => alert.id)).toEqual(first.map((alert) => alert.id));
+
+    const rows = harness.database
+      .select({
+        message: alertEvents.message,
+        periodStart: alertEvents.periodStart,
+        scopeKey: alertEvents.scopeKey,
+        title: alertEvents.title,
+      })
+      .from(alertEvents)
+      .where(eq(alertEvents.type, "budget"))
+      .all();
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ periodStart: "2026-07-12", scopeKey: "daily:100" }),
+        expect.objectContaining({
+          periodStart: "2026-07-12",
+          scopeKey: "project:project-alpha:daily:50",
+        }),
+        expect.objectContaining({
+          periodStart: "2026-07-12",
+          scopeKey: "project:project-alpha:daily:80",
+        }),
+        expect.objectContaining({
+          periodStart: "2026-07-12",
+          scopeKey: "project:project-alpha:daily:100",
+        }),
+        expect.objectContaining({
+          periodStart: "2026-07-01",
+          scopeKey: "project:project-alpha:monthly:100",
+        }),
+      ]),
+    );
+    expect(rows).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ scopeKey: "project:project-alpha:monthly:105" }),
+      ]),
+    );
+    expect(rows.find((row) => row.scopeKey.startsWith("project:"))).toMatchObject({
+      message: expect.stringContaining("=SUM(A1:A2)"),
+      title: expect.stringContaining("=SUM(A1:A2)"),
+    });
+    expect(JSON.stringify(rows)).not.toContain("/workspace/alpha");
+
+    harness.database.delete(projects).where(eq(projects.id, "project-alpha")).run();
+    expect(
+      harness.database
+        .select()
+        .from(projectBudgetSettings)
+        .where(eq(projectBudgetSettings.projectId, "project-alpha"))
+        .all(),
+    ).toEqual([]);
   });
 
   it("raises stable context-pressure alerts without downgrading their severity", () => {
@@ -1004,9 +1252,70 @@ describe("phase 2 API", () => {
     });
     expect(saved.status).toBe(200);
     expect(await saved.json()).toMatchObject({
-      budget: { period: "daily", warningThresholds: [50, 100] },
+      budget: { period: "daily", scope: { kind: "global" }, warningThresholds: [50, 100] },
     });
-    expect((await app.request("/api/budgets")).status).toBe(200);
+    const globals = await app.request("/api/budgets");
+    expect(globals.status).toBe(200);
+    expect(await globals.json()).toMatchObject({
+      budgets: [
+        { period: "daily", scope: { kind: "global" } },
+        { period: "monthly", scope: { kind: "global" } },
+      ],
+    });
+
+    const projectDefaults = await app.request("/api/budgets?project=project-alpha");
+    expect(projectDefaults.status).toBe(200);
+    expect(await projectDefaults.json()).toMatchObject({
+      budgets: [
+        { period: "daily", scope: { kind: "global" } },
+        { period: "monthly", scope: { kind: "global" } },
+        {
+          enabled: false,
+          period: "daily",
+          scope: { kind: "project", projectId: "project-alpha" },
+        },
+        {
+          enabled: false,
+          period: "monthly",
+          scope: { kind: "project", projectId: "project-alpha" },
+        },
+      ],
+    });
+    const savedProject = await app.request("/api/budgets", {
+      body: JSON.stringify({
+        enabled: true,
+        limitUsd: 2,
+        period: "monthly",
+        scope: { kind: "project", projectId: "project-alpha" },
+        warningThresholds: [80, 100],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    expect(savedProject.status).toBe(200);
+    expect(await savedProject.json()).toMatchObject({
+      budget: {
+        period: "monthly",
+        scope: { kind: "project", projectId: "project-alpha" },
+      },
+    });
+    expect((await app.request("/api/budgets?project=missing")).status).toBe(404);
+    expect((await app.request(`/api/budgets?project=${"x".repeat(161)}`)).status).toBe(400);
+    expect(
+      (
+        await app.request("/api/budgets", {
+          body: JSON.stringify({
+            enabled: true,
+            limitUsd: 2,
+            period: "daily",
+            scope: { kind: "project", projectId: "missing" },
+            warningThresholds: [50],
+          }),
+          headers: { "content-type": "application/json" },
+          method: "PUT",
+        })
+      ).status,
+    ).toBe(404);
     expect(
       (
         await app.request("/api/budgets", {
@@ -1078,6 +1387,107 @@ describe("phase 2 API", () => {
       alerts: [],
       unseenCount: 0,
     });
+  });
+
+  it("validates tag CRUD, conflicts and transactional project assignment", async () => {
+    const app = createApp(harness.database, harness.importer, harness.retention);
+    const created = await app.request("/api/tags", {
+      body: JSON.stringify({ name: "  Ｐｒｏｄ   Team  " }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(created.status).toBe(201);
+    const createdPayload = (await created.json()) as { tag: { id: string; name: string } };
+    expect(createdPayload.tag.name).toBe("Prod Team");
+
+    expect(
+      (
+        await app.request("/api/tags", {
+          body: JSON.stringify({ name: "prod team" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await app.request("/api/tags", {
+          body: JSON.stringify({ name: "bad\nname" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      ).status,
+    ).toBe(400);
+    expect(await (await app.request("/api/tags")).json()).toMatchObject({
+      tags: [expect.objectContaining({ name: "Prod Team", projectCount: 0 })],
+    });
+
+    const assigned = await app.request("/api/projects/project-alpha/tags", {
+      body: JSON.stringify({ tagIds: [createdPayload.tag.id, createdPayload.tag.id] }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    expect(assigned.status).toBe(200);
+    expect(await assigned.json()).toEqual({
+      tags: [{ id: createdPayload.tag.id, name: "Prod Team" }],
+    });
+    expect(
+      (
+        await app.request("/api/projects/project-alpha/tags", {
+          body: JSON.stringify({ tagIds: [randomUUID()] }),
+          headers: { "content-type": "application/json" },
+          method: "PUT",
+        })
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await app.request("/api/projects/project-alpha/tags", {
+          body: JSON.stringify({ tagIds: Array.from({ length: 51 }, () => randomUUID()) }),
+          headers: { "content-type": "application/json" },
+          method: "PUT",
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await app.request("/api/projects/missing/tags", {
+          body: JSON.stringify({ tagIds: [] }),
+          headers: { "content-type": "application/json" },
+          method: "PUT",
+        })
+      ).status,
+    ).toBe(404);
+
+    const filtered = await app.request(
+      `/api/dashboard?from=2026-07-12&to=2026-07-12&tags=${createdPayload.tag.id}`,
+    );
+    expect(filtered.status).toBe(200);
+    expect(await filtered.json()).toMatchObject({ kpis: { totalTokens: 3_600 } });
+    expect((await app.request("/api/dashboard?tags=not-a-uuid")).status).toBe(400);
+
+    const renamed = await app.request(`/api/tags/${createdPayload.tag.id}`, {
+      body: JSON.stringify({ name: "Production" }),
+      headers: { "content-type": "application/json" },
+      method: "PUT",
+    });
+    expect(renamed.status).toBe(200);
+    expect(await renamed.json()).toMatchObject({ tag: { name: "Production" } });
+    expect(
+      (
+        await app.request(`/api/tags/${randomUUID()}`, {
+          body: JSON.stringify({ name: "Missing" }),
+          headers: { "content-type": "application/json" },
+          method: "PUT",
+        })
+      ).status,
+    ).toBe(404);
+    expect(
+      (await app.request(`/api/tags/${createdPayload.tag.id}`, { method: "DELETE" })).status,
+    ).toBe(200);
+    expect(
+      (await app.request(`/api/tags/${createdPayload.tag.id}`, { method: "DELETE" })).status,
+    ).toBe(404);
   });
 
   it("invalidates alert analytics only for data-changing mutation groups", async () => {

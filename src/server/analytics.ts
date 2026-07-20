@@ -3,6 +3,7 @@ import { and, asc, eq, gte, inArray, isNull, lte, sql } from "drizzle-orm";
 import type { AppDatabase } from "@/server/db/client";
 import {
   modelRates,
+  projectTags,
   sessionAgents,
   sessions,
   turnModelUsage,
@@ -351,6 +352,7 @@ export function getTopSessionsByProject(
     ...(filters.model ? { model: filters.model } : {}),
     ...(filters.models ? { models: filters.models } : {}),
     ...(filters.projectId ? { projectId: filters.projectId } : {}),
+    ...(filters.tagIds ? { tagIds: filters.tagIds } : {}),
     to: coverage.to,
   };
   const conditions = ["e.local_date >= ?", "e.local_date <= ?", "s.project_id is not null"];
@@ -372,6 +374,16 @@ export function getTopSessionsByProject(
   if (effectiveFilters.projectId) {
     conditions.push("s.project_id = ?");
     parameters.push(effectiveFilters.projectId);
+  }
+  if (effectiveFilters.tagIds?.length) {
+    conditions.push(
+      `exists (
+        select 1 from project_tags tag_filter
+        where tag_filter.project_id = s.project_id
+          and tag_filter.tag_id in (${effectiveFilters.tagIds.map(() => "?").join(", ")})
+      )`,
+    );
+    parameters.push(...effectiveFilters.tagIds);
   }
 
   const rows = database.$client
@@ -595,6 +607,7 @@ function buildRawSessionScope(
     ...(filters.model ? { model: filters.model } : {}),
     ...(filters.models ? { models: filters.models } : {}),
     ...(filters.projectId ? { projectId: filters.projectId } : {}),
+    ...(filters.tagIds ? { tagIds: filters.tagIds } : {}),
     to: coverage.to,
   };
   const usageConditions = ["e.local_date >= ?", "e.local_date <= ?"];
@@ -616,6 +629,16 @@ function buildRawSessionScope(
   if (effectiveFilters.projectId) {
     usageConditions.push("s.project_id = ?");
     parameters.push(effectiveFilters.projectId);
+  }
+  if (effectiveFilters.tagIds?.length) {
+    usageConditions.push(
+      `exists (
+        select 1 from project_tags tag_filter
+        where tag_filter.project_id = s.project_id
+          and tag_filter.tag_id in (${effectiveFilters.tagIds.map(() => "?").join(", ")})
+      )`,
+    );
+    parameters.push(...effectiveFilters.tagIds);
   }
   return { coverage, effectiveFilters, parameters, usageConditions };
 }
@@ -1218,6 +1241,14 @@ function usageWhere(filters: DashboardFilters) {
         and ${sessions.projectId} = ${filters.projectId}
     )`);
   }
+  if (filters.tagIds?.length) {
+    conditions.push(sql`exists (
+      select 1 from ${sessions}
+      join ${projectTags} on ${projectTags.projectId} = ${sessions.projectId}
+      where ${sessions.id} = ${usageEvents.sessionId}
+        and ${inArray(projectTags.tagId, filters.tagIds)}
+    )`);
+  }
   return and(...conditions);
 }
 
@@ -1232,6 +1263,13 @@ function dailyRollupWhere(filters: DashboardFilters) {
   if (filters.agentKind && filters.agentKind !== "all")
     conditions.push(eq(usageDailyRollups.agentKind, filters.agentKind));
   if (filters.projectId) conditions.push(eq(usageDailyRollups.projectId, filters.projectId));
+  if (filters.tagIds?.length) {
+    conditions.push(sql`exists (
+      select 1 from ${projectTags}
+      where ${projectTags.projectId} = ${usageDailyRollups.projectId}
+        and ${inArray(projectTags.tagId, filters.tagIds)}
+    )`);
+  }
   return and(...conditions);
 }
 
@@ -1246,6 +1284,13 @@ function hourlyRollupWhere(filters: DashboardFilters) {
   if (filters.agentKind && filters.agentKind !== "all")
     conditions.push(eq(usageHourlyRollups.agentKind, filters.agentKind));
   if (filters.projectId) conditions.push(eq(usageHourlyRollups.projectId, filters.projectId));
+  if (filters.tagIds?.length) {
+    conditions.push(sql`exists (
+      select 1 from ${projectTags}
+      where ${projectTags.projectId} = ${usageHourlyRollups.projectId}
+        and ${inArray(projectTags.tagId, filters.tagIds)}
+    )`);
+  }
   return and(...conditions);
 }
 
@@ -1264,6 +1309,13 @@ function membershipWhere(filters: DashboardFilters, bucketType: "day" | "hour") 
     conditions.push(eq(usageRollupSessionMemberships.agentKind, filters.agentKind));
   if (filters.projectId)
     conditions.push(eq(usageRollupSessionMemberships.projectId, filters.projectId));
+  if (filters.tagIds?.length) {
+    conditions.push(sql`exists (
+      select 1 from ${projectTags}
+      where ${projectTags.projectId} = ${usageRollupSessionMemberships.projectId}
+        and ${inArray(projectTags.tagId, filters.tagIds)}
+    )`);
+  }
   return and(...conditions);
 }
 

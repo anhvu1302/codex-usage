@@ -32,6 +32,7 @@ export function toDashboardQuery(filters: DashboardFilters): DashboardQuery {
   const models = filters.models?.length ? filters.models : filters.model ? [filters.model] : [];
   if (models.length > 0) query.models = models.join(",");
   if (filters.projectId) query.project = filters.projectId;
+  if (filters.tagIds?.length) query.tags = [...new Set(filters.tagIds)].join(",");
   if (filters.agentKind && filters.agentKind !== "all") query.agentKind = filters.agentKind;
   return query;
 }

@@ -1,9 +1,18 @@
-import type { TurnFilters, TurnQuery } from "@/shared/types";
+import type { TurnDiagnosticsQuery, TurnFilters, TurnQuery } from "@/shared/types";
 import { filtersFromSearch, updateFilterSearch } from "@/web/lib/product-api";
 import { apiClient, rpcJson, rpcOptions, toDashboardQuery } from "@/web/lib/rpc-client";
 
 export function fetchTurns(filters: TurnFilters, signal?: AbortSignal) {
   return rpcJson(apiClient.api.turns.$get({ query: turnQuery(filters) }, rpcOptions(signal)));
+}
+
+export function fetchTurnDiagnostics(filters: TurnFilters, signal?: AbortSignal) {
+  return rpcJson(
+    apiClient.api.turns.diagnostics.$get(
+      { query: turnDiagnosticsQuery(filters) },
+      rpcOptions(signal),
+    ),
+  );
 }
 
 export function fetchTurnDetail(turnKey: string, signal?: AbortSignal) {
@@ -86,6 +95,18 @@ function turnQuery(filters: TurnFilters): TurnQuery {
     ...(filters.query ? { q: filters.query } : {}),
     ...(filters.sessionId ? { session: filters.sessionId } : {}),
     sort: filters.sort ?? "lastActivity",
+    ...(filters.status ? { status: filters.status } : {}),
+  };
+}
+
+function turnDiagnosticsQuery(filters: TurnFilters): TurnDiagnosticsQuery {
+  return {
+    ...toDashboardQuery(filters),
+    ...(filters.agentId ? { agent: filters.agentId } : {}),
+    ...(filters.effort ? { effort: filters.effort } : {}),
+    ...(filters.pressure ? { pressure: filters.pressure } : {}),
+    ...(filters.query ? { q: filters.query } : {}),
+    ...(filters.sessionId ? { session: filters.sessionId } : {}),
     ...(filters.status ? { status: filters.status } : {}),
   };
 }

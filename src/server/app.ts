@@ -41,13 +41,30 @@ import {
   getProjectsPage,
   getProjectsSummary,
   getProjects,
+  projectExists,
   saveBudget,
   simulatePricing,
   updateAlert,
 } from "@/server/product-analytics";
 import { renameProject } from "@/server/projects";
+import { exportReport, previewReport, ReportRequestError } from "@/server/reports";
 import { currentLocalDate, dateDaysBefore, type RetentionService } from "@/server/retention";
-import { compareTurns, getTurnDetail, getTurns } from "@/server/turns";
+import {
+  createTag,
+  deleteTag,
+  getTags,
+  InvalidTagNameError,
+  renameTag,
+  replaceProjectTags,
+  TagNameConflictError,
+} from "@/server/tags";
+import {
+  compareTurns,
+  getTurnDetail,
+  getTurnDiagnostics,
+  getTurns,
+  TurnDiagnosticsLimitError,
+} from "@/server/turns";
 import type {
   ActivityFilters,
   ActivityKind,
@@ -58,15 +75,18 @@ import type {
   AgentPageQuery,
   AgentQuery,
   AgentFilters,
+  BudgetQuery,
   DashboardFilters,
   DashboardQuery,
   DailyMinuteReportQuery,
   PricingSimulationRequest,
   ProjectPageFilters,
   ProjectPageQuery,
+  ReportRequest,
   SessionFilters,
   SessionQuery,
   TurnComparisonQuery,
+  TurnDiagnosticsQuery,
   TurnFilters,
   TurnQuery,
   TurnStatus,
@@ -74,6 +94,7 @@ import type {
 } from "@/shared/types";
 
 const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const rateSchema = z.object({
   cachedInputRate: z.coerce.number().finite().nonnegative(),
   inputRate: z.coerce.number().finite().nonnegative(),
@@ -82,11 +103,19 @@ const rateSchema = z.object({
 const projectSchema = z.object({
   displayName: z.string().trim().min(1).max(80),
 });
+const budgetScopeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("global") }),
+  z.object({
+    kind: z.literal("project"),
+    projectId: z.string().trim().min(1).max(160),
+  }),
+]);
 const budgetSchema = z
   .object({
     enabled: z.boolean(),
     limitUsd: z.number().finite().nonnegative(),
     period: z.enum(["daily", "monthly"]),
+    scope: budgetScopeSchema.optional(),
     warningThresholds: z
       .array(z.number().finite().positive().max(1_000))
       .min(1)
@@ -97,6 +126,94 @@ const budgetSchema = z
     message: "limitUsd must be greater than 0 when budget is enabled",
     path: ["limitUsd"],
   });
+const tagSchema = z.object({ name: z.string().max(256) });
+const projectTagsSchema = z.object({
+  tagIds: z
+    .array(z.string().uuid())
+    .max(50)
+    .transform((values) => [...new Set(values)]),
+});
+const reportFilterFields = {
+  agentKind: z.enum(["all", "main", "subagent"]).optional(),
+  from: z.string().refine(isIsoDate, "from must be a valid ISO date"),
+  model: z.string().trim().min(1).max(160).optional(),
+  models: z.array(z.string().trim().min(1).max(160)).max(100).optional(),
+  projectId: z.string().trim().min(1).max(160).optional(),
+  tagIds: z.array(z.string().uuid()).max(50).optional(),
+  to: z.string().refine(isIsoDate, "to must be a valid ISO date"),
+};
+const reportDashboardFiltersSchema = z
+  .object(reportFilterFields)
+  .refine((value) => value.from <= value.to, {
+    message: "from must be before or equal to to",
+    path: ["from"],
+  });
+const reportAgentFiltersSchema = z
+  .object({
+    ...reportFilterFields,
+    depth: z.number().int().min(0).max(100).optional(),
+    role: z.string().trim().min(1).max(100).optional(),
+  })
+  .refine((value) => value.from <= value.to, {
+    message: "from must be before or equal to to",
+    path: ["from"],
+  });
+const reportSessionFiltersSchema = z
+  .object({
+    ...reportFilterFields,
+    hasSubagents: z.boolean().optional(),
+    query: z.string().trim().min(1).max(200).optional(),
+  })
+  .refine((value) => value.from <= value.to, {
+    message: "from must be before or equal to to",
+    path: ["from"],
+  });
+const reportTurnFiltersSchema = z
+  .object({
+    ...reportFilterFields,
+    agentId: z.string().trim().min(1).max(160).optional(),
+    effort: z.string().trim().min(1).max(100).optional(),
+    pressure: z.enum(["70", "70-84", "85", "85-94", "95", "95+", "below-70", "unknown"]).optional(),
+    query: z.string().trim().min(1).max(200).optional(),
+    sessionId: z.string().trim().min(1).max(160).optional(),
+    status: z.enum(["aborted", "completed", "unknown"]).optional(),
+  })
+  .refine((value) => value.from <= value.to, {
+    message: "from must be before or equal to to",
+    path: ["from"],
+  });
+const reportSharedFields = {
+  acknowledgeSensitive: z.array(z.string().trim().min(1).max(100)).max(30),
+  columns: z.array(z.string().trim().min(1).max(100)).max(100),
+  format: z.enum(["csv", "json"]),
+};
+const reportRequestSchema = z.discriminatedUnion("preset", [
+  z.object({
+    ...reportSharedFields,
+    filters: reportDashboardFiltersSchema,
+    preset: z.literal("cost-overview"),
+  }),
+  z.object({
+    ...reportSharedFields,
+    filters: reportDashboardFiltersSchema,
+    preset: z.literal("project-summary"),
+  }),
+  z.object({
+    ...reportSharedFields,
+    filters: reportAgentFiltersSchema,
+    preset: z.literal("agent-summary"),
+  }),
+  z.object({
+    ...reportSharedFields,
+    filters: reportSessionFiltersSchema,
+    preset: z.literal("session-summary"),
+  }),
+  z.object({
+    ...reportSharedFields,
+    filters: reportTurnFiltersSchema,
+    preset: z.literal("turn-summary"),
+  }),
+]);
 const pricingSchema = z
   .object({
     agentKind: z.enum(["all", "main", "subagent"]).optional(),
@@ -104,6 +221,11 @@ const pricingSchema = z
     model: z.string().trim().min(1).max(160).optional(),
     models: z.array(z.string().trim().min(1).max(160)).max(100).optional(),
     projectId: z.string().trim().min(1).max(160).optional(),
+    tagIds: z
+      .array(z.string().uuid())
+      .max(50)
+      .transform((values) => [...new Set(values)])
+      .optional(),
     rates: z
       .array(rateSchema.extend({ model: z.string().trim().min(1).max(160) }))
       .min(1)
@@ -429,6 +551,7 @@ function createAnalyticsRoutes({ database, events }: AppDependencies) {
 
 function createTurnRoutes({ database, importer }: AppDependencies) {
   const turnQuery = queryValidator<TurnQuery>()(parseTurnFilters);
+  const diagnosticsQuery = queryValidator<TurnDiagnosticsQuery>()(parseTurnDiagnosticFilters);
   const comparisonQuery = queryValidator<TurnComparisonQuery>()(parseTurnComparisonQuery);
   return new Hono()
     .get("/turns", turnQuery, (context) => {
@@ -436,6 +559,22 @@ function createTurnRoutes({ database, importer }: AppDependencies) {
       return context.json(
         getTurns(database, context.req.valid("query"), status.turnBackfill, status.isSyncing),
       );
+    })
+    .get("/turns/diagnostics", diagnosticsQuery, (context) => {
+      try {
+        return context.json(
+          getTurnDiagnostics(
+            database,
+            context.req.valid("query"),
+            importer.getStatus().turnBackfill,
+          ),
+        );
+      } catch (error) {
+        if (error instanceof TurnDiagnosticsLimitError) {
+          return context.json({ error: error.message }, 422);
+        }
+        throw error;
+      }
     })
     .get("/turns/compare", comparisonQuery, (context) =>
       context.json(compareTurns(database, context.req.valid("query").ids)),
@@ -450,17 +589,107 @@ function createTurnRoutes({ database, importer }: AppDependencies) {
     });
 }
 
-function createProductRoutes({ alerts, database, events }: AppDependencies) {
+function createProductRoutes({ alerts, database, events, importer }: AppDependencies) {
   const budgetBody = jsonValidator(budgetSchema);
+  const budgetQuery = queryValidator<BudgetQuery>()(parseBudgetQuery);
   const alertBody = jsonValidator(alertActionSchema);
   const pricingBody = jsonValidator(pricingSchema);
+  const projectTagsBody = jsonValidator(projectTagsSchema);
+  const reportBody = jsonValidator(reportRequestSchema);
+  const tagBody = jsonValidator(tagSchema);
   return new Hono()
-    .get("/budgets", (context) => context.json({ budgets: getBudgets(database) }))
+    .get("/budgets", budgetQuery, (context) => {
+      const projectId = context.req.valid("query").project;
+      if (projectId && !projectExists(database, projectId)) {
+        return context.json({ error: "Project not found" }, 404);
+      }
+      return context.json({ budgets: getBudgets(database, projectId) });
+    })
     .put("/budgets", budgetBody, (context) => {
       const budget = saveBudget(database, context.req.valid("json"));
+      if (!budget) return context.json({ error: "Project not found" }, 404);
       alerts.invalidate("budget");
       events.publish("budget");
       return context.json({ budget });
+    })
+    .get("/tags", (context) => context.json(getTags(database)))
+    .post("/tags", tagBody, (context) => {
+      try {
+        const tag = createTag(database, context.req.valid("json").name);
+        events.publish("project");
+        return context.json({ tag }, 201);
+      } catch (error) {
+        if (error instanceof InvalidTagNameError) {
+          return context.json({ error: error.message }, 400);
+        }
+        if (error instanceof TagNameConflictError) {
+          return context.json({ error: error.message }, 409);
+        }
+        throw error;
+      }
+    })
+    .put("/tags/:id", tagBody, (context) => {
+      try {
+        const tag = renameTag(database, context.req.param("id"), context.req.valid("json").name);
+        if (!tag) return context.json({ error: "Tag not found" }, 404);
+        events.publish("project");
+        return context.json({ tag });
+      } catch (error) {
+        if (error instanceof InvalidTagNameError) {
+          return context.json({ error: error.message }, 400);
+        }
+        if (error instanceof TagNameConflictError) {
+          return context.json({ error: error.message }, 409);
+        }
+        throw error;
+      }
+    })
+    .delete("/tags/:id", (context) => {
+      const deleted = deleteTag(database, context.req.param("id"));
+      if (!deleted) return context.json({ error: "Tag not found" }, 404);
+      events.publish("project");
+      return context.json({ deleted: true as const });
+    })
+    .put("/projects/:id/tags", projectTagsBody, (context) => {
+      const result = replaceProjectTags(
+        database,
+        context.req.param("id"),
+        context.req.valid("json").tagIds,
+      );
+      if (result.status === "project-not-found") {
+        return context.json({ error: "Project not found" }, 404);
+      }
+      if (result.status === "tag-not-found") {
+        return context.json({ error: "Tag not found" }, 404);
+      }
+      events.publish("project");
+      return context.json({ tags: result.tags });
+    })
+    .post("/reports/preview", reportBody, (context) => {
+      try {
+        const request = normalizeReportRequest(context.req.valid("json"));
+        return context.json(previewReport(database, request, importer.getStatus().turnBackfill));
+      } catch (error) {
+        if (error instanceof ReportRequestError) {
+          return context.json({ error: error.message }, error.status);
+        }
+        throw error;
+      }
+    })
+    .post("/reports/export", reportBody, (context) => {
+      try {
+        const request = normalizeReportRequest(context.req.valid("json"));
+        const report = exportReport(database, request, importer.getStatus().turnBackfill);
+        return context.newResponse(report.body, 200, {
+          "Content-Disposition": `attachment; filename="${report.filename}"`,
+          "Content-Type": report.contentType,
+        });
+      } catch (error) {
+        if (error instanceof ReportRequestError) {
+          return context.json({ error: error.message }, error.status);
+        }
+        throw error;
+      }
     })
     .get("/alerts", (context) => context.json(alerts.getFeed()))
     .delete("/alerts", (context) => {
@@ -488,6 +717,7 @@ function createProductRoutes({ alerts, database, events }: AppDependencies) {
       if (payload.model) request.model = payload.model;
       if (payload.models) request.models = payload.models;
       if (payload.projectId) request.projectId = payload.projectId;
+      if (payload.tagIds) request.tagIds = payload.tagIds;
       return context.json(simulatePricing(database, request));
     });
 }
@@ -548,6 +778,14 @@ function jsonValidator<Schema extends z.ZodType<object>>(
     context.req.addValidatedData("json", parsed.data);
     return next();
   };
+}
+
+function parseBudgetQuery(query: BudgetQuery): ParseResult<BudgetQuery> {
+  const project = query.project?.trim();
+  if (project && project.length > 160) {
+    return { error: "project must be at most 160 characters", success: false };
+  }
+  return { data: project ? { project } : {}, success: true };
 }
 
 function privacySafeScanEvent(status: ImportStatus): AppScanEvent {
@@ -748,11 +986,23 @@ function parseFilters(
   if (projectId && projectId.length > 160) {
     return { error: "project must be at most 160 characters", success: false };
   }
+  const tagIds = [
+    ...new Set(
+      (query["tags"] ?? "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  ];
+  if (tagIds.length > 50 || tagIds.some((value) => !uuidPattern.test(value))) {
+    return { error: "tags must contain at most 50 UUIDs", success: false };
+  }
   const data: DashboardFilters = { from, to };
   if (agentKind) data.agentKind = agentKind as NonNullable<DashboardFilters["agentKind"]>;
   if (model) data.model = model;
   if (models.length > 0) data.models = [...new Set(models)];
   if (projectId) data.projectId = projectId;
+  if (tagIds.length > 0) data.tagIds = tagIds;
   return { data, success: true };
 }
 
@@ -868,6 +1118,90 @@ function parseTurnFilters(
   if (sessionId) data.sessionId = sessionId;
   if (agentId) data.agentId = agentId;
   return { data, success: true };
+}
+
+function parseTurnDiagnosticFilters(
+  query: Record<string, string | undefined>,
+): { data: TurnFilters; success: true } | { error: string; success: false } {
+  if (
+    query["order"] !== undefined ||
+    query["page"] !== undefined ||
+    query["pageSize"] !== undefined ||
+    query["sort"] !== undefined
+  ) {
+    return { error: "turn diagnostics does not accept pagination or sort", success: false };
+  }
+  const parsed = parseTurnFilters(query);
+  if (!parsed.success) return parsed;
+  const data = { ...parsed.data };
+  delete data.order;
+  delete data.page;
+  delete data.pageSize;
+  delete data.sort;
+  return { data, success: true };
+}
+
+type ValidatedReportRequest = z.output<typeof reportRequestSchema>;
+
+function normalizeReportRequest(value: ValidatedReportRequest): ReportRequest {
+  const shared = {
+    acknowledgeSensitive: value.acknowledgeSensitive,
+    format: value.format,
+  };
+  switch (value.preset) {
+    case "agent-summary": {
+      const filters: AgentFilters = normalizeReportDashboardFilters(value.filters);
+      if (value.filters.depth !== undefined) filters.depth = value.filters.depth;
+      if (value.filters.role !== undefined) filters.role = value.filters.role;
+      return { ...shared, columns: value.columns, filters, preset: value.preset };
+    }
+    case "cost-overview":
+      return {
+        ...shared,
+        columns: value.columns,
+        filters: normalizeReportDashboardFilters(value.filters),
+        preset: value.preset,
+      };
+    case "project-summary":
+      return {
+        ...shared,
+        columns: value.columns,
+        filters: normalizeReportDashboardFilters(value.filters),
+        preset: value.preset,
+      };
+    case "session-summary": {
+      const filters: Omit<SessionFilters, "order" | "page" | "pageSize" | "sort"> =
+        normalizeReportDashboardFilters(value.filters);
+      if (value.filters.hasSubagents !== undefined) {
+        filters.hasSubagents = value.filters.hasSubagents;
+      }
+      if (value.filters.query !== undefined) filters.query = value.filters.query;
+      return { ...shared, columns: value.columns, filters, preset: value.preset };
+    }
+    case "turn-summary": {
+      const filters: Omit<TurnFilters, "order" | "page" | "pageSize" | "sort"> =
+        normalizeReportDashboardFilters(value.filters);
+      if (value.filters.agentId !== undefined) filters.agentId = value.filters.agentId;
+      if (value.filters.effort !== undefined) filters.effort = value.filters.effort;
+      if (value.filters.pressure !== undefined) filters.pressure = value.filters.pressure;
+      if (value.filters.query !== undefined) filters.query = value.filters.query;
+      if (value.filters.sessionId !== undefined) filters.sessionId = value.filters.sessionId;
+      if (value.filters.status !== undefined) filters.status = value.filters.status;
+      return { ...shared, columns: value.columns, filters, preset: value.preset };
+    }
+  }
+}
+
+function normalizeReportDashboardFilters(
+  value: z.output<typeof reportDashboardFiltersSchema>,
+): DashboardFilters {
+  const filters: DashboardFilters = { from: value.from, to: value.to };
+  if (value.agentKind !== undefined) filters.agentKind = value.agentKind;
+  if (value.model !== undefined) filters.model = value.model;
+  if (value.models !== undefined) filters.models = value.models;
+  if (value.projectId !== undefined) filters.projectId = value.projectId;
+  if (value.tagIds !== undefined) filters.tagIds = value.tagIds;
+  return filters;
 }
 
 function positiveInteger(value: string): number | null {

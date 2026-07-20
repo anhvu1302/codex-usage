@@ -32,6 +32,7 @@ import { Link, useSearchParams } from "react-router";
 
 import { DataHealthCenter } from "@/web/components/data-health-center";
 import { DateRangePicker } from "@/web/components/date-range-picker";
+import { TagFilter } from "@/web/components/tag-filter";
 import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
 import {
@@ -165,8 +166,9 @@ export function ActivityPage() {
   const projectFilters = useMemo<DashboardFilters>(() => {
     const next: DashboardFilters = { from: filters.from, to: filters.to };
     if (filters.agentKind) next.agentKind = filters.agentKind;
+    if (filters.tagIds) next.tagIds = filters.tagIds;
     return next;
-  }, [filters.agentKind, filters.from, filters.to]);
+  }, [filters.agentKind, filters.from, filters.tagIds, filters.to]);
   const projects = useQuery({
     queryKey: ["projects", "options", projectFilters],
     queryFn: ({ signal }) => fetchProjectOptions(projectFilters, signal),
@@ -446,6 +448,15 @@ function ActivityFilterBar({
         </div>
 
         <div className="flex flex-wrap gap-2">
+          <TagFilter
+            tagIds={filters.tagIds}
+            onChange={(tagIds) => {
+              const next = withoutActivityFilter(filters, "tagIds");
+              if (tagIds.length > 0) next.tagIds = tagIds;
+              onChange(next);
+            }}
+          />
+
           <Select
             value={filters.projectId ?? "all"}
             onValueChange={(value) => {
@@ -1354,7 +1365,7 @@ function kindOption(kind: ActivityKind) {
 
 function withoutActivityFilter(
   filters: ActivityFilters,
-  key: "agentKind" | "kinds" | "projectId" | "sessionId",
+  key: "agentKind" | "kinds" | "projectId" | "sessionId" | "tagIds",
 ): ActivityFilters {
   const next = { ...filters };
   switch (key) {
@@ -1370,6 +1381,9 @@ function withoutActivityFilter(
     case "sessionId":
       delete next.sessionId;
       break;
+    case "tagIds":
+      delete next.tagIds;
+      break;
   }
   return next;
 }
@@ -1381,6 +1395,7 @@ function activityFilterKey(filters: ActivityFilters): string {
     filters.projectId ?? "all-projects",
     filters.agentKind ?? "all-agents",
     filters.sessionId ?? "all-sessions",
+    filters.tagIds?.join(",") ?? "all-tags",
     filters.kinds?.join(",") ?? "all-events",
   ].join("|");
 }

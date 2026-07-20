@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowRight, FolderKanban, Pencil } from "lucide-react";
+import { ArrowRight, FolderKanban, LoaderCircle, Pencil, Tags as TagsIcon } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { toast } from "sonner";
@@ -37,6 +37,7 @@ import { fetchModels } from "@/web/lib/api";
 import {
   compactTokens,
   fetchProjectAnalytics,
+  fetchTags,
   fetchProjectsPage,
   fetchProjectsSummary,
   filtersFromSearch,
@@ -44,6 +45,7 @@ import {
   formatTokens,
   formatUsd,
   renameProject,
+  replaceProjectTags,
   updateFilterSearch,
 } from "@/web/lib/product-api";
 import { useMediaQuery } from "@/web/lib/use-media-query";
@@ -54,6 +56,7 @@ import type {
   ProjectAnalyticsResponse,
   ProjectListItem,
   ProjectOptionsResponse,
+  TagSummary,
   ProjectsPageResponse,
 } from "@/shared/types";
 
@@ -69,10 +72,16 @@ export function ProjectsPage() {
   const page = positiveInteger(search.get("projectPage")) ?? 1;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<ProjectListItem | null>(null);
+  const [assigningTags, setAssigningTags] = useState<ProjectListItem | null>(null);
   const queryClient = useQueryClient();
   const models = useQuery({
     queryKey: ["models"],
     queryFn: ({ signal }) => fetchModels(signal),
+    staleTime: 5 * 60_000,
+  });
+  const tagCatalog = useQuery({
+    queryKey: ["tags"],
+    queryFn: ({ signal }) => fetchTags(signal),
     staleTime: 5 * 60_000,
   });
   const projectSummary = useQuery({
@@ -141,6 +150,45 @@ export function ProjectsPage() {
             : current,
       );
       queueLiveMutationScopes(queryClient, ["catalog", "projects"]);
+    },
+  });
+  const assignTags = useMutation({
+    mutationFn: ({ id, tagIds }: { id: string; tagIds: string[] }) =>
+      replaceProjectTags(id, tagIds),
+    onError: (error) => toast.error(error.message),
+    onSuccess: ({ tags }) => {
+      const projectId = assigningTags?.id;
+      setAssigningTags(null);
+      if (projectId) {
+        queryClient.setQueriesData<ProjectsPageResponse>(
+          { queryKey: ["projects", "page"] },
+          (current) =>
+            current
+              ? {
+                  ...current,
+                  projects: current.projects.map((project) =>
+                    project.id === projectId ? { ...project, tags } : project,
+                  ),
+                }
+              : current,
+        );
+        queryClient.setQueriesData<ProjectAnalyticsResponse>(
+          { queryKey: ["projects", "detail"] },
+          (current) =>
+            current?.project.id === projectId ? { project: { ...current.project, tags } } : current,
+        );
+      }
+      void queryClient.invalidateQueries({ queryKey: ["tags"] });
+      queueLiveMutationScopes(queryClient, [
+        "activity",
+        "agents",
+        "catalog",
+        "dashboard",
+        "projects",
+        "sessions",
+        "turns",
+      ]);
+      toast.success("Đã cập nhật tag cho project.");
     },
   });
 
@@ -228,6 +276,7 @@ export function ProjectsPage() {
                     <TableHead>Yêu cầu</TableHead>
                     <TableHead>Phiên</TableHead>
                     <TableHead>Subagent share</TableHead>
+                    <TableHead>Tags</TableHead>
                     <TableHead>Model mix</TableHead>
                     <TableHead className="text-right">Thao tác</TableHead>
                   </TableRow>
@@ -269,23 +318,36 @@ export function ProjectsPage() {
                         <ShareBar value={safeRatio(project.subagentTokens, project.totalTokens)} />
                       </TableCell>
                       <TableCell>
+                        <ProjectTagBadges tags={project.tags} />
+                      </TableCell>
+                      <TableCell>
                         <ModelMix count={project.modelCount} values={project.topModels} />
                       </TableCell>
                       <TableCell className="text-right">
-                        <Button
-                          aria-label={`Đổi alias ${project.displayName}`}
-                          size="icon"
-                          variant="ghost"
-                          onClick={() => setRenaming(project)}
-                        >
-                          <Pencil className="size-4" />
-                        </Button>
+                        <div className="flex justify-end gap-1">
+                          <Button
+                            aria-label={`Gán tag ${project.displayName}`}
+                            size="icon"
+                            variant="ghost"
+                            onClick={() => setAssigningTags(project)}
+                          >
+                            <TagsIcon className="size-4" />
+                          </Button>
+                          <Button
+                            aria-label={`Đổi alias ${project.displayName}`}
+                            size="icon"
+                            variant="ghost"
+                            onClick={() => setRenaming(project)}
+                          >
+                            <Pencil className="size-4" />
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))}
                   {!projects.isLoading && projects.data?.projects.length === 0 ? (
                     <TableRow>
-                      <TableCell className="text-muted-foreground h-28 text-center" colSpan={8}>
+                      <TableCell className="text-muted-foreground h-28 text-center" colSpan={9}>
                         Chưa có project trong khoảng đã chọn.
                       </TableCell>
                     </TableRow>
@@ -302,6 +364,7 @@ export function ProjectsPage() {
                   project={project}
                   onRename={() => setRenaming(project)}
                   onSelect={() => setSelectedId(project.id)}
+                  onTags={() => setAssigningTags(project)}
                 />
               ))}
             </div>
@@ -404,6 +467,19 @@ export function ProjectsPage() {
           onSave={(displayName) => rename.mutate({ displayName, id: renaming.id })}
         />
       ) : null}
+      {assigningTags ? (
+        <ProjectTagsDialog
+          key={assigningTags.id}
+          loading={assignTags.isPending}
+          project={assigningTags}
+          tags={tagCatalog.data?.tags ?? []}
+          tagsError={tagCatalog.isError ? tagCatalog.error.message : null}
+          tagsLoading={tagCatalog.isLoading}
+          onClose={() => setAssigningTags(null)}
+          onRetry={() => void tagCatalog.refetch()}
+          onSave={(tagIds) => assignTags.mutate({ id: assigningTags.id, tagIds })}
+        />
+      ) : null}
     </div>
   );
 }
@@ -412,11 +488,13 @@ function ProjectCard({
   active,
   onRename,
   onSelect,
+  onTags,
   project,
 }: {
   active: boolean;
   onRename: () => void;
   onSelect: () => void;
+  onTags: () => void;
   project: ProjectListItem;
 }) {
   return (
@@ -439,6 +517,7 @@ function ProjectCard({
           <Pencil className="size-4" />
         </Button>
       </div>
+      <ProjectTagBadges className="mt-3" tags={project.tags} />
       <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
         <Stat label="Token" value={compactTokens(project.totalTokens)} />
         <Stat label="Cost" value={formatUsd(project.estimatedCostUsd)} />
@@ -456,7 +535,110 @@ function ProjectCard({
       >
         Xem chi tiết <ArrowRight className="size-4" />
       </Button>
+      <Button className="mt-2 w-full" size="sm" variant="ghost" onClick={onTags}>
+        <TagsIcon className="size-4" /> Gán tag
+      </Button>
     </article>
+  );
+}
+
+function ProjectTagBadges({
+  className,
+  tags,
+}: {
+  className?: string;
+  tags: ProjectListItem["tags"];
+}) {
+  return (
+    <div className={`flex max-w-64 flex-wrap gap-1 ${className ?? ""}`}>
+      {tags.slice(0, 3).map((tag) => (
+        <Badge key={tag.id} variant="secondary">
+          {tag.name}
+        </Badge>
+      ))}
+      {tags.length > 3 ? <Badge variant="outline">+{tags.length - 3}</Badge> : null}
+      {tags.length === 0 ? <span className="text-muted-foreground text-xs">Chưa gán</span> : null}
+    </div>
+  );
+}
+
+function ProjectTagsDialog({
+  loading,
+  onClose,
+  onRetry,
+  onSave,
+  project,
+  tags,
+  tagsError,
+  tagsLoading,
+}: {
+  loading: boolean;
+  onClose: () => void;
+  onRetry: () => void;
+  onSave: (tagIds: string[]) => void;
+  project: ProjectListItem;
+  tags: TagSummary[];
+  tagsError: string | null;
+  tagsLoading: boolean;
+}) {
+  const [selected, setSelected] = useState(() => new Set(project.tags.map((tag) => tag.id)));
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Gán tag · {project.displayName}</DialogTitle>
+          <DialogDescription>
+            Chọn tối đa 50 tag. Project khớp khi có bất kỳ tag đã lọc.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="max-h-72 space-y-1 overflow-y-auto rounded-lg border p-2">
+          {tagsLoading ? <Skeleton className="h-24" /> : null}
+          {tagsError ? (
+            <div className="space-y-2 p-2 text-sm" role="alert">
+              <p>Không tải được tag: {tagsError}</p>
+              <Button size="sm" variant="outline" onClick={onRetry}>
+                Thử lại
+              </Button>
+            </div>
+          ) : null}
+          {tags.map((tag) => (
+            <label key={tag.id} className="hover:bg-accent flex items-center gap-3 rounded-md p-2">
+              <input
+                className="accent-primary size-4"
+                type="checkbox"
+                checked={selected.has(tag.id)}
+                onChange={(event) => {
+                  setSelected((current) => {
+                    const next = new Set(current);
+                    if (event.target.checked) next.add(tag.id);
+                    else next.delete(tag.id);
+                    return next;
+                  });
+                }}
+              />
+              <span className="min-w-0 flex-1 truncate">{tag.name}</span>
+            </label>
+          ))}
+          {!tagsLoading && !tagsError && tags.length === 0 ? (
+            <p className="text-muted-foreground p-5 text-center text-sm">
+              Chưa có tag. Tạo tag trong Cài đặt trước.
+            </p>
+          ) : null}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Huỷ
+          </Button>
+          <Button
+            disabled={loading || selected.size > 50 || Boolean(tagsError)}
+            onClick={() => onSave([...selected])}
+          >
+            {loading ? <LoaderCircle className="size-4 animate-spin" /> : null}
+            Lưu tag
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

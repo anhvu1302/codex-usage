@@ -25,6 +25,7 @@ import {
 import { NavLink, Outlet, useLocation } from "react-router";
 
 import { NotificationCenter } from "@/web/components/alerts";
+import { SavedViewsControls } from "@/web/components/saved-views";
 import { Button } from "@/web/components/ui/button";
 import {
   usePreferences,
@@ -68,7 +69,10 @@ export function AppShell() {
       <aside className="bg-card/88 fixed inset-y-0 left-0 z-40 hidden w-64 border-r backdrop-blur-xl lg:flex lg:flex-col">
         <div className="flex items-center justify-between px-5 py-6">
           <Brand />
-          {desktop ? <NotificationCenter /> : null}
+          <div className="flex items-center gap-1">
+            {desktop ? <SavedViewsControls /> : null}
+            {desktop ? <NotificationCenter /> : null}
+          </div>
         </div>
         <Navigation className="flex-1 overflow-y-auto px-3" />
         <Preferences className="border-t p-4" />
@@ -77,6 +81,7 @@ export function AppShell() {
       <header className="bg-background/88 fixed inset-x-0 top-0 z-40 flex h-16 items-center justify-between border-b px-4 backdrop-blur-xl lg:hidden">
         <Brand />
         <div className="flex items-center gap-1">
+          {!desktop ? <SavedViewsControls /> : null}
           {!desktop ? <NotificationCenter /> : null}
           <Button
             aria-label="Mở menu điều hướng"

@@ -20,6 +20,7 @@ export function fetchDailyMinuteReport(filters: DashboardFilters, signal?: Abort
     ...(dashboardQuery.model ? { model: dashboardQuery.model } : {}),
     ...(dashboardQuery.models ? { models: dashboardQuery.models } : {}),
     ...(dashboardQuery.project ? { project: dashboardQuery.project } : {}),
+    ...(dashboardQuery.tags ? { tags: dashboardQuery.tags } : {}),
   };
   return rpcJson(apiClient.api.dashboard.minutes.$get({ query }, rpcOptions(signal)));
 }

@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import type {
   BudgetPeriod,
+  BudgetScope,
   BudgetSetting,
   DashboardFilters,
   ModelRate,
@@ -21,10 +22,18 @@ import {
 } from "@/web/components/ui/card";
 import { Input } from "@/web/components/ui/input";
 import { Label } from "@/web/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/web/components/ui/select";
 import { Skeleton } from "@/web/components/ui/skeleton";
 import { queueLiveMutationScopes } from "@/web/lib/live-events";
 import {
   fetchBudgets,
+  fetchProjectOptions,
   fetchPricingModels,
   runPricingSimulation,
   saveBudget,
@@ -44,10 +53,22 @@ const USD_FORMATTER = new Intl.NumberFormat("en-US", {
   style: "currency",
 });
 
-export function BudgetSettings() {
+export function BudgetSettings({ filters }: { filters: DashboardFilters }) {
+  const [projectId, setProjectId] = useState("");
   const budgets = useQuery({
-    queryKey: ["budgets"],
-    queryFn: ({ signal }) => fetchBudgets(signal),
+    queryKey: ["budgets", "global"],
+    queryFn: ({ signal }) => fetchBudgets(undefined, signal),
+    staleTime: 5 * 60_000,
+  });
+  const projects = useQuery({
+    queryKey: ["projects", "options", "budget", filters],
+    queryFn: ({ signal }) => fetchProjectOptions(filters, signal),
+    staleTime: 5 * 60_000,
+  });
+  const scopedBudgets = useQuery({
+    enabled: Boolean(projectId),
+    queryKey: ["budgets", "project", projectId],
+    queryFn: ({ signal }) => fetchBudgets(projectId, signal),
     staleTime: 5 * 60_000,
   });
 
@@ -62,7 +83,7 @@ export function BudgetSettings() {
           Budget mặc định tắt. Khi bật, app chỉ cảnh báo nội bộ và không tự giới hạn usage.
         </CardDescription>
       </CardHeader>
-      <CardContent aria-live="polite" aria-busy={budgets.isLoading}>
+      <CardContent className="space-y-6" aria-live="polite" aria-busy={budgets.isLoading}>
         {budgets.isLoading ? (
           <div className="grid gap-4 lg:grid-cols-2">
             <Skeleton className="h-56 rounded-xl" />
@@ -73,12 +94,81 @@ export function BudgetSettings() {
           <InlineError message={budgets.error.message} onRetry={() => void budgets.refetch()} />
         ) : null}
         {budgets.data ? (
-          <div className="grid gap-4 lg:grid-cols-2">
-            {budgets.data.budgets.map((budget) => (
-              <BudgetEditor key={budget.period} budget={budget} />
-            ))}
-          </div>
+          <section className="space-y-3" aria-labelledby="global-budget-title">
+            <div>
+              <h3 id="global-budget-title" className="font-semibold">
+                Budget toàn bộ usage
+              </h3>
+              <p className="text-muted-foreground mt-1 text-xs">
+                Áp dụng cho tổng usage của mọi project.
+              </p>
+            </div>
+            <div className="grid gap-4 lg:grid-cols-2">
+              {budgets.data.budgets.map((budget) => (
+                <BudgetEditor key={budget.period} budget={budget} />
+              ))}
+            </div>
+          </section>
         ) : null}
+
+        <section className="space-y-4 border-t pt-6" aria-labelledby="project-budget-title">
+          <div>
+            <h3 id="project-budget-title" className="font-semibold">
+              Budget theo project
+            </h3>
+            <p className="text-muted-foreground mt-1 text-xs">
+              Chọn project để cấu hình ngưỡng riêng; cảnh báo chỉ hiển thị alias project.
+            </p>
+          </div>
+          {projects.isLoading ? <Skeleton className="h-9 w-full max-w-sm rounded-md" /> : null}
+          {projects.isError ? (
+            <InlineError message={projects.error.message} onRetry={() => void projects.refetch()} />
+          ) : null}
+          {projects.data?.projects.length === 0 ? (
+            <p className="text-muted-foreground text-sm">Chưa có project trong khoảng ngày này.</p>
+          ) : null}
+          {projects.data?.projects.length ? (
+            <div className="max-w-sm space-y-2">
+              <Label htmlFor="budget-project">Project</Label>
+              <Select value={projectId} onValueChange={setProjectId}>
+                <SelectTrigger id="budget-project" aria-label="Chọn project budget">
+                  <SelectValue placeholder="Chọn project" />
+                </SelectTrigger>
+                <SelectContent>
+                  {projects.data.projects.map((project) => (
+                    <SelectItem key={project.id} value={project.id}>
+                      {project.displayName}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ) : null}
+          {projectId && scopedBudgets.isLoading ? (
+            <div className="grid gap-4 lg:grid-cols-2">
+              <Skeleton className="h-56 rounded-xl" />
+              <Skeleton className="h-56 rounded-xl" />
+            </div>
+          ) : null}
+          {projectId && scopedBudgets.isError ? (
+            <InlineError
+              message={scopedBudgets.error.message}
+              onRetry={() => void scopedBudgets.refetch()}
+            />
+          ) : null}
+          {projectId && scopedBudgets.data ? (
+            <div className="grid gap-4 lg:grid-cols-2">
+              {scopedBudgets.data.budgets
+                .filter((budget) => budget.scope.kind === "project")
+                .map((budget) => (
+                  <BudgetEditor
+                    key={`${budget.scope.kind}:${budget.scope.kind === "project" ? budget.scope.projectId : "global"}:${budget.period}`}
+                    budget={budget}
+                  />
+                ))}
+            </div>
+          ) : null}
+        </section>
       </CardContent>
     </Card>
   );
@@ -101,12 +191,20 @@ function BudgetEditor({ budget }: { budget: BudgetSetting }) {
       toast.success(
         `Đã lưu budget ${periodLabel(payload.budget.period).toLocaleLowerCase("vi-VN")}.`,
       );
-      queryClient.setQueryData<{ budgets: BudgetSetting[] }>(["budgets"], (current) => ({
-        budgets: [
-          ...(current?.budgets.filter((item) => item.period !== payload.budget.period) ?? []),
-          payload.budget,
-        ],
-      }));
+      queryClient.setQueriesData<{ budgets: BudgetSetting[] }>(
+        { queryKey: ["budgets"] },
+        (current) =>
+          current
+            ? {
+                budgets: current.budgets.map((item) =>
+                  item.period === payload.budget.period &&
+                  sameBudgetScope(item.scope, payload.budget.scope)
+                    ? payload.budget
+                    : item,
+                ),
+              }
+            : undefined,
+      );
       queueLiveMutationScopes(queryClient, ["alerts", "budgets"]);
     },
   });
@@ -130,6 +228,7 @@ function BudgetEditor({ budget }: { budget: BudgetSetting }) {
       enabled,
       limitUsd: parsedLimit,
       period: budget.period,
+      scope: budget.scope,
       warningThresholds: parsedThresholds,
     });
   }
@@ -196,6 +295,11 @@ function BudgetEditor({ budget }: { budget: BudgetSetting }) {
       </Button>
     </section>
   );
+}
+
+function sameBudgetScope(left: BudgetScope, right: BudgetScope): boolean {
+  if (left.kind !== right.kind) return false;
+  return left.kind === "global" || (right.kind === "project" && left.projectId === right.projectId);
 }
 
 export function PricingSimulator({ filters }: { filters: DashboardFilters }) {

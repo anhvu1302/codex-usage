@@ -10,7 +10,13 @@ import {
   type SessionAnomalyRow,
 } from "@/server/analytics";
 import type { AppDatabase } from "@/server/db/client";
-import { alertEvents, budgetSettings, projects, sessionAgents } from "@/server/db/schema";
+import {
+  alertEvents,
+  budgetSettings,
+  projectBudgetSettings,
+  projects,
+  sessionAgents,
+} from "@/server/db/schema";
 import {
   calculateEfficiencyMetrics,
   createUsageAnomalyDetector,
@@ -21,6 +27,7 @@ import {
 } from "@/server/insights";
 import { currentLocalDate, dateDaysBefore, getSessionCoverage } from "@/server/retention";
 import { getTurnPage } from "@/server/turns";
+import { getProjectTagMap } from "@/server/tags";
 import type {
   AgentFilters,
   AgentLeaderboardItem,
@@ -224,6 +231,7 @@ export function getProjects(
       .map((project) => [project.id, project]),
   );
   const rowsByProject = new Map<string, AgentUsageRow[]>();
+  const tagsByProject = getProjectTagMap(database, [...projectRows.keys()]);
   for (const row of readAgentUsageRows(database, filters)) {
     if (!projectRows.has(row.projectId)) continue;
     const rows = rowsByProject.get(row.projectId) ?? [];
@@ -256,6 +264,7 @@ export function getProjects(
       subagentCostUsd: subagent.estimatedCostUsd,
       subagentShare: kpis.totalTokens === 0 ? 0 : subagent.totalTokens / kpis.totalTokens,
       subagentTokens: subagent.totalTokens,
+      tags: tagsByProject.get(project.id) ?? [],
       topSessions: topSessions.get(project.id) ?? [],
     });
   }
@@ -359,6 +368,7 @@ export function getProjectsPage(
     total = toNumber(totalRow?.count);
   }
   const projectsById = new Map<string, ProjectListItem>();
+  const tagsByProject = getProjectTagMap(database, [...new Set(rows.map((row) => row.id))]);
   for (const row of rows) {
     const project = projectsById.get(row.id) ?? {
       ...toDashboardKpis(row),
@@ -369,6 +379,7 @@ export function getProjectsPage(
       subagentCostUsd: toNumber(row.subagentCostUsd),
       subagentShare: safeRatio(toNumber(row.subagentTokens), toNumber(row.totalTokens)),
       subagentTokens: toNumber(row.subagentTokens),
+      tags: tagsByProject.get(row.id) ?? [],
       topModels: [],
     };
     if (row.model) {
@@ -425,6 +436,25 @@ export function getProjectOptions(
     archivedConditions.push("d.project_id = ?");
     rawParameters.push(filters.projectId);
     archivedParameters.push(filters.projectId);
+  }
+  if (filters.tagIds?.length) {
+    const placeholders = filters.tagIds.map(() => "?").join(", ");
+    rawConditions.push(
+      `exists (
+        select 1 from project_tags tag_filter
+        where tag_filter.project_id = s.project_id
+          and tag_filter.tag_id in (${placeholders})
+      )`,
+    );
+    archivedConditions.push(
+      `exists (
+        select 1 from project_tags tag_filter
+        where tag_filter.project_id = d.project_id
+          and tag_filter.tag_id in (${placeholders})
+      )`,
+    );
+    rawParameters.push(...filters.tagIds);
+    archivedParameters.push(...filters.tagIds);
   }
 
   const rows = database.$client
@@ -754,7 +784,7 @@ export function getAgentsPage(
   return { agents: [...agentsById.values()], order, page, pageSize, sort, total };
 }
 
-export function getBudgets(database: AppDatabase): BudgetSetting[] {
+export function getBudgets(database: AppDatabase, projectId?: string): BudgetSetting[] {
   const stored = new Map(
     database
       .select()
@@ -762,23 +792,75 @@ export function getBudgets(database: AppDatabase): BudgetSetting[] {
       .all()
       .map((budget) => [budget.period, budget]),
   );
-  return (["daily", "monthly"] as const).map((period) => {
+  const globalBudgets = (["daily", "monthly"] as const).map((period) => {
     const budget = stored.get(period);
     return {
       enabled: budget?.enabled ?? false,
       limitUsd: budget?.limitUsd ?? 0,
       period,
+      scope: { kind: "global" } as const,
       updatedAt: new Date(budget?.updatedAt ?? 0).toISOString(),
       warningThresholds: parseThresholds(budget?.warningThresholds),
     };
   });
+
+  if (!projectId) return globalBudgets;
+  const projectStored = new Map(
+    database
+      .select()
+      .from(projectBudgetSettings)
+      .where(eq(projectBudgetSettings.projectId, projectId))
+      .all()
+      .map((budget) => [budget.period, budget]),
+  );
+  return [
+    ...globalBudgets,
+    ...(["daily", "monthly"] as const).map((period) => {
+      const budget = projectStored.get(period);
+      return {
+        enabled: budget?.enabled ?? false,
+        limitUsd: budget?.limitUsd ?? 0,
+        period,
+        scope: { kind: "project", projectId } as const,
+        updatedAt: new Date(budget?.updatedAt ?? 0).toISOString(),
+        warningThresholds: parseThresholds(budget?.warningThresholds),
+      };
+    }),
+  ];
 }
 
 export function saveBudget(
   database: AppDatabase,
-  value: Omit<BudgetSetting, "updatedAt">,
-): BudgetSetting {
+  value: Omit<BudgetSetting, "scope" | "updatedAt"> & {
+    scope?: BudgetSetting["scope"] | undefined;
+  },
+): BudgetSetting | null {
   const updatedAt = Date.now();
+  const scope = value.scope ?? ({ kind: "global" } as const);
+  if (scope.kind === "project") {
+    if (!projectExists(database, scope.projectId)) return null;
+    database
+      .insert(projectBudgetSettings)
+      .values({
+        enabled: value.enabled,
+        limitUsd: value.limitUsd,
+        period: value.period,
+        projectId: scope.projectId,
+        updatedAt,
+        warningThresholds: JSON.stringify(value.warningThresholds),
+      })
+      .onConflictDoUpdate({
+        target: [projectBudgetSettings.projectId, projectBudgetSettings.period],
+        set: {
+          enabled: value.enabled,
+          limitUsd: value.limitUsd,
+          updatedAt,
+          warningThresholds: JSON.stringify(value.warningThresholds),
+        },
+      })
+      .run();
+    return { ...value, scope, updatedAt: new Date(updatedAt).toISOString() };
+  }
   database
     .insert(budgetSettings)
     .values({
@@ -798,7 +880,13 @@ export function saveBudget(
       },
     })
     .run();
-  return { ...value, updatedAt: new Date(updatedAt).toISOString() };
+  return { ...value, scope, updatedAt: new Date(updatedAt).toISOString() };
+}
+
+export function projectExists(database: AppDatabase, projectId: string): boolean {
+  return Boolean(
+    database.select({ id: projects.id }).from(projects).where(eq(projects.id, projectId)).get(),
+  );
 }
 
 export function refreshAlerts(database: AppDatabase, now = new Date()): AlertEvent[] {
@@ -818,6 +906,43 @@ export function refreshAlerts(database: AppDatabase, now = new Date()): AlertEve
         title: `${budget.period === "daily" ? "Ngân sách ngày" : "Ngân sách tháng"} đã đạt ${threshold}%`,
         type: "budget",
       });
+    }
+  }
+
+  const projectBudgets = database
+    .select({
+      displayName: projects.displayName,
+      enabled: projectBudgetSettings.enabled,
+      limitUsd: projectBudgetSettings.limitUsd,
+      period: projectBudgetSettings.period,
+      projectId: projectBudgetSettings.projectId,
+      warningThresholds: projectBudgetSettings.warningThresholds,
+    })
+    .from(projectBudgetSettings)
+    .innerJoin(projects, eq(projectBudgetSettings.projectId, projects.id))
+    .where(eq(projectBudgetSettings.enabled, true))
+    .all();
+  if (projectBudgets.length > 0) {
+    const dailyUsage = getProjectCostTotals(database, today, today);
+    const monthlyUsage = getProjectCostTotals(database, monthStart, today);
+    for (const budget of projectBudgets) {
+      if (budget.limitUsd <= 0) continue;
+      const period = budget.period === "monthly" ? "monthly" : "daily";
+      const from = period === "daily" ? today : monthStart;
+      const usage = (period === "daily" ? dailyUsage : monthlyUsage).get(budget.projectId) ?? 0;
+      const percent = (usage / budget.limitUsd) * 100;
+      for (const threshold of parseThresholds(budget.warningThresholds).filter(
+        (value) => percent >= value,
+      )) {
+        upsertAlert(database, {
+          message: `${budget.displayName}: ${formatUsd(usage)} / ${formatUsd(budget.limitUsd)} (${percent.toFixed(1)}%).`,
+          periodStart: from,
+          scopeKey: `project:${budget.projectId}:${period}:${threshold}`,
+          severity: threshold >= 100 ? "critical" : threshold >= 80 ? "warning" : "info",
+          title: `${budget.displayName} · ${period === "daily" ? "ngân sách ngày" : "ngân sách tháng"} đạt ${threshold}%`,
+          type: "budget",
+        });
+      }
     }
   }
 
@@ -882,6 +1007,37 @@ export function refreshAlerts(database: AppDatabase, now = new Date()): AlertEve
     });
   }
   return listAlerts(database);
+}
+
+function getProjectCostTotals(
+  database: AppDatabase,
+  from: string,
+  to: string,
+): Map<string, number> {
+  const rows = database.$client
+    .prepare(
+      `with project_usage as (
+        select
+          coalesce(s.project_id, 'legacy-unknown') as projectId,
+          coalesce(sum(e.cost_usd), 0) as costUsd
+        from usage_events e
+        left join sessions s on s.id = e.session_id
+        where e.local_date >= ? and e.local_date <= ?
+        group by coalesce(s.project_id, 'legacy-unknown')
+        union all
+        select
+          r.project_id as projectId,
+          coalesce(sum(r.cost_usd), 0) as costUsd
+        from usage_daily_rollups r
+        where r.local_date >= ? and r.local_date <= ?
+        group by r.project_id
+      )
+      select projectId, coalesce(sum(costUsd), 0) as costUsd
+      from project_usage
+      group by projectId`,
+    )
+    .all(from, to, from, to) as { costUsd: number; projectId: string }[];
+  return new Map(rows.map((row) => [row.projectId, toNumber(row.costUsd)]));
 }
 
 function listAlerts(database: AppDatabase): AlertEvent[] {
@@ -1083,6 +1239,7 @@ function copyDashboardFilters(source: DashboardFilters, target: DashboardFilters
   if (source.model) target.model = source.model;
   if (source.models) target.models = source.models;
   if (source.projectId) target.projectId = source.projectId;
+  if (source.tagIds) target.tagIds = source.tagIds;
 }
 
 function buildSetBasedUsage(filters: AgentFilters): SetBasedUsage {
@@ -1113,6 +1270,25 @@ function buildSetBasedUsage(filters: AgentFilters): SetBasedUsage {
     archivedConditions.push("r.project_id = ?");
     rawParameters.push(filters.projectId);
     archivedParameters.push(filters.projectId);
+  }
+  if (filters.tagIds?.length) {
+    const placeholders = filters.tagIds.map(() => "?").join(", ");
+    rawConditions.push(
+      `exists (
+        select 1 from project_tags tag_filter
+        where tag_filter.project_id = s.project_id
+          and tag_filter.tag_id in (${placeholders})
+      )`,
+    );
+    archivedConditions.push(
+      `exists (
+        select 1 from project_tags tag_filter
+        where tag_filter.project_id = r.project_id
+          and tag_filter.tag_id in (${placeholders})
+      )`,
+    );
+    rawParameters.push(...filters.tagIds);
+    archivedParameters.push(...filters.tagIds);
   }
   if (filters.role) {
     rawConditions.push("a.role = ?");
@@ -1308,6 +1484,25 @@ function addSqlFilters(
     rawParameters.push(filters.projectId);
     archivedConditions.push("r.project_id = ?");
     archivedParameters.push(filters.projectId);
+  }
+  if (filters.tagIds?.length) {
+    const placeholders = filters.tagIds.map(() => "?").join(",");
+    rawConditions.push(
+      `exists (
+        select 1 from project_tags tag_filter
+        where tag_filter.project_id = s.project_id
+          and tag_filter.tag_id in (${placeholders})
+      )`,
+    );
+    archivedConditions.push(
+      `exists (
+        select 1 from project_tags tag_filter
+        where tag_filter.project_id = r.project_id
+          and tag_filter.tag_id in (${placeholders})
+      )`,
+    );
+    rawParameters.push(...filters.tagIds);
+    archivedParameters.push(...filters.tagIds);
   }
 }
 

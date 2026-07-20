@@ -57,6 +57,15 @@ test("budget, notification, pricing simulator và export", async ({ page }) => {
   await page.getByRole("button", { name: "Lưu budget" }).first().click();
   await expect(page.getByText(/Đã lưu budget/)).toBeVisible();
 
+  await page.getByRole("combobox", { name: "Chọn project budget" }).click();
+  await page.getByRole("option").first().click();
+  await expect(page.getByText("Budget theo project")).toBeVisible();
+  await page.getByRole("checkbox").nth(2).check();
+  await page.getByLabel("Giới hạn USD").nth(2).fill("1");
+  await page.getByLabel("Ngưỡng cảnh báo (%)").nth(2).fill("50, 100");
+  await page.getByRole("button", { name: "Lưu budget" }).nth(2).click();
+  await expect(page.getByText(/Đã lưu budget/).last()).toBeVisible();
+
   await expect(page.getByRole("heading", { name: "Pricing Simulator" })).toBeVisible();
   await page.getByRole("button", { name: "Tính thử" }).click();
   await expect(page.getByRole("region", { name: "Kết quả mô phỏng giá" })).toBeVisible();
@@ -64,7 +73,7 @@ test("budget, notification, pricing simulator và export", async ({ page }) => {
 
   await page.getByRole("combobox", { name: "Dữ liệu" }).click();
   await page.getByRole("option", { name: "Dự án" }).click();
-  await page.getByRole("combobox", { name: "Định dạng" }).click();
+  await page.getByRole("combobox", { exact: true, name: "Định dạng" }).click();
   await page.getByRole("option", { name: "JSON" }).click();
   const downloadPromise = page.waitForEvent("download");
   await page.getByRole("button", { name: "Export", exact: true }).click();
@@ -73,6 +82,142 @@ test("budget, notification, pricing simulator và export", async ({ page }) => {
 
   await page.getByRole("button", { name: /Thông báo/ }).click();
   await expect(page.getByRole("heading", { name: "Trung tâm thông báo" })).toBeVisible();
+});
+
+test("Report Builder preview và export CSV/JSON với xác nhận privacy", async ({ page }) => {
+  await page.goto("/settings?from=2026-07-12&to=2026-07-12");
+  await expect(page.getByRole("heading", { name: "Report Builder" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Privacy preview" })).toBeVisible();
+
+  await page.getByRole("combobox", { name: "Chọn preset report" }).click();
+  await page.getByRole("option", { name: "Tổng hợp project" }).click();
+  const projectName = page.getByRole("checkbox", { name: /Tên project/ });
+  await expect(projectName).toBeVisible();
+  await projectName.check();
+  await expect(page.getByText(/Tạo lại preview trước khi export/)).toBeVisible();
+  await page.getByRole("button", { name: "Tạo preview" }).click();
+
+  const warning = page.getByTestId("report-privacy-warning");
+  await expect(warning).toContainText("Tên project");
+  const exportButton = page.getByRole("button", { name: "Xuất report" });
+  await expect(exportButton).toBeDisabled();
+  await warning.getByRole("checkbox", { name: /Tôi hiểu file/ }).check();
+  await expect(exportButton).toBeEnabled();
+
+  await page.getByRole("combobox", { name: "Chọn định dạng report" }).click();
+  await page.getByRole("option", { name: "JSON" }).click();
+  const jsonDownloadPromise = page.waitForEvent("download");
+  await exportButton.click();
+  const jsonDownload = await jsonDownloadPromise;
+  expect(jsonDownload.suggestedFilename()).toBe("codex-usage-project-summary.json");
+
+  await page.getByRole("combobox", { name: "Chọn định dạng report" }).click();
+  await page.getByRole("option", { name: "CSV" }).click();
+  const csvDownloadPromise = page.waitForEvent("download");
+  await exportButton.click();
+  const csvDownload = await csvDownloadPromise;
+  expect(csvDownload.suggestedFilename()).toBe("codex-usage-project-summary.csv");
+
+  await page.setViewportSize({ height: 844, width: 390 });
+  await expect(page.getByTestId("report-preview-cards")).toBeVisible();
+  const accessibility = await new AxeBuilder({ page })
+    .include('[data-testid="report-builder"]')
+    .analyze();
+  expect(accessibility.violations).toEqual([]);
+});
+
+test("Report Builder hiển thị empty và error state", async ({ page }) => {
+  let mode: "empty" | "error" = "empty";
+  await page.route("**/api/reports/preview", async (route) => {
+    if (mode === "error") {
+      await route.fulfill({
+        contentType: "application/json",
+        json: { error: "Preview fixture failed" },
+        status: 500,
+      });
+      return;
+    }
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        acknowledgementMatches: true,
+        availableColumns: [
+          {
+            id: "date",
+            label: "Ngày",
+            selectedByDefault: true,
+            sensitive: false,
+          },
+        ],
+        coverage: {
+          aggregate: "full",
+          detail: { from: "2026-07-12", status: "full", to: "2026-07-12" },
+        },
+        resolvedColumns: [
+          {
+            id: "date",
+            label: "Ngày",
+            selectedByDefault: true,
+            sensitive: false,
+          },
+        ],
+        rowCount: { kind: "exact", value: 0 },
+        rows: [],
+        sensitiveWarning: null,
+      },
+    });
+  });
+
+  await page.goto("/settings?from=2026-07-12&to=2026-07-12");
+  await expect(page.getByTestId("report-empty-state")).toBeVisible();
+  mode = "error";
+  await page.getByRole("button", { name: "Tạo preview" }).click();
+  await expect(page.getByRole("alert")).toContainText("Không thể tạo preview");
+  await expect(page.getByRole("alert")).toContainText("Preview fixture failed");
+});
+
+test("quản lý, gán và lọc project bằng tag xuyên dashboard/activity", async ({ page }) => {
+  await page.goto("/settings?from=2026-07-12&to=2026-07-12");
+  await page.getByLabel("Tên tag mới").fill("E2E Focus");
+  await page.getByRole("button", { name: "Tạo tag" }).click();
+  await expect(page.getByText("Đã tạo tag.")).toBeVisible();
+
+  await page.goto("/projects?from=2026-07-12&to=2026-07-12");
+  await page
+    .getByRole("button", { name: /^Gán tag / })
+    .first()
+    .click();
+  const assignment = page.getByRole("dialog", { name: /Gán tag/ });
+  await assignment.getByLabel("E2E Focus").check();
+  const dialogAccessibility = await new AxeBuilder({ page }).analyze();
+  expect(dialogAccessibility.violations).toEqual([]);
+  await assignment.getByRole("button", { name: "Lưu tag" }).click();
+  await expect(page.getByText("Đã cập nhật tag cho project.")).toBeVisible();
+  await expect(page.getByText("E2E Focus").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Lọc theo tag" }).click();
+  await page
+    .getByRole("button", { name: /E2E Focus/ })
+    .last()
+    .click();
+  await expect(page).toHaveURL(/tags=[0-9a-f-]+/);
+  const tagId = new URL(page.url()).searchParams.get("tags");
+  expect(tagId).toMatch(/^[0-9a-f-]+$/);
+  await expect(page.getByTestId("project-table").locator("tbody tr")).toHaveCount(1);
+
+  await page.goto(`/?from=2026-07-12&to=2026-07-12&tags=${tagId}`);
+  await expect(page.getByRole("heading", { name: "Phân tích" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Lọc theo tag" })).toContainText("E2E Focus");
+
+  await page.goto(`/activity?from=2026-07-12&to=2026-07-12&tags=${tagId}`);
+  await expect(page.getByRole("heading", { name: "Hoạt động", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Lọc theo tag" })).toContainText("E2E Focus");
+
+  await page.goto("/settings?from=2026-07-12&to=2026-07-12");
+  await page.getByRole("button", { name: "Xoá tag E2E Focus" }).click();
+  const confirmation = page.getByRole("dialog", { name: "Xoá tag?" });
+  await confirmation.getByRole("button", { name: "Xoá tag" }).click();
+  await expect(page.getByText("Đã xoá tag và các gán liên quan.")).toBeVisible();
 });
 
 test("notification tự đánh dấu đã đọc khi xem turn và hỗ trợ xóa tất cả", async ({ page }) => {
@@ -181,6 +326,116 @@ test("role và turn text filters debounce thành một request cuối", async ({
   await expect(page).toHaveURL(/effort=high/);
   await page.waitForTimeout(350);
   expect(requests.filter((url) => url.startsWith("/api/turns?"))).toHaveLength(1);
+});
+
+test("lưu, mở và xóa Saved View mà không giữ state tạm thời", async ({ page }) => {
+  const tagId = "11111111-1111-4111-8111-111111111111";
+  await page.goto(
+    `/turns?from=2026-07-12&to=2026-07-12&project=project-e2e&q=dashboard&sort=cost&page=4&ids=one,two&tags=${tagId}`,
+  );
+  await page.getByRole("button", { name: "Lưu view hiện tại" }).click();
+  const saveDialog = page.getByRole("dialog", { name: "Lưu view hiện tại" });
+  await saveDialog.getByLabel("Tên view").fill("Cost watch");
+  await saveDialog.getByRole("button", { name: "Lưu view" }).click();
+  await expect(page.getByText("Đã lưu view hiện tại.")).toBeVisible();
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Saved Views: 1" }).click();
+  await page.getByRole("button", { name: /^Cost watch \/turns/ }).click();
+  await expect(page).toHaveURL(/\/turns\?/);
+  await expect(page).toHaveURL(/project=project-e2e/);
+  await expect(page).toHaveURL(/q=dashboard/);
+  await expect(page).toHaveURL(/sort=cost/);
+  await expect(page).toHaveURL(new RegExp(`tags=${tagId}`));
+  expect(new URL(page.url()).searchParams.has("page")).toBe(false);
+  expect(new URL(page.url()).searchParams.has("ids")).toBe(false);
+
+  await page.getByRole("button", { name: "Saved Views: 1" }).click();
+  await page.getByRole("button", { name: "Xoá Cost watch" }).click();
+  const deleteDialog = page.getByRole("dialog", { name: "Xoá Saved View?" });
+  await deleteDialog.getByRole("button", { name: "Xoá view" }).click();
+  await expect(page.getByText("Đã xoá Saved View.")).toBeVisible();
+  await page.getByRole("button", { name: "Saved Views" }).click();
+  await expect(page.getByText("Chưa có view nào được lưu.")).toBeVisible();
+});
+
+test("browser notification chỉ gửi alert mới sau khi opt-in", async ({ page }) => {
+  await page.addInitScript(() => {
+    const notifications: { body: string; title: string }[] = [];
+    Object.defineProperty(window, "__browserNotifications", {
+      configurable: true,
+      value: notifications,
+    });
+    class MockNotification {
+      static get permission(): NotificationPermission {
+        return (window.localStorage.getItem("e2e-notification-permission") ??
+          "default") as NotificationPermission;
+      }
+
+      static requestPermission(): Promise<NotificationPermission> {
+        window.localStorage.setItem("e2e-notification-permission", "granted");
+        return Promise.resolve("granted");
+      }
+
+      onclick: (() => void) | null = null;
+
+      constructor(title: string, options?: NotificationOptions) {
+        notifications.push({ body: options?.body ?? "", title });
+      }
+
+      close() {
+        return undefined;
+      }
+    }
+    Object.defineProperty(window, "Notification", {
+      configurable: true,
+      value: MockNotification,
+    });
+  });
+
+  let alerts: AlertEvent[] = [notificationFixture("existing-alert")];
+  let seenMutations = 0;
+  await page.route("**/api/alerts**", async (route) => {
+    if (route.request().method() !== "GET") {
+      seenMutations += 1;
+      await route.continue();
+      return;
+    }
+    await route.fulfill({
+      contentType: "application/json",
+      json: { alerts, unseenCount: alerts.length },
+    });
+  });
+
+  await page.goto("/settings");
+  await page.getByRole("button", { name: "Bật thông báo" }).click();
+  await expect(page.getByText("Đã bật browser notification.")).toBeVisible();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as typeof window & { __browserNotifications: unknown[] }).__browserNotifications
+          .length,
+    ),
+  ).toBe(0);
+
+  alerts = [
+    ...alerts,
+    {
+      ...notificationFixture("new-alert"),
+      createdAt: new Date(Date.now() + 60_000).toISOString(),
+    },
+  ];
+  await page.reload();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as typeof window & { __browserNotifications: unknown[] }).__browserNotifications
+            .length,
+      ),
+    )
+    .toBe(1);
+  expect(seenMutations).toBe(0);
 });
 
 function notificationFixture(id: string, options: { turnKey?: string | null } = {}): AlertEvent {

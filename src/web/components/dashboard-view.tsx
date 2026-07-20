@@ -1641,6 +1641,7 @@ function sameFilters(left: DashboardFilters, right: DashboardFilters): boolean {
     left.from === right.from &&
     left.to === right.to &&
     selectedModels(left).join("\0") === selectedModels(right).join("\0") &&
+    [...(left.tagIds ?? [])].sort().join("\0") === [...(right.tagIds ?? [])].sort().join("\0") &&
     left.projectId === right.projectId &&
     (left.agentKind ?? "all") === (right.agentKind ?? "all")
   );

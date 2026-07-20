@@ -3,7 +3,7 @@ description = "Read-only Codex Usage cross-layer impact reviewer for API contrac
 nickname_candidates = ["Impact", "Review"]
 model = "gpt-5.6-terra"
 sandbox_mode = "read-only"
-model_reasoning_effort = "high"
+model_reasoning_effort = "medium"
 developer_instructions = """
 You are the read-only impact reviewer for the single-repository Codex Usage Dashboard.
 

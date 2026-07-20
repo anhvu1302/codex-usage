@@ -73,8 +73,9 @@ export function AgentsPage() {
     if (filters.agentKind) value.agentKind = filters.agentKind;
     if (filters.model) value.model = filters.model;
     if (filters.models) value.models = filters.models;
+    if (filters.tagIds) value.tagIds = filters.tagIds;
     return value;
-  }, [filters.agentKind, filters.from, filters.model, filters.models, filters.to]);
+  }, [filters.agentKind, filters.from, filters.model, filters.models, filters.tagIds, filters.to]);
   const projects = useQuery({
     queryKey: ["projects", "options", projectFilter],
     queryFn: ({ signal }) => fetchProjectOptions(projectFilter, signal),

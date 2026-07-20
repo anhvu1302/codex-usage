@@ -64,7 +64,7 @@ export function ExportActions({
           Export dữ liệu
         </CardTitle>
         <CardDescription>
-          File dùng chính xác khoảng ngày, model, project và loại agent đang được lọc.
+          File dùng chính xác khoảng ngày, model, project, tag và loại agent đang được lọc.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -143,6 +143,7 @@ function dashboardQuery(dataset: ExportDataset, filters: ExportFilters) {
   const models = filters.models?.length ? filters.models : filters.model ? [filters.model] : [];
   if (models.length > 0) query.set("models", models.join(","));
   if (filters.projectId) query.set("project", filters.projectId);
+  if (filters.tagIds?.length) query.set("tags", [...new Set(filters.tagIds)].join(","));
   if (filters.agentKind && filters.agentKind !== "all") query.set("agentKind", filters.agentKind);
   if ("depth" in filters && filters.depth !== undefined) query.set("depth", String(filters.depth));
   if ("role" in filters && filters.role) query.set("role", filters.role);

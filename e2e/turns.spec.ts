@@ -14,6 +14,8 @@ test("mở deep link, xem timeline, quay lại và so sánh 4 turns", async ({ p
 
   await expect(page.getByRole("heading", { level: 1, name: "Turns" })).toBeVisible();
   await expect(page.getByText("5 turn", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Diagnostic toàn filtered range" })).toBeVisible();
+  await expect(page.getByText(/Chưa đủ 20 mẫu/)).toBeVisible();
   await expect(page.getByRole("region", { name: "Danh sách turns" })).toBeVisible();
 
   const firstTurn = page.getByRole("button", { name: /^E2E dashboard task .* Turn/ }).first();
@@ -54,6 +56,7 @@ test("hiển thị card mobile và không có lỗi accessibility", async ({ pag
   await page.goto(`/turns?${TURN_RANGE}`);
 
   await expect(page.getByRole("heading", { level: 1, name: "Turns" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Diagnostic toàn filtered range" })).toBeVisible();
   await expect(page.getByRole("region", { name: "Danh sách turns" })).toHaveCount(0);
   await expect(page.getByTestId("turn-table")).toHaveCount(0);
   await expect(page.getByTestId("turn-cards")).toHaveCount(1);

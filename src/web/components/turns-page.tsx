@@ -59,16 +59,26 @@ import { fetchProjectOptions, formatPercent, formatTokens, formatUsd } from "@/w
 import {
   fetchTurnComparison,
   fetchTurnDetail,
+  fetchTurnDiagnostics,
   fetchTurns,
   turnFiltersFromSearch,
   updateTurnSearch,
 } from "@/web/lib/turns-api";
 import { useLiveEventsFallbackActive } from "@/web/lib/live-events";
+import {
+  diagnoseTurnPage,
+  diagnosticReasonLabel,
+  isOutlierReason,
+  type TurnDiagnosticReason,
+  type TurnPageDiagnostics,
+} from "@/web/lib/turn-diagnostics";
 import { useMediaQuery } from "@/web/lib/use-media-query";
 import { cn } from "@/web/lib/utils";
 import type {
   AgentFilters,
   ActivityKind,
+  DashboardFilters,
+  TurnDiagnosticsResponse,
   TurnCostCoverage,
   TurnFilters,
   TurnSummary,
@@ -122,9 +132,10 @@ export function TurnsPage() {
     staleTime: 5 * 60_000,
   });
   const projectFilters = useMemo(() => {
-    const next = { from: filters.from, to: filters.to };
+    const next: DashboardFilters = { from: filters.from, to: filters.to };
+    if (filters.tagIds) next.tagIds = filters.tagIds;
     return next;
-  }, [filters.from, filters.to]);
+  }, [filters.from, filters.tagIds, filters.to]);
   const projects = useQuery({
     queryKey: ["projects", "options", projectFilters],
     queryFn: ({ signal }) => fetchProjectOptions(projectFilters, signal),
@@ -139,6 +150,16 @@ export function TurnsPage() {
         ? 5_000
         : false,
   });
+  const diagnosticFilters = useMemo(() => withoutTurnPagination(filters), [filters]);
+  const rangeDiagnostics = useQuery({
+    queryKey: ["turns", "diagnostics", diagnosticFilters],
+    queryFn: ({ signal }) => fetchTurnDiagnostics(diagnosticFilters, signal),
+    staleTime: 30_000,
+  });
+  const pageDiagnostics = useMemo(
+    () => diagnoseTurnPage(turns.data?.turns ?? []),
+    [turns.data?.turns],
+  );
   const detail = useQuery({
     enabled: Boolean(turnKey),
     queryKey: ["turn", turnKey],
@@ -256,6 +277,14 @@ export function TurnsPage() {
 
       <TurnKpiGrid loading={turns.isLoading} response={turns.data} />
 
+      <TurnDiagnosticSummary
+        data={rangeDiagnostics.data}
+        error={rangeDiagnostics.error}
+        loading={rangeDiagnostics.isLoading}
+        onOpen={openTurn}
+        onRetry={() => void rangeDiagnostics.refetch()}
+      />
+
       <section className="grid gap-4 xl:grid-cols-5">
         <Card className="xl:col-span-3">
           <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 space-y-0">
@@ -301,6 +330,7 @@ export function TurnsPage() {
       <TurnList
         columns={columns}
         desktop={desktopTurns}
+        diagnostics={pageDiagnostics}
         filters={filters}
         loading={turns.isLoading}
         onColumnsChange={setColumns}
@@ -334,6 +364,93 @@ export function TurnsPage() {
         }}
       />
     </div>
+  );
+}
+
+function TurnDiagnosticSummary({
+  data,
+  error,
+  loading,
+  onOpen,
+  onRetry,
+}: {
+  data: TurnDiagnosticsResponse | undefined;
+  error: Error | null;
+  loading: boolean;
+  onOpen: (turnKey: string) => void;
+  onRetry: () => void;
+}) {
+  const baselines = data ? [data.baselines.duration, data.baselines.ttft, data.baselines.cost] : [];
+  const availableCount = baselines.filter((baseline) => baseline.baselineAvailable).length;
+  return (
+    <section
+      aria-label="Diagnostic turns trong toàn bộ filtered range"
+      className="bg-muted/30 space-y-4 rounded-xl border p-4"
+    >
+      <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+        <div>
+          <h2 className="font-semibold">Diagnostic toàn filtered range</h2>
+          <p className="text-muted-foreground mt-1 text-sm">
+            Duration, TTFT và exact cost dùng median/P95 trên tối đa 20.000 turn; context dùng
+            ngưỡng 70/85/95%.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="secondary">
+            {loading && !data ? "Đang tính…" : `${data?.outlierTurnCount ?? 0} turn cần chú ý`}
+          </Badge>
+          <Badge variant="outline">
+            {data && availableCount === 3
+              ? `${formatTokens(data.matchedTurnCount)} turn đã xét`
+              : `Chưa đủ 20 mẫu cho ${3 - availableCount} metric`}
+          </Badge>
+          {data ? (
+            <Badge variant="outline">
+              Aggregate {data.coverage.aggregate} · timeline {data.coverage.timeline.status}
+            </Badge>
+          ) : null}
+        </div>
+      </div>
+      {error ? (
+        <div
+          className="border-destructive/40 flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3 text-sm"
+          role="alert"
+        >
+          <p>Không thể tính diagnostic: {error.message}</p>
+          <Button size="sm" variant="outline" onClick={onRetry}>
+            Thử lại
+          </Button>
+        </div>
+      ) : null}
+      {data?.items.length ? (
+        <div className="border-t pt-3">
+          <p className="text-muted-foreground mb-2 text-xs font-medium uppercase">
+            Top {Math.min(5, data.items.length)} / {data.items.length} kết quả diagnostic
+          </p>
+          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-5">
+            {data.items.slice(0, 5).map((item) => (
+              <button
+                key={item.turn.turnKey}
+                className="bg-background hover:bg-accent focus-visible:ring-ring min-w-0 rounded-lg border p-3 text-left outline-none focus-visible:ring-2"
+                type="button"
+                onClick={() => onOpen(item.turn.turnKey)}
+              >
+                <span className="block truncate text-sm font-medium">{turnLabel(item.turn)}</span>
+                <span className="text-muted-foreground mt-1 block truncate font-mono text-xs">
+                  {shortId(item.turn.turnKey)}
+                </span>
+                <DiagnosticBadges reasons={item.reasons} />
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {data?.items.length === 0 ? (
+        <p className="text-muted-foreground border-t pt-3 text-sm">
+          Không có turn nào vượt baseline hoặc ngưỡng context trong range này.
+        </p>
+      ) : null}
+    </section>
   );
 }
 
@@ -558,6 +675,7 @@ function MetricToggle({
 function TurnList({
   columns,
   desktop,
+  diagnostics,
   filters,
   loading,
   onColumnsChange,
@@ -570,6 +688,7 @@ function TurnList({
 }: {
   columns: Set<VisibleColumn>;
   desktop: boolean;
+  diagnostics: TurnPageDiagnostics;
   filters: TurnFilters;
   loading: boolean;
   onColumnsChange: (columns: Set<VisibleColumn>) => void;
@@ -670,6 +789,9 @@ function TurnList({
                               {shortId(turn.turnKey)} ·{" "}
                               {formatDateTime(turn.startedAt ?? turn.lastEventAt)}
                             </span>
+                            <DiagnosticBadges
+                              reasons={diagnostics.reasons.get(turn.turnKey) ?? []}
+                            />
                           </button>
                         </TableCell>
                         {columns.has("model") ? (
@@ -733,6 +855,7 @@ function TurnList({
                       </button>
                       <StatusBadge status={turn.status} />
                     </div>
+                    <DiagnosticBadges reasons={diagnostics.reasons.get(turn.turnKey) ?? []} />
                     <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
                       <Metric label="Token" value={formatTokens(turn.totalTokens)} />
                       <Metric
@@ -778,6 +901,28 @@ function TurnList({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function DiagnosticBadges({ reasons }: { reasons: TurnDiagnosticReason[] }) {
+  if (reasons.length === 0) return null;
+  return (
+    <span className="mt-2 flex flex-wrap gap-1" aria-label="Turn diagnostic">
+      {reasons.map((reason) => (
+        <Badge
+          key={reason}
+          variant={
+            reason === "context-95"
+              ? "destructive"
+              : isOutlierReason(reason)
+                ? "secondary"
+                : "outline"
+          }
+        >
+          {diagnosticReasonLabel(reason)}
+        </Badge>
+      ))}
+    </span>
   );
 }
 
@@ -1292,6 +1437,15 @@ function pickAdvancedFilters(filters: TurnFilters): Omit<TurnFilters, keyof Agen
   if (filters.sessionId) next.sessionId = filters.sessionId;
   if (filters.sort) next.sort = filters.sort;
   if (filters.status) next.status = filters.status;
+  return next;
+}
+
+function withoutTurnPagination(filters: TurnFilters): TurnFilters {
+  const next = { ...filters };
+  delete next.order;
+  delete next.page;
+  delete next.pageSize;
+  delete next.sort;
   return next;
 }
 

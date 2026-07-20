@@ -2,6 +2,7 @@ import { Check, Filter, X } from "lucide-react";
 import { useEffect, useEffectEvent, useRef, useState } from "react";
 
 import { DateRangePicker } from "@/web/components/date-range-picker";
+import { TagFilter } from "@/web/components/tag-filter";
 import { Badge } from "@/web/components/ui/badge";
 import { Button } from "@/web/components/ui/button";
 import { Input } from "@/web/components/ui/input";
@@ -43,6 +44,7 @@ export function ProductFilterBar({
   const hasAdvanced =
     selectedModels.length > 0 ||
     Boolean(filters.projectId) ||
+    Boolean(filters.tagIds?.length) ||
     (filters.agentKind !== undefined && filters.agentKind !== "all") ||
     Boolean(filters.role) ||
     filters.depth !== undefined;
@@ -164,6 +166,15 @@ export function ProductFilterBar({
             </PopoverContent>
           </Popover>
 
+          <TagFilter
+            tagIds={filters.tagIds}
+            onChange={(tagIds) =>
+              onChange(
+                tagIds.length > 0 ? { ...filters, tagIds } : withoutFilters(filters, "tagIds"),
+              )
+            }
+          />
+
           <Select
             value={filters.agentKind ?? "all"}
             onValueChange={(value) =>
@@ -282,7 +293,7 @@ function DebouncedRoleInput({
   );
 }
 
-type OptionalFilterKey = "depth" | "model" | "models" | "projectId" | "role";
+type OptionalFilterKey = "depth" | "model" | "models" | "projectId" | "role" | "tagIds";
 
 function withoutFilters(filters: AgentFilters, ...keys: OptionalFilterKey[]): AgentFilters {
   const next = { ...filters };
@@ -302,6 +313,9 @@ function withoutFilters(filters: AgentFilters, ...keys: OptionalFilterKey[]): Ag
         break;
       case "role":
         delete next.role;
+        break;
+      case "tagIds":
+        delete next.tagIds;
         break;
     }
   }

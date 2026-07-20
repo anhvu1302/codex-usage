@@ -39,6 +39,35 @@ export const projects = sqliteTable(
   (table) => [uniqueIndex("projects_normalized_path_unique").on(table.normalizedPath)],
 );
 
+export const tags = sqliteTable(
+  "tags",
+  {
+    id: text("id").primaryKey(),
+    name: text("name").notNull(),
+    normalizedName: text("normalized_name").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [uniqueIndex("tags_normalized_name_unique").on(table.normalizedName)],
+);
+
+export const projectTags = sqliteTable(
+  "project_tags",
+  {
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    tagId: text("tag_id")
+      .notNull()
+      .references(() => tags.id, { onDelete: "cascade" }),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.projectId, table.tagId] }),
+    index("project_tags_tag_project_index").on(table.tagId, table.projectId),
+  ],
+);
+
 export const sessionAgents = sqliteTable(
   "session_agents",
   {
@@ -299,6 +328,28 @@ export const budgetSettings = sqliteTable("budget_settings", {
   warningThresholds: text("warning_thresholds").notNull().default("[50,80,100]"),
   updatedAt: integer("updated_at").notNull(),
 });
+
+export const projectBudgetSettings = sqliteTable(
+  "project_budget_settings",
+  {
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    period: text("period").notNull(),
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(false),
+    limitUsd: real("limit_usd").notNull().default(0),
+    warningThresholds: text("warning_thresholds").notNull().default("[50,80,100]"),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.projectId, table.period] }),
+    index("project_budget_settings_enabled_scan_index").on(
+      table.enabled,
+      table.period,
+      table.projectId,
+    ),
+  ],
+);
 
 export const alertEvents = sqliteTable(
   "alert_events",

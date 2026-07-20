@@ -1,10 +1,16 @@
 import { useQuery } from "@tanstack/react-query";
 import { Bell, BellRing, TriangleAlert } from "lucide-react";
-import { lazy, Suspense, useState } from "react";
-import { Link } from "react-router";
+import { lazy, Suspense, useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router";
 
 import type { AlertEvent } from "@/shared/types";
 import { Button } from "@/web/components/ui/button";
+import {
+  eligibleBrowserAlerts,
+  readNotifiedAlertIds,
+  rememberNotifiedAlertIds,
+  useBrowserNotificationPreferences,
+} from "@/web/lib/browser-notifications";
 import { useLiveEventsFallbackActive } from "@/web/lib/live-events";
 import { fetchAlerts } from "@/web/lib/product-api";
 
@@ -14,6 +20,8 @@ const NotificationPanel = lazy(loadNotificationPanel);
 
 export function NotificationCenter() {
   const liveEventsFallbackActive = useLiveEventsFallbackActive();
+  const navigate = useNavigate();
+  const { permission, preferences } = useBrowserNotificationPreferences();
   const [open, setOpen] = useState(false);
   const alerts = useQuery({
     queryKey: ["alerts"],
@@ -22,6 +30,30 @@ export function NotificationCenter() {
     staleTime: 30_000,
   });
   const unseen = alerts.data?.unseenCount ?? 0;
+
+  useEffect(() => {
+    if (permission !== "granted" || !alerts.data || !("Notification" in window)) return;
+    const notified = new Set(readNotifiedAlertIds());
+    const eligible = eligibleBrowserAlerts(alerts.data.alerts, preferences, notified);
+    const delivered: string[] = [];
+    for (const alert of eligible) {
+      try {
+        const notification = new Notification(alert.title, {
+          body: alert.message,
+          tag: alert.id,
+        });
+        notification.onclick = () => {
+          window.focus();
+          void navigate(notificationTarget(alert));
+          notification.close();
+        };
+        delivered.push(alert.id);
+      } catch {
+        // Keep the in-app notification center functional if system delivery fails.
+      }
+    }
+    if (delivered.length > 0) rememberNotifiedAlertIds(delivered);
+  }, [alerts.data, navigate, permission, preferences]);
 
   return (
     <>
@@ -54,6 +86,13 @@ export function NotificationCenter() {
       ) : null}
     </>
   );
+}
+
+function notificationTarget(alert: AlertEvent): string {
+  if (alert.turnKey) return `/turns/${alert.turnKey}`;
+  if (alert.type === "budget") return "/settings";
+  if (alert.type === "data-health") return "/activity?tab=health";
+  return "/";
 }
 
 export function AlertBanner() {

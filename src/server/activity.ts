@@ -7,6 +7,7 @@ import {
   activityDailyRollups,
   activityEvents,
   importDiagnostics,
+  projectTags,
   sessionAgents,
   sessions,
   turnModelUsage,
@@ -246,6 +247,7 @@ function activityFilterFingerprint(filters: ActivityFilters): string {
     ].sort(),
     projectId: filters.projectId ?? null,
     sessionId: filters.sessionId ?? null,
+    tagIds: [...(filters.tagIds ?? [])].sort(),
     to: filters.to,
   });
   return createHash("sha256").update(canonical).digest("base64url");
@@ -353,6 +355,13 @@ function activityConditions(table: ActivityTable, filters: ActivityFilters): SQL
     conditions.push(eq(table.agentKind, filters.agentKind));
   }
   if (filters.projectId) conditions.push(eq(table.projectId, filters.projectId));
+  if (filters.tagIds?.length) {
+    conditions.push(sql`exists (
+      select 1 from ${projectTags}
+      where ${projectTags.projectId} = ${table.projectId}
+        and ${inArray(projectTags.tagId, filters.tagIds)}
+    )`);
+  }
   if (filters.kinds && filters.kinds.length > 0)
     conditions.push(inArray(table.kind, filters.kinds));
   return conditions;
@@ -380,6 +389,14 @@ function activityUsageConditions(filters: ActivityFilters): SQL[] {
         and ${sessions.projectId} = ${filters.projectId}
     )`);
   }
+  if (filters.tagIds?.length) {
+    conditions.push(sql`exists (
+      select 1 from ${sessions}
+      join ${projectTags} on ${projectTags.projectId} = ${sessions.projectId}
+      where ${sessions.id} = ${usageEvents.sessionId}
+        and ${inArray(projectTags.tagId, filters.tagIds)}
+    )`);
+  }
   return conditions;
 }
 
@@ -393,6 +410,13 @@ function activityDailyUsageConditions(filters: ActivityFilters): SQL[] {
   }
   if (filters.projectId) {
     conditions.push(eq(usageDailyRollups.projectId, filters.projectId));
+  }
+  if (filters.tagIds?.length) {
+    conditions.push(sql`exists (
+      select 1 from ${projectTags}
+      where ${projectTags.projectId} = ${usageDailyRollups.projectId}
+        and ${inArray(projectTags.tagId, filters.tagIds)}
+    )`);
   }
   return conditions;
 }
